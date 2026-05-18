@@ -53,6 +53,9 @@ EvaluatorPayload = Union[float, int, dict[str, object], EvaluatorResult]
 EvaluatorFn = Callable[[str], EvaluatorPayload]
 SearchFactory = Callable[[str], SearchBackend]
 
+PREDICTION_MARKET_DEFAULT_SIMULATIONS = "24"
+PREDICTION_MARKET_DEFAULT_SEED_START = "0"
+
 
 def _find_pm_upstream_path() -> Optional[Path]:
     """Auto-detect the prediction-market-challenge repo at common locations.
@@ -3677,9 +3680,11 @@ def _run_prediction_market_official(strategy_path: Path) -> dict[str, object]:
             "set PREDICTION_MARKET_CHALLENGE_PATH. No fallback score was used for optimization."
         )
 
-    simulations = os.environ.get("PREDICTION_MARKET_SIMULATIONS", "200")
+    # Keep variants comparable and cheap by default: every candidate in a
+    # generation uses the same seed range unless the user overrides it.
+    simulations = os.environ.get("PREDICTION_MARKET_SIMULATIONS", PREDICTION_MARKET_DEFAULT_SIMULATIONS)
     steps = os.environ.get("PREDICTION_MARKET_STEPS", "600")
-    seed_start = os.environ.get("PREDICTION_MARKET_SEED_START", "0")
+    seed_start = os.environ.get("PREDICTION_MARKET_SEED_START", PREDICTION_MARKET_DEFAULT_SEED_START)
     workers = os.environ.get("PREDICTION_MARKET_WORKERS", "4")
     if os.environ.get("PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM") == "1":
         completed = _run_prediction_market_upstream_on_host(
@@ -3923,7 +3928,7 @@ def main(path: str) -> None:
     spec.loader.exec_module(module)
     strategy_cls = getattr(module, "Strategy")
     rng = random.Random(20260509)
-    simulations = int(os.environ.get("PREDICTION_MARKET_SIMULATIONS", "200"))
+    simulations = int(os.environ.get("PREDICTION_MARKET_SIMULATIONS", PREDICTION_MARKET_DEFAULT_SIMULATIONS))
     edge = 0.0
     retail_edge = 0.0
     arb_edge = 0.0
@@ -4017,7 +4022,7 @@ if __name__ == "__main__":
 '''
 
 
-def _prediction_market_local_semantic_score(strategy_text: str, simulations: int = 200, steps: int = 800) -> dict[str, object]:
+def _prediction_market_local_semantic_score(strategy_text: str, simulations: int = int(PREDICTION_MARKET_DEFAULT_SIMULATIONS), steps: int = 800) -> dict[str, object]:
     params = _params_from_strategy_text(strategy_text)
     rng = random.Random(20260507)
     edges = []

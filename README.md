@@ -30,6 +30,56 @@ Optional install, so `autore` works from anywhere:
 python3 -m pip install -e .
 ```
 
+### Environment
+
+You can run offline without any keys. For live model calls, create `.env.local`
+with the providers and defaults you want:
+
+```bash
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+
+RESEARCH_HARNESS_CORPUS_PATH=examples/corpus/research_corpus.json
+RESEARCH_HARNESS_OUTPUT_DIR=outputs
+RESEARCH_HARNESS_RETRIEVER=auto
+
+RESEARCH_HARNESS_LLM_PROVIDER=auto
+RESEARCH_HARNESS_LLM_MODEL=all-configured
+RESEARCH_HARNESS_LLM_MODELS=openai/gpt-5.5,openai/gpt-5.2,anthropic/claude-opus-4-6,anthropic/claude-sonnet-4-6,anthropic/claude-sonnet-4-5,anthropic/claude-haiku-4-5,local/local-deterministic-fallback
+```
+
+`all-configured` uses every available model in `RESEARCH_HARNESS_LLM_MODELS`
+round-robin. Providers without a valid key are skipped. The local fallback keeps
+offline runs working.
+
+### Examples
+
+Research report:
+
+```bash
+./autore "Research enterprise AI agent adoption patterns" --task-mode research
+```
+
+Research first, then optimize:
+
+```bash
+./autore "Research approaches for improving a tiny scoring function" \
+  --task-mode optimize_query \
+  --evaluator length_score \
+  --retriever local
+```
+
+Prediction-market challenge:
+
+```bash
+./autore "Get to \$10 profit in the prediction market challenge. Research strategy ideas first, then optimize." \
+  --task-mode optimize_query \
+  --evaluator prediction_market
+```
+
+Set `PREDICTION_MARKET_USE_UPSTREAM=1` to score through the real upstream CLI
+instead of the local proxy.
+
 ## First Run
 
 Try a small research-only run first:
@@ -54,13 +104,14 @@ The most useful files are:
 
 | File | What to open first |
 | --- | --- |
-| `final_report.pdf` | Paper-style report. |
-| `final_report_preview.png` | First-page image preview for IDEs. |
-| `final_report.md` | Markdown version of the report. |
-| `progress.txt` | Step-by-step log of what happened. |
-| `run_benchmark.html` | Timeline and decision visuals. |
-| `prd.json` | Task plan and pass/fail status. |
+| `final_report.md` | Main human-readable report. |
+| `optimal_code.py` | Best selected code, when the run used an optimizer. |
+| `prd.json` | Task plan, status, and acceptance criteria. |
 | `cost.json` | Model usage and estimated cost. |
+| `failed_paths.json` | Failed attempts, causes, and retryability. |
+| `progress.txt` | Step-by-step log of what happened. |
+| `agent_timeline.png` | Visual timing trace of agents/evaluators. |
+| `harness_changes.json` | Proposed harness improvements for future evolutionary-agent work. |
 
 ## Selection-Based Setup
 
@@ -121,73 +172,27 @@ You can start with a few flags but still use the menu:
 ./autore --interactive --retriever local
 ```
 
-## Environment
-
-Create `.env.local` for secrets and defaults:
-
-```bash
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-
-RESEARCH_HARNESS_CORPUS_PATH=examples/corpus/research_corpus.json
-RESEARCH_HARNESS_OUTPUT_DIR=outputs
-RESEARCH_HARNESS_RETRIEVER=auto
-
-RESEARCH_HARNESS_LLM_PROVIDER=auto
-RESEARCH_HARNESS_LLM_MODEL=all-configured
-RESEARCH_HARNESS_LLM_MODELS=openai/gpt-5.5,openai/gpt-5.2,anthropic/claude-opus-4-6,anthropic/claude-sonnet-4-6,anthropic/claude-sonnet-4-5,anthropic/claude-haiku-4-5,local/local-deterministic-fallback
-```
-
-`all-configured` uses every available model in `RESEARCH_HARNESS_LLM_MODELS` round-robin. Providers without a valid key are skipped. The local fallback keeps offline runs working.
-
-## Examples
-
-Research report:
-
-```bash
-./autore "Research enterprise AI agent adoption patterns" --task-mode research
-```
-
-Research first, then optimize:
-
-```bash
-./autore "Research approaches for improving a tiny scoring function" \
-  --task-mode optimize_query \
-  --evaluator length_score \
-  --retriever local
-```
-
-Prediction-market challenge:
-
-```bash
-./autore "Get to \$10 profit in the prediction market challenge. Research strategy ideas first, then optimize." \
-  --task-mode optimize_query \
-  --evaluator prediction_market
-```
-
-Set `PREDICTION_MARKET_USE_UPSTREAM=1` to score through the real upstream CLI instead of the local proxy.
-
 ## Outputs
 
 Each run creates `outputs/<NNN>_run_<slug>/`.
 
 | Artifact | Purpose |
 | --- | --- |
-| `final_report.md` / `final_report.tex` / `final_report.pdf` / `final_report_preview.png` | Final synthesis report in Markdown, LaTeX, PDF, and image-preview form. |
+| `final_report.md` | Final synthesis report. Start here for research runs. |
+| `optimal_code.py` | Universal best-code artifact for optimizer runs, when applicable. |
+| `prd.json` | Organized task map with status, dependencies, and acceptance criteria. |
+| `cost.json` | Per-run model usage totals and estimated cost. |
+| `failed_paths.json` | Failed paths, causes, severity, and retryability. |
 | `progress.txt` | Human-readable progress log. |
-| `prd.json` | Organized task map with status and dependencies. |
+| `agent_timeline.png` | Agent/evaluator timing visual. |
+| `harness_changes.json` | Candidate harness improvements for future evolutionary-agent iterations. |
+| `optimization_result.json` | Best score, candidate path, evaluator metadata, and official-result status. |
+| `champion_tree.json` / `champion_tree.png` | Champion lineage data and graph for optimization runs. |
 | `variants.json` / `variant_evaluations.json` | Proposed variants and their scores. |
 | `optimizer_seed_context.json` | Research findings used to seed optimization. |
-| `optimization_result.json` | Best score, candidate path, and official-result status. |
-| `optimal_code.py` | Universal code artifact for the best selected candidate. |
 | `solution.py` | Challenge-specific runnable solution when applicable. |
-| `run_benchmark.html` | Per-run visual benchmark with Gantt timeline and decision DAG. |
-| `run_notebook.ipynb` | Notebook export with trace summaries, artifact counts, cost, and diagnosis data. |
+| `run_benchmark.html` | Per-run visual benchmark with timelines and decision graphs. |
 | `harness_diagnosis.json` | Failure taxonomy and debugger localization. |
-| `provenance_edges.json` | Claim/source/hypothesis/report provenance graph. |
-| `cost.json` / `cost_events.json` | Per-run model usage totals and per-call accounting. |
-| `world_model.sqlite` | Cross-run SQLite mirror for dedupe, provenance, and observability. |
-| `decision_dag.png` / `agent_timeline.png` | Flow and timing visuals. |
 
 ## Evaluation
 
@@ -234,6 +239,13 @@ Use these when you want repeatable commands instead of the guided setup.
 | `--llm-provider openai` / `anthropic` / `local` / `multi` | Force a provider mode. |
 | `--llm-model all-configured` | Use every configured available model round-robin. |
 | `--no-steering` | Disable live `/article`, `/steer`, and `/note` input during terminal runs. |
+| `--llm-model openai/gpt-5.2` | Use one specific model. |
+| `--list-llm-models` | Print the configured model catalog and exit. |
+| `--max-iterations N` | Set the outer-loop iteration budget. |
+| `--corpus PATH` | Choose the local corpus JSON file. |
+| `--output PATH` | Choose where run artifacts are written. |
+| `--no-sessions` | Disable session JSONL logging. |
+| `--quiet` | Suppress live progress printing. |
 
 During a normal terminal run, you can steer the next proposal round without
 stopping the agent:
@@ -247,10 +259,3 @@ stopping the agent:
 Steering input is recorded in `user_steering_inbox.jsonl`, ingested at the next
 round boundary, and persisted as user-provided sources/claims before it affects
 queries or candidate proposals.
-| `--llm-model openai/gpt-5.2` | Use one specific model. |
-| `--list-llm-models` | Print the configured model catalog and exit. |
-| `--max-iterations N` | Set the outer-loop iteration budget. |
-| `--corpus PATH` | Choose the local corpus JSON file. |
-| `--output PATH` | Choose where run artifacts are written. |
-| `--no-sessions` | Disable session JSONL logging. |
-| `--quiet` | Suppress live progress printing. |

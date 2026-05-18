@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from .run_benchmarks import write_run_benchmarks
+from .store import ArtifactStore
+
 
 ARTIFACT_FILES = {
     "sources": "sources.json",
@@ -82,6 +85,28 @@ class RunMetrics:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.run_dir:
+        store = ArtifactStore(args.run_dir)
+        write_run_benchmarks(store)
+        trace = json.loads((store.root / "optimizer_trace.json").read_text(encoding="utf-8")) if (store.root / "optimizer_trace.json").exists() else []
+        print(f"Run benchmark: {store.run_benchmark_path}")
+        print(f"Optimizer trace: {store.root / 'optimizer_trace.json'}")
+        print(f"Optimizer flow: {store.root / 'optimizer_flow.png'}")
+        print(f"Optimizer flow SVG: {store.root / 'optimizer_flow.svg'}")
+        print(f"Champion tree graph: {store.champion_tree_graph_path}")
+        print(f"Champion tree SVG: {store.champion_tree_svg_path}")
+        if trace:
+            best = max(trace, key=lambda row: float(row.get("best_mean_edge") or row.get("best_score") or 0.0))
+            parameter_like = sum(1 for row in trace if row.get("all_variants_parameter_nudges"))
+            print(
+                "Optimizer summary: "
+                f"{len(trace)} round(s), best mean_edge={best.get('best_mean_edge')}, "
+                f"best score={float(best.get('best_score') or 0.0):.3f}, "
+                f"parameter-like rounds={parameter_like}/{len(trace)}"
+            )
+        else:
+            print("Optimizer summary: no optimizer rounds found in this run directory.")
+        return
     output_dir = args.benchmark_output or Path("benchmarks") / timestamp_slug()
     output_dir.mkdir(parents=True, exist_ok=True)
     runs = collect_runs(args.outputs)
@@ -105,6 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Directory where benchmark charts and summaries should be written.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Regenerate the per-run benchmark, optimizer trace, and optimizer flow diagram for one outputs/<run> directory.",
     )
     return parser
 

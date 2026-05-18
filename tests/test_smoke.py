@@ -31,9 +31,9 @@ from research_harness.evals import (
 from research_harness.evals.cli import build_parser as build_eval_parser
 from research_harness.agents import SynthesisAgent
 from research_harness.llm import LLMClient, LLMError
-from research_harness.loops import EvaluatorRegistry, EvolutionaryOuterLoop, ResearchLoop, TaskRouter
+from research_harness.loops import EvaluatorRegistry, EvaluatorResult, EvolutionaryOuterLoop, OptimizeLoop, PlateauDetector, ResearchLoop, TaskRouter
 from research_harness.orchestrator import HarnessConfig, Orchestrator, goal_slug
-from research_harness.schemas import AgentTrace, Claim, Contradiction, Hypothesis, RunRecord, Source, Variant, VariantEvaluation
+from research_harness.schemas import AgentTrace, Claim, Contradiction, EvolutionRound, Hypothesis, RunRecord, Source, SourceStrategyItem, Variant, VariantEvaluation
 from research_harness.search import CorpusDocument, LocalCorpusSearch, OpenAlexSearch, SemanticScholarSearch, _parse_arxiv_feed, _score_documents
 from research_harness.sessions import SessionStore
 from research_harness.store import ArtifactStore
@@ -131,6 +131,24 @@ class SmokeTest(unittest.TestCase):
         self.assertTrue(args.preflight)
         self.assertEqual(args.preflight_suite, "preflight")
         self.assertEqual(args.preflight_eval_ids, ["research_uses_at_least_four_source_families"])
+        self.assertFalse(args.no_steering)
+
+    def test_user_steering_inbox_ingests_articles_as_sources_and_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            store.append_user_steering(
+                "/article https://example.edu/paper | Useful mechanism paper | This suggests a fresh evaluation angle."
+            )
+            ingested = store.ingest_pending_user_steering("run_steering")
+
+            sources = store.list("sources")
+            claims = store.list("claims")
+
+        self.assertEqual(ingested, 1)
+        self.assertEqual(sources[0]["url"], "https://example.edu/paper")
+        self.assertEqual(sources[0]["source_type"], "user_steering")
+        self.assertEqual(claims[0]["created_by_agent"], "user_steering")
+        self.assertIn("fresh evaluation angle", claims[0]["text"])
 
     def test_interactive_cli_setup_collects_run_choices(self) -> None:
         parser = build_parser()
@@ -178,6 +196,53 @@ class SmokeTest(unittest.TestCase):
 
         self.assertEqual(configured.task_mode, "optimize_query")
         self.assertEqual(configured.evaluator, "prediction_market")
+        self.assertEqual(configured.optimization_preset, "challenge")
+
+    def test_cli_accepts_optimization_challenge_knobs(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "optimize kernel challenge",
+                "--task-mode",
+                "optimize",
+                "--evaluator",
+                "length_score",
+                "--optimization-preset",
+                "challenge",
+                "--population-size",
+                "64",
+                "--parent-count",
+                "5",
+                "--parallel-evaluator-cap",
+                "12",
+            ]
+        )
+
+        self.assertEqual(args.optimization_preset, "challenge")
+        self.assertEqual(args.population_size, 64)
+        self.assertEqual(args.parent_count, 5)
+        self.assertEqual(args.parallel_evaluator_cap, 12)
+
+    def test_challenge_preset_expands_optimizer_defaults(self) -> None:
+        config = HarnessConfig(
+            optimization_preset="challenge",
+            max_loop_iterations=12,
+            evolution_population_size=4,
+            optimizer_parent_count=2,
+            parallel_evaluator_cap=8,
+        )
+        orchestrator = Orchestrator(
+            Path("examples/corpus/research_corpus.json"),
+            Path("outputs"),
+            config=config,
+        )
+
+        self.assertEqual(orchestrator.config.max_loop_iterations, 20)
+        self.assertEqual(orchestrator.config.evolution_population_size, 48)
+        self.assertEqual(orchestrator.config.optimizer_parent_count, 4)
+        self.assertEqual(orchestrator.config.parallel_evaluator_cap, 16)
+        self.assertEqual(orchestrator.config.optimize_plateau_patience, 5)
+        self.assertTrue(orchestrator.config.continue_on_optimize_plateau)
 
     def test_prediction_market_evaluator_overrides_plain_optimize_to_challenge_flow(self) -> None:
         router = TaskRouter(EvaluatorRegistry())
@@ -191,6 +256,96 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(decision.selected_mode, "optimize_query")
         self.assertEqual(decision.product_agent, "challenge")
         self.assertEqual(decision.evaluator_name, "prediction_market")
+
+    def test_optimize_loop_records_json_evaluator_responses_and_failures(self) -> None:
+        def evaluator(payload: str) -> EvaluatorResult:
+            if payload == "bad":
+                raise TimeoutError("benchmark timed out")
+            return EvaluatorResult(
+                score=0.42,
+                status="completed",
+                metrics={"latency_ms": 12.5},
+                diagnostics={"correctness": "passed"},
+                loss_reason="slower_than_baseline",
+                summary="Variant was correct but slow.",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            variants = [
+                Variant(
+                    run_id="run_json_eval",
+                    outer_iteration=1,
+                    kind="code",
+                    payload="good",
+                    parent_ids=[],
+                    metadata={"strategy_family": "control_baseline", "mechanism_hypothesis": "test direction metadata"},
+                ),
+                Variant(run_id="run_json_eval", outer_iteration=1, kind="code", payload="bad", parent_ids=[], metadata={}),
+            ]
+            for variant in variants:
+                store.add_variant(variant)
+            result = asyncio.run(OptimizeLoop("run_json_eval", evaluator, parallel_evaluator_cap=1).evaluate(variants, store))
+            evaluations = store.list("variant_evaluations")
+
+        self.assertEqual(len(result.ranked_evaluations), 2)
+        self.assertEqual(len(evaluations), 2)
+        json_responses = [row["metrics"]["json_response"] for row in evaluations]
+        self.assertTrue(all(isinstance(response, dict) for response in json_responses))
+        self.assertIn("slower_than_baseline", {response["loss_reason"] for response in json_responses})
+        self.assertIn("timeout", {response["loss_reason"] for response in json_responses})
+        self.assertTrue(all(row["summary"].startswith("{") for row in evaluations))
+        self.assertEqual(evaluations[0]["metrics"]["direction"]["strategy_family"], "control_baseline")
+
+    def test_direction_entropy_forces_multiple_code_families_and_novelty_slots(self) -> None:
+        outer = EvolutionaryOuterLoop(
+            run_id="run_direction_entropy",
+            goal="optimize a matrix multiplication kernel for latency and correctness",
+            task_mode="optimize",
+            source_strategy=[],
+            search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+            evaluator_name="length_score",
+            population_size=12,
+            novelty_fraction=0.25,
+        )
+
+        variants = outer._propose_code_variants(1, [], None)
+        families = {variant.metadata.get("strategy_family") for variant in variants}
+        roles = {variant.metadata.get("entropy_role") for variant in variants}
+
+        self.assertEqual(len(variants), 12)
+        self.assertGreaterEqual(len(families), 6)
+        self.assertIn("novelty", roles)
+        self.assertIn("ablation", roles)
+        self.assertTrue(all(variant.metadata.get("mechanism_hypothesis") for variant in variants))
+        self.assertTrue(all(variant.metadata.get("paired_crn") is True for variant in variants))
+        self.assertTrue(any("strategy_family=" in variant.payload for variant in variants))
+
+    def test_direction_entropy_forces_multiple_research_query_directions(self) -> None:
+        outer = EvolutionaryOuterLoop(
+            run_id="run_query_direction_entropy",
+            goal="research robustness methods for automated theorem proving agents",
+            task_mode="research",
+            source_strategy=[
+                SourceStrategyItem(
+                    name="local",
+                    retriever="local",
+                    purpose="local corpus",
+                    queries=["automated theorem proving agent robustness"],
+                    limit=6,
+                )
+            ],
+            search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+            population_size=8,
+        )
+
+        variants = outer._propose_query_variants(1, [], None)
+        families = {variant.metadata.get("strategy_family") for variant in variants}
+
+        self.assertEqual(len(variants), 8)
+        self.assertGreaterEqual(len(families), 6)
+        self.assertTrue(all("mechanism_hypothesis:" in variant.payload for variant in variants))
+        self.assertTrue(all(variant.metadata.get("eval_protocol") == "paired_crn_same_seeds_across_variants" for variant in variants))
 
     def test_plan_uses_llm_interpretation_for_typoed_prediction_market_goal(self) -> None:
         class FakePlannerLLM:
@@ -561,6 +716,14 @@ class SmokeTest(unittest.TestCase):
             self.assertTrue(store.optimal_code_path.exists())
             optimization_result = json.loads(store.optimization_result_path.read_text(encoding="utf-8"))
             self.assertEqual(optimization_result["optimal_code_path"], str(store.optimal_code_path))
+            optimizer_trace = json.loads((store.root / "optimizer_trace.json").read_text(encoding="utf-8"))
+            self.assertTrue(optimizer_trace)
+            self.assertTrue((store.root / "optimizer_flow.mmd").exists())
+            self.assertTrue((store.root / "optimizer_flow.png").exists())
+            self.assertTrue(store.champion_tree_graph_path.exists())
+            self.assertTrue(store.champion_tree_svg_path.exists())
+            self.assertTrue(store.champion_tree_mermaid_path.exists())
+            self.assertIn("Optimizer Trace", store.run_benchmark_path.read_text(encoding="utf-8"))
 
     def test_optimize_query_mode_feeds_optimizer_with_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -742,27 +905,29 @@ class SmokeTest(unittest.TestCase):
             self.assertIn("optimize_query", inner_loops)
             self.assertIn("optimize", inner_loops)
             self.assertIn("prediction_market", progress)
-            self.assertTrue(store.optimized_candidate_path.exists())
-            self.assertTrue(store.optimal_code_path.exists())
             self.assertTrue(store.optimization_result_path.exists())
-            self.assertTrue(store.solution_path.exists())
-            self.assertIn("class Strategy", store.solution_path.read_text(encoding="utf-8"))
-            self.assertIn("class Strategy", store.optimal_code_path.read_text(encoding="utf-8"))
             optimization_result = json.loads(store.optimization_result_path.read_text(encoding="utf-8"))
             self.assertEqual(optimization_result["objective_direction"], "maximize")
             self.assertEqual(optimization_result["objective_name"], "prediction_market_mean_edge")
-            self.assertEqual(optimization_result["optimal_code_path"], str(store.optimal_code_path))
             score_source = optimization_result["official_result"]["score_source"]
             measured = optimization_result["official_result"]["measured"]
-            self.assertIn(score_source, {"local_sandbox_strategy_execution", "local_official_semantics_fallback", "upstream_orderbook_pm_challenge"})
-            if score_source == "local_sandbox_strategy_execution":
-                self.assertTrue(optimization_result["official_result"]["sandbox_executed"])
-            self.assertEqual(optimization_result["official_result"]["simulations"], 200)
+            self.assertIn(score_source, {"upstream_repo_missing", "official_sandbox_failed", "official_scorer_json_error", "official_scorer_no_successes", "upstream_orderbook_pm_challenge"})
             # measured must be truthful: True iff the upstream runner was used.
             if score_source == "upstream_orderbook_pm_challenge":
                 self.assertTrue(measured)
+                self.assertTrue(optimization_result["official_result"]["score_eligible"])
+                self.assertTrue(store.optimized_candidate_path.exists())
+                self.assertTrue(store.optimal_code_path.exists())
+                self.assertTrue(store.solution_path.exists())
+                self.assertIn("class Strategy", store.solution_path.read_text(encoding="utf-8"))
+                self.assertIn("class Strategy", store.optimal_code_path.read_text(encoding="utf-8"))
+                self.assertEqual(optimization_result["optimal_code_path"], str(store.optimal_code_path))
             else:
                 self.assertFalse(measured)
+                self.assertFalse(optimization_result["official_result"]["score_eligible"])
+                self.assertFalse(store.optimized_candidate_path.exists())
+                self.assertFalse(store.optimal_code_path.exists())
+                self.assertFalse(store.solution_path.exists())
             self.assertTrue(Path(optimization_result["official_result"]["candidate_path"]).exists())
             self.assertTrue(any("Prediction Market" in source["title"] for source in store.list("sources")))
             prd = json.loads(store.prd_path.read_text(encoding="utf-8"))
@@ -786,15 +951,14 @@ class SmokeTest(unittest.TestCase):
             )
             run, store = asyncio.run(orchestrator.run("optimizing the predictionm arket mm'ing, get to 10$"))
 
-            report = store.report_path.read_text(encoding="utf-8")
-
             self.assertEqual(run.task_mode, "optimize_query")
             self.assertEqual(run.product_agent, "challenge")
-            self.assertIn("Prediction Market", report)
-            self.assertIn("prediction_market", report)
-            self.assertNotIn("Review of deep learning", report)
-            self.assertNotIn("Brain Tumor", report)
-            self.assertNotIn("G*Power", report)
+            result = json.loads(store.optimization_result_path.read_text(encoding="utf-8"))
+            self.assertFalse(result["official_result"]["measured"])
+            self.assertFalse(result["official_result"]["score_eligible"])
+            self.assertFalse(store.report_path.exists())
+            progress = store.progress_path.read_text(encoding="utf-8")
+            self.assertIn("prediction_market", progress)
 
     def test_research_report_filters_placeholder_and_challenge_references(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1332,8 +1496,8 @@ class EvaluationHarnessTest(unittest.TestCase):
             )
 
             self.assertEqual(summary.trial_count, 1)
-            self.assertEqual(summary.passed_trials, 1)
-            self.assertGreaterEqual(summary.aggregate_score, 0.8)
+            self.assertEqual(summary.passed_trials, 0)
+            self.assertLess(summary.aggregate_score, 0.8)
             self.assertTrue((Path(directory) / "core_summary.json").exists())
             trial = summary.trials[0]
             isolation = trial["isolation"]
@@ -1343,9 +1507,9 @@ class EvaluationHarnessTest(unittest.TestCase):
             self.assertIn("Orchestrator", isolation["production_agent_path"])
             graders = {result["grader_id"]: result for result in trial["grader_results"]}
             self.assertIn("optimization_code_artifact", graders)
-            self.assertTrue(graders["optimization_code_artifact"]["passed"])
+            self.assertFalse(graders["optimization_code_artifact"]["passed"])
             self.assertIn("prediction_market_solution", graders)
-            self.assertTrue(graders["prediction_market_solution"]["passed"])
+            self.assertFalse(graders["prediction_market_solution"]["passed"])
             self.assertIn("isolation_clean_trial", graders)
             self.assertTrue(graders["isolation_clean_trial"]["passed"])
 
@@ -1674,6 +1838,72 @@ class ArxivRetrieverTest(unittest.TestCase):
         self.assertFalse(any("lmsr" in variant.payload.lower() for variant in round_two))
         self.assertFalse(any("adverse" in variant.payload.lower() for variant in round_two))
 
+    def test_optimizer_champion_promotion_writes_highlighted_tree_and_guides_next_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            outer = EvolutionaryOuterLoop(
+                run_id="run_champion",
+                goal="optimize tiny kernel",
+                task_mode="optimize",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="length_score",
+                population_size=4,
+                parent_count=3,
+            )
+            variants = [
+                Variant(run_id="run_champion", outer_iteration=1, kind="code", payload=f"candidate {index}", parent_ids=[], metadata={})
+                for index in range(4)
+            ]
+            for variant in variants:
+                store.add_variant(variant)
+            evaluations = [
+                VariantEvaluation(
+                    run_id="run_champion",
+                    variant_id=variants[2].id,
+                    inner_loop="optimize",
+                    score=0.7,
+                    metrics={"json_response": {"score": 0.7, "status": "completed"}},
+                    judge_scores=[0.7],
+                    summary="{}",
+                    passed=False,
+                ),
+                VariantEvaluation(
+                    run_id="run_champion",
+                    variant_id=variants[1].id,
+                    inner_loop="optimize",
+                    score=0.5,
+                    metrics={"json_response": {"score": 0.5, "status": "completed"}},
+                    judge_scores=[0.5],
+                    summary="{}",
+                    passed=False,
+                ),
+            ]
+            for evaluation in evaluations:
+                store.add_variant_evaluation(evaluation)
+            store.add_evolution_round(
+                EvolutionRound(
+                    run_id="run_champion",
+                    outer_iteration=1,
+                    mode="optimize",
+                    variant_ids=[variant.id for variant in variants],
+                    best_variant_id=variants[2].id,
+                    best_score=0.7,
+                    termination_signal="continue",
+                    plateau_count=0,
+                )
+            )
+            outer._promote_round_champion(store, 1, variants, evaluations, loop_name="optimizer_loop")
+            tree = json.loads(store.champion_tree_path.read_text(encoding="utf-8"))
+            current_champion_exists = store.current_champion_path.exists()
+            next_variants = outer._propose_code_variants(2, variants[:3], store)
+
+        self.assertEqual(tree["global_champion_variant_id"], variants[2].id)
+        champion_nodes = [node for node in tree["nodes"] if node["highlight"] == "global_champion"]
+        self.assertEqual(len(champion_nodes), 1)
+        self.assertTrue(current_champion_exists)
+        self.assertTrue(all("diff_against_champion" in variant.payload for variant in next_variants))
+
     def test_prediction_market_plateau_grounding_can_refresh_literature(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory) / "run")
@@ -1694,6 +1924,218 @@ class ArxivRetrieverTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(grounding_claims), 2)
         self.assertTrue(any("prediction_market_plateau_round_2" in claim["text"] for claim in grounding_claims))
+
+    def test_prediction_market_first_stall_fetches_fresh_literature(self) -> None:
+        strategy_code = textwrap.dedent("""\
+            from orderbook_pm_challenge.strategy import BaseStrategy
+            from orderbook_pm_challenge.types import CancelAll, StepState
+
+            class Strategy(BaseStrategy):
+                def on_step(self, state: StepState):
+                    return [CancelAll()]
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            outer = EvolutionaryOuterLoop(
+                run_id="run_pm_first_stall",
+                goal="prediction market market making strategy",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="prediction_market",
+                max_outer_iterations=2,
+            )
+            recorded_reasons: list[str] = []
+
+            def propose(round_index: int, parents: list[Variant], _store: ArtifactStore) -> list[Variant]:
+                return [
+                    Variant(
+                        run_id=outer.run_id,
+                        outer_iteration=round_index,
+                        kind="code",
+                        payload=strategy_code,
+                        parent_ids=[parent.id for parent in parents],
+                        metadata={"challenge": "prediction_market"},
+                    )
+                ]
+
+            async def evaluate(variant: Variant, _store: ArtifactStore, _round_index: int) -> VariantEvaluation:
+                return VariantEvaluation(
+                    run_id=outer.run_id,
+                    variant_id=variant.id,
+                    inner_loop="optimize",
+                    score=0.5,
+                    metrics={
+                        "mean_edge": -0.02,
+                        "score_eligible": True,
+                        "score_source": "upstream_orderbook_pm_challenge",
+                    },
+                    judge_scores=[0.5],
+                    summary="upstream orderbook-pm mean_edge=-0.020",
+                    passed=False,
+                )
+
+            async def record_literature(_store: ArtifactStore, reason: str) -> None:
+                recorded_reasons.append(reason)
+
+            outer._propose_prediction_market_variants = propose  # type: ignore[method-assign]
+            outer._evaluate_prediction_market_variant = evaluate  # type: ignore[method-assign]
+            outer._record_literature_grounding = record_literature  # type: ignore[method-assign]
+
+            asyncio.run(outer._run_prediction_market_optimizer(store, [], {"summary": ""}))
+            query = outer._literature_grounding_query("prediction_market_first_stall_round_2", store)
+
+        self.assertIn("prediction_market_first_stall_round_2", recorded_reasons)
+        self.assertIn("literature", query)
+        self.assertIn("mechanism", query)
+        self.assertNotIn("adverse selection", query)
+        self.assertNotIn("inventory skew", query)
+        self.assertNotIn("avellaneda", query.lower())
+        self.assertNotIn("glosten", query.lower())
+        self.assertNotIn("outputs", query)
+
+    def test_plateau_recovery_records_meaningful_entropy_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            outer = EvolutionaryOuterLoop(
+                run_id="run_entropy_recovery",
+                goal="prediction market market making strategy",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="prediction_market",
+                population_size=4,
+            )
+            plateau = PlateauDetector("optimize")
+            plateau.update(0.5)
+            plateau.update(0.5)
+            store.add_evolution_round(
+                EvolutionRound(
+                    run_id="run_entropy_recovery",
+                    outer_iteration=2,
+                    mode="optimize",
+                    variant_ids=[],
+                    best_variant_id=None,
+                    best_score=0.5,
+                    termination_signal="score_plateau",
+                    plateau_count=2,
+                )
+            )
+            outer._apply_plateau_recovery(plateau, store, 2, "score_plateau")
+            variants = outer._propose_prediction_market_variants(3, [], store)
+            for variant in variants:
+                store.add_variant(variant)
+
+            result = default_graders()["plateau_entropy_exploration"].grade(
+                EvalTask(
+                    id="entropy",
+                    name="entropy",
+                    prompt="prediction market",
+                    task_mode="optimize_query",
+                    success_criteria=[],
+                ),
+                store,
+            )
+            claims = store.list("claims")
+            persisted_variants = store.list("variants")
+
+        self.assertTrue(result.passed)
+        self.assertTrue(any("expected to improve generalization" in claim["text"].lower() for claim in claims))
+        self.assertTrue(
+            any(
+                isinstance(variant.get("metadata", {}).get("meaningful_entropy_intent"), dict)
+                for variant in persisted_variants
+            )
+        )
+
+    def test_broad_optimizer_plateau_branches_instead_of_stopping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            outer = EvolutionaryOuterLoop(
+                run_id="run_broad_plateau",
+                goal="optimization challenge",
+                task_mode="optimize",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="length_score",
+                population_size=48,
+                parent_count=4,
+                max_outer_iterations=20,
+                optimize_plateau_patience=5,
+                continue_on_optimize_plateau=True,
+            )
+            plateau = PlateauDetector("optimize", patience=5)
+            signal = "continue"
+            for _ in range(6):
+                signal = plateau.update(0.2)
+            should_stop = outer._should_stop_outer_loop(
+                "score_plateau",
+                VariantEvaluation(
+                    run_id="run_broad_plateau",
+                    variant_id="variant_best",
+                    inner_loop="optimize",
+                    score=0.2,
+                    metrics={},
+                    judge_scores=[0.2],
+                    summary="{}",
+                    passed=False,
+                ),
+                5,
+            )
+            outer._apply_plateau_recovery(plateau, store, 5, signal)
+
+        self.assertEqual(signal, "score_plateau")
+        self.assertFalse(should_stop)
+        self.assertEqual(outer.population_size, 64)
+        self.assertGreaterEqual(outer._recovery_temperature, 1.05)
+
+    def test_plateau_entropy_grader_rejects_hyperparameter_only_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            store.add_evolution_round(
+                EvolutionRound(
+                    run_id="run_bad_entropy",
+                    outer_iteration=2,
+                    mode="optimize",
+                    variant_ids=[],
+                    best_variant_id=None,
+                    best_score=0.4,
+                    termination_signal="score_plateau",
+                    plateau_count=2,
+                )
+            )
+            store.add_variant(
+                Variant(
+                    run_id="run_bad_entropy",
+                    outer_iteration=3,
+                    kind="code",
+                    payload="same strategy temperature=1.2 seed=44",
+                    parent_ids=[],
+                    metadata={
+                        "meaningful_entropy_intent": {
+                            "action": "boost_temperature",
+                            "exploration_path": "raise temperature",
+                            "expected_generalization": "",
+                        }
+                    },
+                )
+            )
+
+            result = default_graders()["plateau_entropy_exploration"].grade(
+                EvalTask(
+                    id="bad_entropy",
+                    name="bad entropy",
+                    prompt="prediction market",
+                    task_mode="optimize_query",
+                    success_criteria=[],
+                ),
+                store,
+            )
+
+        self.assertFalse(result.passed)
+        failed_checks = {assertion["check"] for assertion in result.assertions if not assertion["passed"]}
+        self.assertIn("not_hyperparameter_only", failed_checks)
+        self.assertIn("intent_records_expected_generalization", failed_checks)
 
 
 class SkillSpecTest(unittest.TestCase):
@@ -1884,6 +2326,31 @@ class PredictionMarketSandboxTest(unittest.TestCase):
         # official_measured must be False; only the upstream runner sets it True.
         self.assertFalse(result["official_measured"])
         self.assertNotEqual(result.get("score_source"), "upstream_orderbook_pm_challenge")
+
+    def test_official_scorer_path_requires_upstream_orderbook_repo(self) -> None:
+        from research_harness.loops import _find_pm_upstream_path, _is_pm_upstream_repo
+
+        project_root = Path(__file__).resolve().parents[1]
+        self.assertFalse(_is_pm_upstream_repo(project_root / "challenges" / "prediction_market"))
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "prediction-market-challenge"
+            package_dir = repo / "orderbook_pm_challenge"
+            package_dir.mkdir(parents=True)
+            (repo / "pyproject.toml").write_text(
+                '[project]\nname = "orderbook-pm-challenge"\n'
+                '[project.scripts]\norderbook-pm = "orderbook_pm_challenge.cli:main"\n',
+                encoding="utf-8",
+            )
+            prev = os.environ.get("PREDICTION_MARKET_CHALLENGE_PATH")
+            os.environ["PREDICTION_MARKET_CHALLENGE_PATH"] = str(repo)
+            try:
+                self.assertEqual(_find_pm_upstream_path(), repo)
+            finally:
+                if prev is None:
+                    del os.environ["PREDICTION_MARKET_CHALLENGE_PATH"]
+                else:
+                    os.environ["PREDICTION_MARKET_CHALLENGE_PATH"] = prev
 
 
 @unittest.skipUnless(os.environ.get("RUN_PM_UPSTREAM") == "1", "Set RUN_PM_UPSTREAM=1 to test the uv run path against the upstream repo.")

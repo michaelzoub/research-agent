@@ -27,6 +27,7 @@ from .optimize import (
     _grade_optimize_query_phases,
     _grade_optimize_score,
     _grade_optimizer_skipped_without_evaluator,
+    _grade_plateau_entropy_exploration,
     _grade_research_search_budget,
     _grade_seed_context,
 )
@@ -80,6 +81,7 @@ def default_graders() -> dict[str, Grader]:
         "prediction_market_candidate_files_only_in_outputs": Grader("prediction_market_candidate_files_only_in_outputs", "code", "artifact containment", 1.0, 1.0, _grade_prediction_market_candidate_files_only_in_outputs),
         "no_repo_root_strategy_files": Grader("no_repo_root_strategy_files", "code", "artifact containment", 1.0, 1.0, _grade_no_repo_root_strategy_files),
         "optimizer_skipped_without_evaluator": Grader("optimizer_skipped_without_evaluator", "code", "negative-path outcome verification", 1.0, 1.0, _grade_optimizer_skipped_without_evaluator),
+        "plateau_entropy_exploration": Grader("plateau_entropy_exploration", "code", "anti-reward-hack plateau exploration", 1.0, 1.0, _grade_plateau_entropy_exploration),
         "research_search_budget": Grader("research_search_budget", "code", "search budget verification", 1.0, 1.0, _grade_research_search_budget),
         "trajectory_modes": Grader("trajectory_modes", "code", "trajectory subset/superset match", 1.0, 1.0, _grade_trajectory_modes),
         "multi_iteration_loop": Grader("multi_iteration_loop", "code", "multi-round trajectory check", 1.0, 1.0, _grade_multi_iteration_loop),

@@ -22,6 +22,8 @@ cd research-agent
 
 `./autore` with no arguments opens a selection-based setup. Use Up/Down to move through choices and Enter to select. The setup asks plain questions, then starts the run for you.
 
+The CLI opens with an Autore banner, quick command reminders, and a guided prompt. It also groups the finished run into "Open first", optimization artifacts, and diagnostics so the useful files are easier to spot.
+
 Optional install, so `autore` works from anywhere:
 
 ```bash
@@ -231,6 +233,20 @@ Use these when you want repeatable commands instead of the guided setup.
 | `--llm-provider auto` | Infer provider from the selected model. |
 | `--llm-provider openai` / `anthropic` / `local` / `multi` | Force a provider mode. |
 | `--llm-model all-configured` | Use every configured available model round-robin. |
+| `--no-steering` | Disable live `/article`, `/steer`, and `/note` input during terminal runs. |
+
+During a normal terminal run, you can steer the next proposal round without
+stopping the agent:
+
+```text
+/article https://example.edu/paper | Paper title | Why this should matter
+/steer The last variants all failed on the same observed scorer behavior; explore a different mechanism.
+/note Locally found source says the evaluator exposes this state field.
+```
+
+Steering input is recorded in `user_steering_inbox.jsonl`, ingested at the next
+round boundary, and persisted as user-provided sources/claims before it affects
+queries or candidate proposals.
 | `--llm-model openai/gpt-5.2` | Use one specific model. |
 | `--list-llm-models` | Print the configured model catalog and exit. |
 | `--max-iterations N` | Set the outer-loop iteration budget. |

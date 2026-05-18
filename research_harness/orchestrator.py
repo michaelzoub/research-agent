@@ -31,6 +31,7 @@ from .search import SocialWebSearch
 from .search import WebSearch
 from .search import WikipediaSearch
 from .sessions import SessionStore, default_session_projects_dir
+from .steering import start_cli_steering
 from .store import ArtifactStore
 
 
@@ -97,6 +98,13 @@ class HarnessConfig:
     task_mode: str = "auto"
     evaluator_name: Optional[str] = None
     evolution_population_size: int = 4
+    optimization_preset: str = "standard"
+    optimizer_parent_count: int = 2
+    parallel_evaluator_cap: int = 8
+    optimize_plateau_patience: int = 2
+    continue_on_optimize_plateau: bool = False
+    force_direction_entropy: bool = True
+    novelty_fraction: float = 0.25
     llm_provider: str = "auto"
     llm_model: str = "gpt-5.2"
     research_lead_model: Optional[str] = None
@@ -106,6 +114,7 @@ class HarnessConfig:
     fork_session_id: Optional[str] = None
     enable_sessions: bool = True
     echo_progress: bool = True
+    enable_steering: bool = False
     default_budget: AgentBudget = field(default_factory=AgentBudget)
 
 
@@ -114,6 +123,13 @@ class Orchestrator:
         self.corpus_path = corpus_path
         self.output_root = output_root
         self.config = config or HarnessConfig()
+        if self.config.optimization_preset == "challenge":
+            self.config.max_loop_iterations = max(self.config.max_loop_iterations, 20)
+            self.config.evolution_population_size = max(self.config.evolution_population_size, 48)
+            self.config.optimizer_parent_count = max(self.config.optimizer_parent_count, 4)
+            self.config.parallel_evaluator_cap = 16 if self.config.parallel_evaluator_cap == 8 else max(1, self.config.parallel_evaluator_cap)
+            self.config.optimize_plateau_patience = max(self.config.optimize_plateau_patience, 5)
+            self.config.continue_on_optimize_plateau = True
         self.evaluator_registry = EvaluatorRegistry()
         self.llm = LLMClient(provider=self.config.llm_provider, model=self.config.llm_model)
         if self.config.llm_provider == "openai" and not self.llm.is_live:
@@ -137,6 +153,7 @@ class Orchestrator:
         )
         session_store = self._start_session_store(goal, run)
         store = ArtifactStore(self.output_root / run.id, echo_progress=self.config.echo_progress, session_store=session_store)
+        steering_handle = start_cli_steering(store) if self.config.enable_steering else None
         store.add_run(run)
         store.write_prior_run_memory(prior_run_memory)
         store.append_progress(f"Starting run {run.id}")
@@ -203,6 +220,8 @@ class Orchestrator:
             )
             if session_store is not None:
                 session_store.complete_session(status=run.status, summary=f"Run {run.id} {run.status}.")
+            if steering_handle is not None:
+                steering_handle.stop()
         return run, store
 
     def _start_session_store(self, goal: str, run: RunRecord) -> Optional[SessionStore]:
@@ -640,6 +659,8 @@ class Orchestrator:
         population_size = self.config.evolution_population_size
         if decision.selected_mode == "research" and plan.task_type == "bounded":
             population_size = 1
+        if self.config.optimization_preset == "challenge" and decision.selected_mode in {"optimize", "optimize_query"}:
+            population_size = max(population_size, 48)
         outer_loop = EvolutionaryOuterLoop(
             run_id=run.id,
             goal=run.user_goal,
@@ -650,6 +671,12 @@ class Orchestrator:
             evaluator_name=decision.evaluator_name,
             max_outer_iterations=self.config.max_loop_iterations,
             population_size=population_size,
+            parent_count=self.config.optimizer_parent_count,
+            parallel_evaluator_cap=self.config.parallel_evaluator_cap,
+            optimize_plateau_patience=self.config.optimize_plateau_patience,
+            continue_on_optimize_plateau=self.config.continue_on_optimize_plateau,
+            force_direction_entropy=self.config.force_direction_entropy,
+            novelty_fraction=self.config.novelty_fraction,
             llm=self.llm,
             prior_run_memory=_read_json_if_exists(store.prior_run_memory_path),
         )

@@ -645,6 +645,51 @@ def _round_rows_html(summary: dict[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def _optimizer_trace_rows_html(summary: dict[str, Any]) -> str:
+    trace = summary.get("optimizer_trace") or []
+    if not trace:
+        return (
+            '<tr><td colspan="9" style="color:#94a3b8;text-align:center;padding:16px;">'
+            'No optimizer trace recorded.</td></tr>'
+        )
+    rows: list[str] = []
+    for item in trace:
+        score = float(item.get("best_score") or 0.0)
+        edge = item.get("best_mean_edge")
+        learned = bool(item.get("uses_prior_parent") or item.get("uses_score_feedback"))
+        parameter_only = bool(item.get("all_variants_parameter_nudges"))
+        status_color = "#16a34a" if learned and not parameter_only else "#f97316" if parameter_only else "#0284c7"
+        status = item.get("learning_status", "unknown")
+        rows.append(
+            "<tr>"
+            f'<td style="color:#64748b;">{html.escape(str(item.get("round", "—")))}</td>'
+            f'<td><span style="color:{status_color};font-size:11px;font-weight:700;">{html.escape(str(status))}</span></td>'
+            f'<td style="font-family:monospace;">{score:.3f}</td>'
+            f'<td style="font-family:monospace;">{html.escape(str(edge if edge is not None else "—"))}</td>'
+            f'<td>{html.escape(str(item.get("best_score_source") or "—"))}</td>'
+            f'<td>{item.get("variant_count", 0)} / {item.get("evaluation_count", 0)}</td>'
+            f'<td>{"yes" if item.get("uses_prior_parent") else "no"} / {"yes" if item.get("uses_score_feedback") else "no"}</td>'
+            f'<td>{"yes" if parameter_only else "no"}</td>'
+            f'<td style="color:#64748b;max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{html.escape(str(item.get("best_payload_preview") or ""))}</td>'
+            "</tr>"
+        )
+        for variant in item.get("variants", [])[:6]:
+            change = str(variant.get("change_type") or "unknown")
+            rows.append(
+                '<tr style="background:#fbfdff;">'
+                '<td></td>'
+                f'<td colspan="2" style="font-family:\'SF Mono\',\'Fira Code\',monospace;font-size:11px;color:#475569;">{html.escape(str(variant.get("variant_id") or ""))}</td>'
+                f'<td style="font-family:monospace;">{html.escape(str(variant.get("mean_edge") if variant.get("mean_edge") is not None else "—"))}</td>'
+                f'<td>{html.escape(str(variant.get("score_source") or "—"))}</td>'
+                f'<td>{html.escape(change)}</td>'
+                f'<td>{"yes" if variant.get("uses_prior_parent") else "no"} / {"yes" if variant.get("uses_score_feedback") else "no"}</td>'
+                f'<td>{html.escape(str(variant.get("meaningful_entropy_action") or "—"))}</td>'
+                f'<td style="color:#64748b;max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{html.escape(str(variant.get("payload_preview") or ""))}</td>'
+                '</tr>'
+            )
+    return "\n".join(rows)
+
+
 def write_run_benchmarks(store: ArtifactStore) -> None:
     if not store.harness_diagnosis_path.exists():
         store.write_harness_diagnosis()
@@ -657,10 +702,23 @@ def write_run_benchmarks(store: ArtifactStore) -> None:
     spans, num_rows, total_ms = _build_timeline_spans(summary, for_agent_chart=True)
     dag_svg = decision_dag_svg(summary)
     timeline_svg = _gantt_svg(spans, num_rows, total_ms)
+    optimizer_trace = summary.get("optimizer_trace") or []
+    optimizer_flow = optimizer_flow_mermaid(summary)
+    optimizer_flow_svg_text = optimizer_flow_svg(summary)
+    champion_tree = read_json(store.champion_tree_path, {})
+    champion_tree_graph = champion_tree_mermaid(champion_tree)
+    champion_tree_svg_text = champion_tree_svg(champion_tree)
     (store.root / "decision_dag.mmd").write_text(dag, encoding="utf-8")
+    (store.root / "optimizer_trace.json").write_text(json.dumps(optimizer_trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (store.root / "optimizer_flow.mmd").write_text(optimizer_flow, encoding="utf-8")
+    (store.root / "optimizer_flow.svg").write_text(optimizer_flow_svg_text, encoding="utf-8")
+    store.champion_tree_mermaid_path.write_text(champion_tree_graph, encoding="utf-8")
+    store.champion_tree_svg_path.write_text(champion_tree_svg_text, encoding="utf-8")
     _write_png_from_svg_or_fallback(store.decision_dag_path, dag_svg, lambda: decision_dag_png(summary))
     _write_png_from_svg_or_fallback(store.agent_timeline_path, timeline_svg, lambda: _gantt_png(spans, num_rows, total_ms))
-    (store.root / "run_benchmark.md").write_text(run_benchmark_markdown(summary, dag), encoding="utf-8")
+    _write_png_from_svg_or_fallback(store.root / "optimizer_flow.png", optimizer_flow_svg_text, lambda: optimizer_flow_png(summary))
+    _write_png_from_svg_or_fallback(store.champion_tree_graph_path, champion_tree_svg_text, lambda: champion_tree_png(champion_tree))
+    (store.root / "run_benchmark.md").write_text(run_benchmark_markdown(summary, dag, optimizer_flow), encoding="utf-8")
     (store.root / "run_benchmark.html").write_text(run_benchmark_html(summary), encoding="utf-8")
     store.run_notebook_path.write_text(json.dumps(run_notebook_export(summary), indent=2) + "\n", encoding="utf-8")
 
@@ -691,6 +749,7 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
     cost = read_json(store.cost_path, {})
     models = Counter(str(trace.get("model", "unknown")) for trace in traces)
     best_eval = max(evaluations, key=lambda row: float(row.get("score", 0.0)), default={})
+    optimizer_trace = build_optimizer_trace(rounds, variants, evaluations)
     return {
         "run": run,
         "counts": {
@@ -725,6 +784,7 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
         "variants": variants,
         "evaluations": evaluations,
         "best_evaluation": best_eval,
+        "optimizer_trace": optimizer_trace,
         "trace_summaries": [
             {
                 "agent_name":  trace.get("agent_name"),
@@ -739,6 +799,148 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
             for trace in traces
         ],
     }
+
+
+def build_optimizer_trace(rounds: list[dict[str, Any]], variants: list[dict[str, Any]], evaluations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    variant_by_id = {str(row.get("id")): row for row in variants}
+    evals_by_variant: dict[str, list[dict[str, Any]]] = {}
+    for evaluation in evaluations:
+        evals_by_variant.setdefault(str(evaluation.get("variant_id")), []).append(evaluation)
+    trace: list[dict[str, Any]] = []
+    previous_parent_ids: set[str] = set()
+    previous_best_payload = ""
+    previous_best_score: Optional[float] = None
+    optimizer_rounds = [row for row in rounds if row.get("mode") in {"optimize", "optimize_query"}]
+    for round_record in optimizer_rounds:
+        variant_ids = [str(variant_id) for variant_id in round_record.get("variant_ids", [])]
+        variant_rows = [variant_by_id[variant_id] for variant_id in variant_ids if variant_id in variant_by_id]
+        best_variant_id = str(round_record.get("best_variant_id") or "")
+        round_evals = [
+            evaluation
+            for variant_id in variant_ids
+            for evaluation in evals_by_variant.get(variant_id, [])
+        ]
+        round_evals.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
+        best_eval = next((evaluation for evaluation in round_evals if str(evaluation.get("variant_id")) == best_variant_id), round_evals[0] if round_evals else {})
+        best_variant = variant_by_id.get(best_variant_id, {})
+        variant_details = [
+            _optimizer_variant_detail(variant, evals_by_variant.get(str(variant.get("id")), []), previous_parent_ids, previous_best_payload)
+            for variant in variant_rows
+        ]
+        parent_links = sum(len(detail["parent_ids"]) for detail in variant_details)
+        prior_parent_reuse = any(detail["uses_prior_parent"] for detail in variant_details)
+        score_feedback_reuse = any(detail["uses_score_feedback"] for detail in variant_details)
+        meaningful_entropy = any(detail["change_type"] == "meaningful_entropy" for detail in variant_details)
+        entropy_label_only = any(detail["change_type"] == "entropy_label_on_numeric_mutation" for detail in variant_details)
+        parameter_like_types = {"parameter_nudge", "parameter_exploration", "context_derived_numeric_mutation", "entropy_label_on_numeric_mutation"}
+        parameter_only = bool(variant_details) and all(detail["change_type"] in parameter_like_types for detail in variant_details)
+        learn_status = "learned_from_prior_score_or_parent" if prior_parent_reuse or score_feedback_reuse else "fresh_or_unlinked_batch"
+        if parameter_only and not meaningful_entropy:
+            learn_status = f"{learn_status}_but_parameter_only"
+        if entropy_label_only:
+            learn_status = f"{learn_status}_entropy_label_only"
+        score = float(round_record.get("best_score", 0.0) or 0.0)
+        score_delta = None if previous_best_score is None else round(score - previous_best_score, 6)
+        metrics = best_eval.get("metrics") if isinstance(best_eval.get("metrics"), dict) else {}
+        trace.append(
+            {
+                "round": round_record.get("outer_iteration"),
+                "mode": round_record.get("mode"),
+                "termination_signal": round_record.get("termination_signal"),
+                "plateau_count": round_record.get("plateau_count", 0),
+                "variant_count": len(variant_details),
+                "evaluation_count": len(round_evals),
+                "best_variant_id": best_variant_id or None,
+                "best_score": score,
+                "best_score_delta_vs_previous_round": score_delta,
+                "best_mean_edge": metrics.get("mean_edge"),
+                "best_score_source": metrics.get("score_source"),
+                "best_summary": best_eval.get("summary", ""),
+                "best_payload_preview": _shorten(str(best_variant.get("payload", "")), 420),
+                "parent_links": parent_links,
+                "uses_prior_parent": prior_parent_reuse,
+                "uses_score_feedback": score_feedback_reuse,
+                "meaningful_entropy": meaningful_entropy,
+                "entropy_label_only": entropy_label_only,
+                "all_variants_parameter_nudges": parameter_only,
+                "learning_status": learn_status,
+                "variants": variant_details,
+            }
+        )
+        previous_parent_ids = {
+            str(evaluation.get("variant_id"))
+            for evaluation in round_evals[:2]
+            if evaluation.get("variant_id")
+        }
+        previous_best_payload = str(best_variant.get("payload", ""))
+        previous_best_score = score
+    return trace
+
+
+def _optimizer_variant_detail(
+    variant: dict[str, Any],
+    evaluations: list[dict[str, Any]],
+    previous_parent_ids: set[str],
+    previous_best_payload: str,
+) -> dict[str, Any]:
+    payload = str(variant.get("payload", ""))
+    metadata = variant.get("metadata") if isinstance(variant.get("metadata"), dict) else {}
+    parent_ids = [str(parent_id) for parent_id in variant.get("parent_ids", [])]
+    best_eval = max(evaluations, key=lambda row: float(row.get("score", 0.0) or 0.0), default={})
+    metrics = best_eval.get("metrics") if isinstance(best_eval.get("metrics"), dict) else {}
+    entropy = metadata.get("meaningful_entropy_intent") if isinstance(metadata.get("meaningful_entropy_intent"), dict) else {}
+    uses_prior_parent = bool(previous_parent_ids.intersection(parent_ids))
+    uses_score_feedback = bool(re.search(r"prior_best|score_memory|score_feedback|mean_edge|best_edge", payload, re.I))
+    if previous_best_payload:
+        uses_score_feedback = uses_score_feedback or _payload_mentions_parent(payload, previous_best_payload)
+    return {
+        "variant_id": variant.get("id"),
+        "kind": variant.get("kind"),
+        "score": best_eval.get("score"),
+        "mean_edge": metrics.get("mean_edge"),
+        "score_source": metrics.get("score_source"),
+        "passed": best_eval.get("passed"),
+        "summary": best_eval.get("summary", ""),
+        "parent_ids": parent_ids,
+        "uses_prior_parent": uses_prior_parent,
+        "uses_score_feedback": uses_score_feedback,
+        "change_type": _optimizer_change_type(payload, metadata, bool(entropy)),
+        "meaningful_entropy_action": entropy.get("action") if entropy else None,
+        "proposal_source": metadata.get("proposal_source"),
+        "recovery": metadata.get("recovery"),
+        "rendered_code_hash": metadata.get("rendered_code_hash"),
+        "payload_preview": _shorten(payload, 360),
+    }
+
+
+def _optimizer_change_type(payload: str, metadata: dict[str, Any], has_entropy: bool) -> str:
+    lowered = payload.lower()
+    recovery = str(metadata.get("recovery") or "")
+    if has_entropy and (recovery == "context_derived_numeric_mutation" or "contextual_parent_mutation" in lowered):
+        return "entropy_label_on_numeric_mutation"
+    if has_entropy:
+        return "meaningful_entropy"
+    if recovery:
+        return recovery
+    if "class strategy" in lowered:
+        return "executable_strategy_code"
+    if "contextual_parent_mutation" in lowered or "contextual_score_memory" in lowered:
+        return "parameter_nudge"
+    if "contextual_score_explore" in lowered:
+        return "parameter_exploration"
+    if "fresh_literature=" in lowered or "query_seed=" in lowered or "literature_inspiration=" in lowered:
+        return "fresh_context_or_literature"
+    if "new strategy" in lowered or "mechanism" in lowered or "alternative evaluator" in lowered:
+        return "strategy_shift"
+    return "unknown"
+
+
+def _payload_mentions_parent(payload: str, parent_payload: str) -> bool:
+    parent_terms = [term for term in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{5,}", parent_payload.lower()) if term not in {"contextual", "strategy", "parent"}]
+    if not parent_terms:
+        return False
+    payload_lower = payload.lower()
+    return sum(1 for term in set(parent_terms[:24]) if term in payload_lower) >= 3
 
 
 def run_notebook_export(summary: dict[str, Any]) -> dict[str, Any]:
@@ -764,6 +966,7 @@ def run_notebook_export(summary: dict[str, Any]) -> dict[str, Any]:
             f"- Model calls: `{cost.get('model_call_count', 0)}`\n"
         ),
         _code_cell("harness_diagnosis = " + json.dumps(diagnosis, indent=2, sort_keys=True)),
+        _code_cell("optimizer_trace = " + json.dumps(summary.get("optimizer_trace", []), indent=2, sort_keys=True)),
         _code_cell("trace_summaries = " + json.dumps(summary.get("trace_summaries", []), indent=2, sort_keys=True)),
     ]
     return {
@@ -826,6 +1029,278 @@ def decision_dag_mermaid(summary: dict[str, Any]) -> str:
         lines.append(f'  {node}["{_mermaid(label)}"]')
         lines.append(f"  continue --> {node}")
     return "\n".join(lines) + "\n"
+
+
+def optimizer_flow_mermaid(summary: dict[str, Any]) -> str:
+    trace = summary.get("optimizer_trace") or []
+    lines = ["flowchart LR"]
+    if not trace:
+        return "flowchart LR\n  none[\"No optimizer rounds recorded\"]\n"
+    lines.append('  seed["Seed context / prior findings"]')
+    previous = "seed"
+    for index, round_trace in enumerate(trace, start=1):
+        round_node = f"round{index}"
+        best_node = f"best{index}"
+        feedback_node = f"feedback{index}"
+        change = "parameter-only" if round_trace.get("all_variants_parameter_nudges") else "mixed/structural"
+        learned = "uses prior" if round_trace.get("uses_prior_parent") or round_trace.get("uses_score_feedback") else "unlinked"
+        label = (
+            f"Round {round_trace.get('round')}\\n"
+            f"{round_trace.get('variant_count', 0)} variants, {learned}\\n"
+            f"{change}"
+        )
+        best_label = (
+            f"Best {float(round_trace.get('best_score') or 0.0):.3f}\\n"
+            f"edge {round_trace.get('best_mean_edge', 'n/a')}\\n"
+            f"{round_trace.get('termination_signal', 'continue')}"
+        )
+        feedback_label = (
+            "Parent + score feedback"
+            if round_trace.get("uses_prior_parent") or round_trace.get("uses_score_feedback")
+            else "No parent/score link detected"
+        )
+        lines.append(f'  {round_node}["{_mermaid(label)}"]')
+        lines.append(f'  {best_node}["{_mermaid(best_label)}"]')
+        lines.append(f'  {feedback_node}["{_mermaid(feedback_label)}"]')
+        lines.append(f"  {previous} --> {round_node} --> {best_node} --> {feedback_node}")
+        previous = feedback_node
+    return "\n".join(lines) + "\n"
+
+
+def optimizer_flow_svg(summary: dict[str, Any]) -> str:
+    trace = summary.get("optimizer_trace") or []
+    if not trace:
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="960" height="120" viewBox="0 0 960 120" '
+            'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;">'
+            '<rect width="100%" height="100%" fill="#fff"/><text x="24" y="64" font-size="14" fill="#94a3b8">'
+            'No optimizer rounds recorded.</text></svg>'
+        )
+    card_w = 250
+    card_h = 156
+    gap_x = 26
+    gap_y = 34
+    left = 28
+    cards_per_row = 4
+    row_count = (len(trace) + cards_per_row - 1) // cards_per_row
+    width = max(960, left * 2 + cards_per_row * card_w + (cards_per_row - 1) * gap_x)
+    height = 86 + row_count * card_h + max(0, row_count - 1) * gap_y + 28
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;">',
+        '<defs><marker id="flowArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/></marker></defs>',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="24" y="32" font-size="18" font-weight="700" fill="#0f172a">Optimizer learning flow</text>',
+        '<text x="24" y="52" font-size="11" fill="#64748b">Shows whether each round used prior parents/scores and whether changes were structural or mostly parameter nudges.</text>',
+    ]
+    for index, round_trace in enumerate(trace):
+        row = index // cards_per_row
+        col = index % cards_per_row
+        x = left + col * (card_w + gap_x)
+        y = 78 + row * (card_h + gap_y)
+        score = float(round_trace.get("best_score") or 0.0)
+        edge = round_trace.get("best_mean_edge")
+        learned = bool(round_trace.get("uses_prior_parent") or round_trace.get("uses_score_feedback"))
+        parameter_only = bool(round_trace.get("all_variants_parameter_nudges"))
+        entropy = bool(round_trace.get("meaningful_entropy"))
+        entropy_label_only = bool(round_trace.get("entropy_label_only"))
+        fill = "#dcfce7" if learned and not parameter_only else "#ffedd5" if parameter_only else "#e0f2fe"
+        border = "#16a34a" if learned and not parameter_only else "#f97316" if parameter_only else "#0284c7"
+        status = "learned from prior" if learned else "no prior link detected"
+        change = "meaningful entropy" if entropy else "entropy label only" if entropy_label_only else "parameter nudge" if parameter_only else "mixed / structural"
+        parts.append(f'<rect x="{x}" y="{y}" width="{card_w}" height="{card_h}" rx="10" fill="{fill}" stroke="{border}" stroke-width="1.5"/>')
+        parts.append(f'<text x="{x + 12}" y="{y + 24}" font-size="13" font-weight="700" fill="#0f172a">Round {html.escape(str(round_trace.get("round")))}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 47}" font-size="11" fill="#334155">best score: {score:.3f}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 66}" font-size="11" fill="#334155">mean edge: {html.escape(str(edge if edge is not None else "n/a"))}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 85}" font-size="11" fill="#334155">variants: {round_trace.get("variant_count", 0)} / evals: {round_trace.get("evaluation_count", 0)}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 104}" font-size="11" fill="#334155">feedback: {html.escape(status)}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 123}" font-size="11" fill="#334155">change: {html.escape(change)}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 142}" font-size="11" fill="#64748b">{html.escape(str(round_trace.get("termination_signal", ""))[:28])}</text>')
+        if index < len(trace) - 1:
+            next_row = (index + 1) // cards_per_row
+            next_col = (index + 1) % cards_per_row
+            if next_row == row:
+                x1 = x + card_w
+                x2 = x + card_w + gap_x
+                y_mid = y + card_h // 2
+                parts.append(f'<path d="M{x1},{y_mid} L{x2},{y_mid}" fill="none" stroke="#64748b" stroke-width="1.6" marker-end="url(#flowArrow)"/>')
+                delta_x = x1 + 5
+                delta_y = y_mid - 11
+            else:
+                x1 = x + card_w // 2
+                y1 = y + card_h
+                x2 = left + next_col * (card_w + gap_x) + card_w // 2
+                y2 = 78 + next_row * (card_h + gap_y)
+                mid_y = y1 + gap_y // 2
+                parts.append(f'<path d="M{x1},{y1} L{x1},{mid_y} L{x2},{mid_y} L{x2},{y2}" fill="none" stroke="#64748b" stroke-width="1.6" marker-end="url(#flowArrow)"/>')
+                delta_x = min(x1, x2) + 8
+                delta_y = mid_y - 4
+            delta = trace[index + 1].get("best_score_delta_vs_previous_round")
+            if delta is not None:
+                parts.append(f'<text x="{delta_x}" y="{delta_y}" font-size="10" fill="#64748b">Δ {float(delta):+.3f}</text>')
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def optimizer_flow_png(summary: dict[str, Any]) -> bytes:
+    trace = summary.get("optimizer_trace") or []
+    cards_per_row = 4
+    card_w = 250
+    card_h = 136
+    gap_x = 24
+    gap_y = 28
+    row_count = max(1, (len(trace) + cards_per_row - 1) // cards_per_row)
+    width = 40 + cards_per_row * card_w + (cards_per_row - 1) * gap_x
+    height = 76 + row_count * card_h + (row_count - 1) * gap_y + 24
+    canvas = _PngCanvas(width, height, "#ffffff")
+    canvas.text(24, 18, "Optimizer learning flow", "#0f172a", 2)
+    if not trace:
+        canvas.text(24, 70, "No optimizer rounds recorded", "#94a3b8", 2)
+        return canvas.png()
+    for index, round_trace in enumerate(trace):
+        row = index // cards_per_row
+        col = index % cards_per_row
+        x = 24 + col * (card_w + gap_x)
+        y = 72 + row * (card_h + gap_y)
+        parameter_only = bool(round_trace.get("all_variants_parameter_nudges"))
+        learned = bool(round_trace.get("uses_prior_parent") or round_trace.get("uses_score_feedback"))
+        entropy_label_only = bool(round_trace.get("entropy_label_only"))
+        fill = "#dcfce7" if learned and not parameter_only else "#ffedd5" if parameter_only else "#e0f2fe"
+        border = "#16a34a" if learned and not parameter_only else "#f97316" if parameter_only else "#0284c7"
+        canvas.rect(x, y, card_w - 12, card_h, fill)
+        canvas.outline(x, y, card_w - 12, card_h, border)
+        canvas.text(x + 10, y + 12, f"Round {round_trace.get('round')}", "#0f172a", 1)
+        canvas.text(x + 10, y + 34, f"score {float(round_trace.get('best_score') or 0.0):.3f}", "#334155", 1)
+        canvas.text(x + 10, y + 54, f"edge {round_trace.get('best_mean_edge', 'n/a')}", "#334155", 1)
+        canvas.text(x + 10, y + 74, "prior yes" if learned else "prior no", "#334155", 1)
+        canvas.text(x + 10, y + 94, "entropy-label" if entropy_label_only else "param-only" if parameter_only else "struct/mixed", "#334155", 1)
+    return canvas.png()
+
+
+def champion_tree_mermaid(tree: dict[str, Any]) -> str:
+    nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
+    edges = tree.get("edges") if isinstance(tree.get("edges"), list) else []
+    if not nodes:
+        return 'flowchart LR\n  none["No champion tree recorded"]\n'
+    lines = ["flowchart LR"]
+    for index, node in enumerate(nodes):
+        node_id = _mermaid_node_id(str(node.get("id") or f"node_{index}"))
+        label = (
+            f"{str(node.get('id') or '')[:10]}\\n"
+            f"score {float(node.get('score') or 0.0):.3f}\\n"
+            f"{node.get('highlight', 'candidate')}"
+        )
+        lines.append(f'  {node_id}["{_mermaid(label)}"]')
+        if node.get("is_global_champion"):
+            lines.append(f"  class {node_id} champion")
+        elif node.get("is_round_winner"):
+            lines.append(f"  class {node_id} winner")
+    node_ids = {_mermaid_node_id(str(node.get("id") or "")) for node in nodes}
+    for edge in edges:
+        from_id = _mermaid_node_id(str(edge.get("from") or ""))
+        to_id = _mermaid_node_id(str(edge.get("to") or ""))
+        if from_id in node_ids and to_id in node_ids:
+            lines.append(f"  {from_id} --> {to_id}")
+    lines.append("  classDef champion fill:#dcfce7,stroke:#16a34a,stroke-width:3px,color:#0f172a;")
+    lines.append("  classDef winner fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0f172a;")
+    return "\n".join(lines) + "\n"
+
+
+def champion_tree_svg(tree: dict[str, Any]) -> str:
+    nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
+    if not nodes:
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="960" height="120" viewBox="0 0 960 120" '
+            'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;">'
+            '<rect width="100%" height="100%" fill="#fff"/><text x="24" y="64" font-size="14" fill="#94a3b8">'
+            'No champion tree recorded.</text></svg>'
+        )
+    ordered = sorted(nodes, key=lambda node: (int(node.get("outer_iteration") or 0), str(node.get("id") or "")))
+    shown = ordered[:80]
+    columns = 4
+    card_w = 250
+    card_h = 116
+    gap_x = 26
+    gap_y = 26
+    left = 28
+    row_count = (len(shown) + columns - 1) // columns
+    width = max(960, left * 2 + columns * card_w + (columns - 1) * gap_x)
+    height = 92 + row_count * card_h + max(0, row_count - 1) * gap_y + 34
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="24" y="32" font-size="18" font-weight="700" fill="#0f172a">Champion tree</text>',
+        '<text x="24" y="52" font-size="11" fill="#64748b">Green is the current global champion; blue nodes are round winners. Showing up to 80 variants.</text>',
+    ]
+    for index, node in enumerate(shown):
+        row = index // columns
+        col = index % columns
+        x = left + col * (card_w + gap_x)
+        y = 82 + row * (card_h + gap_y)
+        highlight = str(node.get("highlight") or "candidate")
+        fill = "#dcfce7" if highlight == "global_champion" else "#e0f2fe" if highlight == "round_winner" else "#f8fafc"
+        border = "#16a34a" if highlight == "global_champion" else "#0284c7" if highlight == "round_winner" else "#cbd5e1"
+        score = float(node.get("score") or 0.0)
+        label = str(node.get("id") or "")[:18]
+        family = _direction_from_summary(str(node.get("summary") or ""))
+        parts.append(f'<rect x="{x}" y="{y}" width="{card_w}" height="{card_h}" rx="8" fill="{fill}" stroke="{border}" stroke-width="1.5"/>')
+        parts.append(f'<text x="{x + 12}" y="{y + 24}" font-size="12" font-weight="700" fill="#0f172a">{html.escape(label)}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 45}" font-size="11" fill="#334155">round {html.escape(str(node.get("outer_iteration") or "n/a"))} · score {score:.3f}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 66}" font-size="11" fill="#334155">{html.escape(highlight)}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 87}" font-size="11" fill="#64748b">{html.escape(family[:36])}</text>')
+    if len(ordered) > len(shown):
+        parts.append(f'<text x="24" y="{height - 14}" font-size="11" fill="#64748b">+ {len(ordered) - len(shown)} additional nodes in champion_tree.json</text>')
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def champion_tree_png(tree: dict[str, Any]) -> bytes:
+    nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
+    shown = sorted(nodes, key=lambda node: (int(node.get("outer_iteration") or 0), str(node.get("id") or "")))[:40]
+    columns = 4
+    card_w = 220
+    card_h = 96
+    gap = 18
+    rows = max(1, (len(shown) + columns - 1) // columns)
+    width = 32 + columns * card_w + (columns - 1) * gap
+    height = 68 + rows * card_h + (rows - 1) * gap + 24
+    canvas = _PngCanvas(width, height, "#ffffff")
+    canvas.text(24, 18, "Champion tree", "#0f172a", 2)
+    if not shown:
+        canvas.text(24, 62, "No champion tree recorded", "#94a3b8", 2)
+        return canvas.png()
+    for index, node in enumerate(shown):
+        row = index // columns
+        col = index % columns
+        x = 24 + col * (card_w + gap)
+        y = 64 + row * (card_h + gap)
+        highlight = str(node.get("highlight") or "candidate")
+        fill = "#dcfce7" if highlight == "global_champion" else "#e0f2fe" if highlight == "round_winner" else "#f8fafc"
+        border = "#16a34a" if highlight == "global_champion" else "#0284c7" if highlight == "round_winner" else "#cbd5e1"
+        canvas.rect(x, y, card_w, card_h, fill)
+        canvas.outline(x, y, card_w, card_h, border)
+        canvas.text(x + 10, y + 10, str(node.get("id") or "")[:16], "#0f172a", 1)
+        canvas.text(x + 10, y + 32, f"r{node.get('outer_iteration')} score {float(node.get('score') or 0.0):.3f}", "#334155", 1)
+        canvas.text(x + 10, y + 54, highlight[:24], "#334155", 1)
+    return canvas.png()
+
+
+def _mermaid_node_id(value: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_]", "_", value)
+    if not clean or clean[0].isdigit():
+        clean = f"n_{clean}"
+    return clean[:48]
+
+
+def _direction_from_summary(summary: str) -> str:
+    try:
+        payload = json.loads(summary)
+    except Exception:
+        return summary[:48] if summary else "candidate"
+    if isinstance(payload, dict):
+        return str(payload.get("loss_reason") or payload.get("status") or payload.get("summary") or "candidate")
+    return "candidate"
 
 
 def decision_dag_svg(summary: dict[str, Any]) -> str:
@@ -1068,7 +1543,7 @@ def _convert_with_qlmanage(svg_path: Path, output_path: Path, tmp_dir: Path) -> 
     return False
 
 
-def run_benchmark_markdown(summary: dict[str, Any], dag: str) -> str:
+def run_benchmark_markdown(summary: dict[str, Any], dag: str, optimizer_flow: str) -> str:
     counts = summary.get("counts", {})
     decision = summary.get("task_ingestion") or {}
     lines = [
@@ -1088,12 +1563,25 @@ def run_benchmark_markdown(summary: dict[str, Any], dag: str) -> str:
         dag.strip(),
         "```",
         "",
+        "## Optimizer Flow",
+        "",
+        "```mermaid",
+        optimizer_flow.strip(),
+        "```",
+        "",
         "## Round Summary",
     ]
     for round_record in summary.get("rounds", []):
         lines.append(
             f"- Round {round_record.get('outer_iteration')}: best `{round_record.get('best_variant_id')}` "
             f"score {float(round_record.get('best_score', 0.0)):.3f}; signal `{round_record.get('termination_signal')}`."
+        )
+    lines.extend(["", "## Optimizer Trace"])
+    for item in summary.get("optimizer_trace", []):
+        lines.append(
+            f"- Round {item.get('round')}: `{item.get('learning_status')}`; "
+            f"best `{item.get('best_variant_id')}` score {float(item.get('best_score', 0.0)):.3f}; "
+            f"mean_edge `{item.get('best_mean_edge')}`; parameter_only `{item.get('all_variants_parameter_nudges')}`."
         )
     return "\n".join(lines) + "\n"
 
@@ -1118,6 +1606,7 @@ def run_benchmark_html(summary: dict[str, Any]) -> str:
     evt_rows  = _event_rows_html(spans)
     stats     = _stats_cards_html(summary)
     rnd_rows  = _round_rows_html(summary)
+    opt_rows  = _optimizer_trace_rows_html(summary)
 
     # Compact colour legend.
     legend = "".join(
@@ -1209,6 +1698,31 @@ def run_benchmark_html(summary: dict[str, Any]) -> str:
   <h2>Decision DAG</h2>
   <div class="gantt-card">
     <img src="decision_dag.png" alt="Decision DAG" style="width:100%;display:block;">
+  </div>
+
+  <h2>Optimizer Flow</h2>
+  <div class="gantt-card">
+    <img src="optimizer_flow.png" alt="Optimizer learning flow" style="width:100%;display:block;">
+  </div>
+
+  <h2>Optimizer Trace</h2>
+  <div class="events-card">
+    <table>
+      <thead>
+        <tr>
+          <th>Round</th>
+          <th>Learning status</th>
+          <th>Best score</th>
+          <th>Mean edge</th>
+          <th>Score source</th>
+          <th>Variants / evals</th>
+          <th>Parent / score reuse</th>
+          <th>Param only?</th>
+          <th>Payload / variant preview</th>
+        </tr>
+      </thead>
+      <tbody>{opt_rows}</tbody>
+    </table>
   </div>
 
   <!-- ── Event log ────────────────────────────────────── -->

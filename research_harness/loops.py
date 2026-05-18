@@ -14,7 +14,7 @@ import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
-from typing import Callable, Optional, Protocol
+from typing import Callable, Optional, Protocol, Union
 
 from challenges.prediction_market import prediction_market_score
 
@@ -35,10 +35,22 @@ from .schemas import (
     now_iso,
 )
 from .search import SearchBackend
+from .sandbox import DockerSandboxRunner
 from .store import ArtifactStore
 
 
-EvaluatorFn = Callable[[str], float]
+@dataclass(frozen=True)
+class EvaluatorResult:
+    score: float
+    status: str = "completed"
+    metrics: Optional[dict[str, object]] = None
+    diagnostics: Optional[dict[str, object]] = None
+    loss_reason: str = ""
+    summary: str = ""
+
+
+EvaluatorPayload = Union[float, int, dict[str, object], EvaluatorResult]
+EvaluatorFn = Callable[[str], EvaluatorPayload]
 SearchFactory = Callable[[str], SearchBackend]
 
 
@@ -50,8 +62,12 @@ def _find_pm_upstream_path() -> Optional[Path]:
     """
     if os.environ.get("PREDICTION_MARKET_USE_UPSTREAM") == "0":
         return None
+    project_root = Path(__file__).resolve().parents[1]
     candidates: list[Optional[str]] = [
         os.environ.get("PREDICTION_MARKET_CHALLENGE_PATH"),
+        str(project_root / "challenges" / "prediction-market-challenge"),
+        str(project_root / "challenges" / "prediction_market_challenge"),
+        str(project_root / "vendor" / "prediction-market-challenge"),
         "/private/tmp/prediction-market-challenge-src",
         str(Path.home() / "prediction-market-challenge"),
         str(Path.home() / "src" / "prediction-market-challenge"),
@@ -61,9 +77,95 @@ def _find_pm_upstream_path() -> Optional[Path]:
         if not candidate:
             continue
         p = Path(candidate)
-        if p.is_dir() and (p / "pyproject.toml").exists():
+        if _is_pm_upstream_repo(p):
             return p
     return None
+
+
+def _is_pm_upstream_repo(path: Path) -> bool:
+    """Return True only for danrobinson/prediction-market-challenge layout."""
+    pyproject = path / "pyproject.toml"
+    package_dir = path / "orderbook_pm_challenge"
+    if not path.is_dir() or not pyproject.exists() or not package_dir.is_dir():
+        return False
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return 'orderbook-pm = "orderbook_pm_challenge.cli:main"' in text
+
+
+def _normalize_evaluator_result(raw_result: EvaluatorPayload) -> EvaluatorResult:
+    if isinstance(raw_result, EvaluatorResult):
+        return EvaluatorResult(
+            score=max(0.0, min(1.0, float(raw_result.score))),
+            status=raw_result.status or "completed",
+            metrics=dict(raw_result.metrics or {}),
+            diagnostics=dict(raw_result.diagnostics or {}),
+            loss_reason=raw_result.loss_reason,
+            summary=raw_result.summary,
+        )
+    if isinstance(raw_result, dict):
+        score = float(raw_result.get("score", raw_result.get("deterministic_score", 0.0)) or 0.0)
+        diagnostics = raw_result.get("diagnostics") if isinstance(raw_result.get("diagnostics"), dict) else {}
+        metrics = raw_result.get("metrics") if isinstance(raw_result.get("metrics"), dict) else {}
+        if not metrics:
+            metrics = {
+                key: value
+                for key, value in raw_result.items()
+                if key not in {"score", "deterministic_score", "status", "diagnostics", "loss_reason", "summary"}
+            }
+        return EvaluatorResult(
+            score=max(0.0, min(1.0, score)),
+            status=str(raw_result.get("status") or "completed"),
+            metrics=dict(metrics),
+            diagnostics=dict(diagnostics),
+            loss_reason=str(raw_result.get("loss_reason") or raw_result.get("failure_reason") or ""),
+            summary=str(raw_result.get("summary") or ""),
+        )
+    score = max(0.0, min(1.0, float(raw_result)))
+    return EvaluatorResult(
+        score=score,
+        status="completed",
+        metrics={"scalar_score": score},
+        diagnostics={},
+        loss_reason="" if score > 0 else "zero_score",
+        summary=f"Deterministic scalar evaluator returned {score:.3f}.",
+    )
+
+
+def _exception_evaluator_result(exc: Exception) -> EvaluatorResult:
+    exc_type = type(exc).__name__
+    lower = str(exc).lower()
+    if "timeout" in lower or exc_type.lower().find("timeout") >= 0:
+        reason = "timeout"
+    elif "compile" in lower or "syntax" in lower:
+        reason = "compile_error"
+    elif "correct" in lower or "assert" in lower:
+        reason = "correctness_fail"
+    elif "slow" in lower or "baseline" in lower:
+        reason = "slower_than_baseline"
+    else:
+        reason = "runtime_error"
+    return EvaluatorResult(
+        score=0.0,
+        status="failed",
+        metrics={},
+        diagnostics={"exception_type": exc_type, "exception": str(exc)},
+        loss_reason=reason,
+        summary=f"{exc_type}: {exc}",
+    )
+
+
+def _evaluator_json_response(result: EvaluatorResult) -> dict[str, object]:
+    return {
+        "status": result.status,
+        "score": result.score,
+        "metrics": result.metrics or {},
+        "diagnostics": result.diagnostics or {},
+        "loss_reason": result.loss_reason,
+        "summary": result.summary,
+    }
 
 
 OPTIMIZE_HINTS = {
@@ -290,33 +392,62 @@ class InnerLoop(Protocol):
 class OptimizeLoop:
     mode: TaskMode = "optimize"
 
-    def __init__(self, run_id: str, evaluator: EvaluatorFn, pass_threshold: float = 0.8):
+    def __init__(self, run_id: str, evaluator: EvaluatorFn, pass_threshold: float = 0.8, parallel_evaluator_cap: int = 8):
         self.run_id = run_id
         self.evaluator = evaluator
         self.pass_threshold = pass_threshold
+        self.parallel_evaluator_cap = max(1, parallel_evaluator_cap)
 
     async def evaluate(self, variants: list[Variant], store: ArtifactStore) -> InnerLoopResult:
-        evaluations = await asyncio.gather(*(self._evaluate_variant(variant, store) for variant in variants))
+        semaphore = asyncio.Semaphore(self.parallel_evaluator_cap)
+        evaluations = await asyncio.gather(*(self._evaluate_variant_capped(variant, store, semaphore) for variant in variants))
         for evaluation in evaluations:
             store.add_variant_evaluation(evaluation)
         ranked = sorted(evaluations, key=lambda item: item.score, reverse=True)
         signal = "score_threshold" if ranked and ranked[0].score >= self.pass_threshold else "continue"
         return InnerLoopResult(ranked_evaluations=ranked, termination_signal=signal)
 
+    async def _evaluate_variant_capped(
+        self,
+        variant: Variant,
+        store: ArtifactStore,
+        semaphore: asyncio.Semaphore,
+    ) -> VariantEvaluation:
+        async with semaphore:
+            return await self._evaluate_variant(variant, store)
+
     async def _evaluate_variant(self, variant: Variant, store: ArtifactStore) -> VariantEvaluation:
         started = time.perf_counter()
         started_at = now_iso()
         try:
-            raw_score = float(self.evaluator(variant.payload))
-            score = max(0.0, min(1.0, raw_score))
+            raw_result = self.evaluator(variant.payload)
+            result = _normalize_evaluator_result(raw_result)
+            score = result.score
+            metrics = {
+                "deterministic_score": score,
+                "evaluator_status": result.status,
+                "loss_reason": result.loss_reason,
+                "diagnostics": result.diagnostics or {},
+                "raw_metrics": result.metrics or {},
+                "direction": _variant_direction_metadata(variant),
+                "json_response": _evaluator_json_response(result),
+            }
+            summary_payload = {
+                "status": result.status,
+                "score": score,
+                "passed": score >= self.pass_threshold,
+                "loss_reason": result.loss_reason,
+                "diagnostics": result.diagnostics or {},
+                "summary": result.summary,
+            }
             evaluation = VariantEvaluation(
                 run_id=self.run_id,
                 variant_id=variant.id,
                 inner_loop="optimize",
                 score=score,
-                metrics={"deterministic_score": score},
+                metrics=metrics,
                 judge_scores=[score],
-                summary=f"Deterministic evaluator returned {score:.3f}.",
+                summary=json.dumps(summary_payload, sort_keys=True),
                 passed=score >= self.pass_threshold,
             )
             _record_timing_trace(
@@ -333,6 +464,25 @@ class OptimizeLoop:
             )
             return evaluation
         except Exception as exc:
+            failure = _exception_evaluator_result(exc)
+            evaluation = VariantEvaluation(
+                run_id=self.run_id,
+                variant_id=variant.id,
+                inner_loop="optimize",
+                score=0.0,
+                metrics={
+                    "deterministic_score": 0.0,
+                    "evaluator_status": failure.status,
+                    "loss_reason": failure.loss_reason,
+                    "diagnostics": failure.diagnostics or {},
+                    "raw_metrics": failure.metrics or {},
+                    "direction": _variant_direction_metadata(variant),
+                    "json_response": _evaluator_json_response(failure),
+                },
+                judge_scores=[0.0],
+                summary=json.dumps(_evaluator_json_response(failure), sort_keys=True),
+                passed=False,
+            )
             _record_timing_trace(
                 store,
                 self.run_id,
@@ -346,7 +496,7 @@ class OptimizeLoop:
                 output_summary="Deterministic evaluator failed.",
                 errors=[f"{type(exc).__name__}: {exc}"],
             )
-            raise
+            return evaluation
 
 
 class ResearchLoop:
@@ -676,14 +826,14 @@ class OptimizationQueryLoop:
 
 
 class PlateauDetector:
-    _RECOVERY_ACTIONS = ("rotate_retriever", "boost_temperature", "random_mutation")
+    _RECOVERY_ACTIONS = ("new_strategy_family", "literature_mechanism", "alternative_evaluator", "fresh_search_context")
 
-    def __init__(self, mode: TaskMode):
+    def __init__(self, mode: TaskMode, patience: Optional[int] = None):
         self.mode = mode
         self.best_score = 0.0
         self.plateau_count = 0
         self.epsilon = 0.005 if mode == "optimize" else 0.03
-        self.patience = 2 if mode == "optimize" else 3
+        self.patience = patience if patience is not None else (2 if mode == "optimize" else 3)
         self._recovery_cycle = 0
 
     def update(self, score: float) -> str:
@@ -715,6 +865,19 @@ class LoopObjective:
         return self.target is not None
 
 
+@dataclass(frozen=True)
+class DirectionSpec:
+    slot: int
+    strategy_family: str
+    mechanism_hypothesis: str
+    entropy_role: str
+    parent_policy: str
+    eval_protocol: str
+    regime_focus: str
+    convergence_lane: str
+    ablation_target: str = ""
+
+
 class EvolutionaryOuterLoop:
     def __init__(
         self,
@@ -728,6 +891,12 @@ class EvolutionaryOuterLoop:
         llm: Optional[LLMClient] = None,
         max_outer_iterations: int = 4,
         population_size: int = 4,
+        parent_count: int = 2,
+        parallel_evaluator_cap: int = 8,
+        optimize_plateau_patience: int = 2,
+        continue_on_optimize_plateau: bool = False,
+        force_direction_entropy: bool = True,
+        novelty_fraction: float = 0.25,
         prior_run_memory: Optional[dict[str, object]] = None,
     ):
         self.run_id = run_id
@@ -740,29 +909,41 @@ class EvolutionaryOuterLoop:
         self.llm = llm or LLMClient()
         self.max_outer_iterations = max_outer_iterations
         self.population_size = population_size
+        self.parent_count = max(1, parent_count)
+        self.parallel_evaluator_cap = max(1, parallel_evaluator_cap)
+        self.optimize_plateau_patience = max(1, optimize_plateau_patience)
+        self.continue_on_optimize_plateau = continue_on_optimize_plateau
+        self.force_direction_entropy = force_direction_entropy
+        self.novelty_fraction = max(0.0, min(0.8, novelty_fraction))
         self.prior_run_memory = prior_run_memory or {}
         self.objective = _loop_objective_from_goal(goal, evaluator_name)
+        self._champion_variant_id: Optional[str] = None
+        self._champion_payload: str = ""
+        self._champion_score: float = 0.0
         # One-shot recovery flags set by _apply_plateau_recovery() and
         # consumed at the start of the next _propose_*_variants() call.
         self._recovery_forced_retriever: Optional[str] = None
         self._recovery_temperature: float = 0.7
         self._recovery_inject_mutation: bool = False
+        self._recovery_entropy_intent: Optional[dict[str, object]] = None
         self._recovery_retriever_index: int = 0
 
     async def run(self, store: ArtifactStore) -> None:
+        store.ingest_pending_user_steering(self.run_id)
         if self.task_mode in {"optimize", "optimize_query"}:
             await self._record_literature_grounding(store, "initial")
         if self.task_mode == "optimize_query":
             await self._run_optimize_query(store)
             return
         inner_loop = self._inner_loop()
-        plateau = PlateauDetector(self.task_mode)
+        plateau = PlateauDetector(self.task_mode, patience=self.optimize_plateau_patience if self.task_mode == "optimize" else None)
         parents: list[Variant] = []
         last_result: Optional[InnerLoopResult] = None
         last_variants: list[Variant] = []
         best_eval: Optional[VariantEvaluation] = None
         best_variants: list[Variant] = []
         for outer_iteration in range(1, self.max_outer_iterations + 1):
+            store.ingest_pending_user_steering(self.run_id)
             propose_started = time.perf_counter()
             propose_started_at = now_iso()
             variants = self._propose_variants(outer_iteration, parents, store)
@@ -830,7 +1011,8 @@ class EvolutionaryOuterLoop:
                 store.append_progress(
                     f"  Score {evaluation.score:.3f} for {evaluation.variant_id}: {_shorten(evaluation.summary)}"
                 )
-            winner_ids = {evaluation.variant_id for evaluation in result.ranked_evaluations[:2]}
+            self._promote_round_champion(store, outer_iteration, variants, result.ranked_evaluations, loop_name=self.task_mode)
+            winner_ids = {evaluation.variant_id for evaluation in result.ranked_evaluations[: self.parent_count]}
             parents = [variant for variant in variants if variant.id in winner_ids]
             _record_timing_trace(
                 store,
@@ -869,7 +1051,7 @@ class EvolutionaryOuterLoop:
         if self.task_mode == "optimize":
             if self.evaluator is None:
                 raise ValueError("OptimizeLoop requires a deterministic evaluator.")
-            return OptimizeLoop(self.run_id, self.evaluator)
+            return OptimizeLoop(self.run_id, self.evaluator, parallel_evaluator_cap=self.parallel_evaluator_cap)
         if self.task_mode == "optimize_query":
             return OptimizationQueryLoop(self.run_id, self.search_factory, self.llm)
         return ResearchLoop(self.run_id, self.search_factory, self.llm)
@@ -890,6 +1072,7 @@ class EvolutionaryOuterLoop:
         parents: list[Variant] = []
         last_result: Optional[InnerLoopResult] = None
         for outer_iteration in range(1, self.max_outer_iterations + 1):
+            store.ingest_pending_user_steering(self.run_id)
             propose_started = time.perf_counter()
             propose_started_at = now_iso()
             variants = self._propose_query_variants(outer_iteration, parents, store)
@@ -953,7 +1136,7 @@ class EvolutionaryOuterLoop:
             )
             for evaluation in result.ranked_evaluations[:3]:
                 store.append_progress(f"  Query score {evaluation.score:.3f} for {evaluation.variant_id}: {_shorten(evaluation.summary)}")
-            winner_ids = {evaluation.variant_id for evaluation in result.ranked_evaluations[:2]}
+            winner_ids = {evaluation.variant_id for evaluation in result.ranked_evaluations[: self.parent_count]}
             parents = [variant for variant in variants if variant.id in winner_ids]
             _record_timing_trace(
                 store,
@@ -989,6 +1172,7 @@ class EvolutionaryOuterLoop:
 
         seed_started = time.perf_counter()
         seed_started_at = now_iso()
+        store.ingest_pending_user_steering(self.run_id)
         seed_context = self._build_optimizer_seed_context(store, last_result)
         store.write_optimizer_seed_context(seed_context)
         store.append_progress(f"Optimizer seed context: {store.optimizer_seed_context_path}")
@@ -1013,7 +1197,7 @@ class EvolutionaryOuterLoop:
         if self.evaluator_name == "prediction_market":
             await self._run_prediction_market_optimizer(store, seed_parents, seed_context)
             return
-        optimize_loop = OptimizeLoop(self.run_id, self.evaluator)
+        optimize_loop = OptimizeLoop(self.run_id, self.evaluator, parallel_evaluator_cap=self.parallel_evaluator_cap)
         await self._run_generic_optimizer_rounds(store, optimize_loop, seed_parents, seed_context)
 
     async def _run_generic_optimizer_rounds(
@@ -1023,10 +1207,11 @@ class EvolutionaryOuterLoop:
         parents: list[Variant],
         seed_context: dict[str, object],
     ) -> None:
-        plateau = PlateauDetector("optimize")
+        plateau = PlateauDetector("optimize", patience=self.optimize_plateau_patience)
         best_eval: Optional[VariantEvaluation] = None
         best_round_variants: list[Variant] = []
         for round_index in range(1, self.max_outer_iterations + 1):
+            store.ingest_pending_user_steering(self.run_id)
             propose_started = time.perf_counter()
             propose_started_at = now_iso()
             code_variants = self._propose_code_variants(round_index, parents, store)
@@ -1086,7 +1271,12 @@ class EvolutionaryOuterLoop:
             )
             for evaluation in result.ranked_evaluations[:3]:
                 store.append_progress(f"  Optimize score {evaluation.score:.3f} for {evaluation.variant_id}: {_shorten(evaluation.summary)}")
-            parents = [variant for variant in code_variants if variant.id in {evaluation.variant_id for evaluation in result.ranked_evaluations[:2]}]
+            self._promote_round_champion(store, round_index, code_variants, result.ranked_evaluations, loop_name="optimizer_loop")
+            parents = [
+                variant
+                for variant in code_variants
+                if variant.id in {evaluation.variant_id for evaluation in result.ranked_evaluations[: self.parent_count]}
+            ]
             _record_timing_trace(
                 store,
                 self.run_id,
@@ -1099,6 +1289,8 @@ class EvolutionaryOuterLoop:
                 status="completed",
                 output_summary=f"Selected {len(parents)} code parent(s); signal={termination_signal}.",
             )
+            if termination_signal == "continue" and plateau.plateau_count == 1 and round_index > 1:
+                await self._record_literature_grounding(store, f"optimizer_first_stall_round_{round_index}")
             if termination_signal == "score_plateau":
                 await self._record_literature_grounding(store, f"optimizer_plateau_round_{round_index}")
                 self._apply_plateau_recovery(plateau, store, round_index, termination_signal)
@@ -1126,10 +1318,11 @@ class EvolutionaryOuterLoop:
         parents: list[Variant],
         seed_context: dict[str, object],
     ) -> None:
-        plateau = PlateauDetector("optimize")
+        plateau = PlateauDetector("optimize", patience=self.optimize_plateau_patience)
         best_eval: Optional[VariantEvaluation] = None
         best_round_variants: list[Variant] = []
         for round_index in range(1, self.max_outer_iterations + 1):
+            store.ingest_pending_user_steering(self.run_id)
             propose_started = time.perf_counter()
             propose_started_at = now_iso()
             code_variants = self._propose_prediction_market_variants(round_index, parents, store)
@@ -1163,17 +1356,24 @@ class EvolutionaryOuterLoop:
                 status="completed",
                 output_summary=f"Persisted {len(code_variants)} prediction-market variant(s).",
             )
+            semaphore = asyncio.Semaphore(self.parallel_evaluator_cap)
             evaluations = await asyncio.gather(
-                *(self._evaluate_prediction_market_variant(variant, store, round_index) for variant in code_variants)
+                *(self._evaluate_prediction_market_variant_capped(variant, store, round_index, semaphore) for variant in code_variants)
             )
             rank_started = time.perf_counter()
             rank_started_at = now_iso()
             for evaluation in evaluations:
                 store.add_variant_evaluation(evaluation)
-            ranked = sorted(evaluations, key=lambda item: item.score, reverse=True)
+            eligible_evaluations = [evaluation for evaluation in evaluations if evaluation.metrics.get("score_eligible", True)]
+            ranked = sorted(eligible_evaluations, key=lambda item: item.score, reverse=True)
             round_best = ranked[0] if ranked else None
+            observed_ranked = sorted(evaluations, key=lambda item: item.score, reverse=True)
+            observed_best = round_best or (observed_ranked[0] if observed_ranked else None)
             if round_best and (best_eval is None or round_best.score > best_eval.score):
                 best_eval = round_best
+                best_round_variants = code_variants
+            elif best_eval is None and observed_best is not None:
+                best_eval = observed_best
                 best_round_variants = code_variants
             plateau_signal = plateau.update(round_best.score if round_best else 0.0)
             objective_met = self._prediction_market_objective_met(round_best)
@@ -1187,20 +1387,24 @@ class EvolutionaryOuterLoop:
                     outer_iteration=(len(store.list("evolution_rounds")) + 1),
                     mode="optimize",
                     variant_ids=[variant.id for variant in code_variants],
-                    best_variant_id=round_best.variant_id if round_best else None,
+                    best_variant_id=observed_best.variant_id if observed_best else None,
                     best_score=round_best.score if round_best else 0.0,
                     termination_signal=termination_signal,
                     plateau_count=plateau.plateau_count,
                 )
             )
             store.append_progress(
-                f"Prediction-market optimizer round {round_index}: best_edge={_pm_edge_from_eval(round_best):.3f} "
+                f"Prediction-market optimizer round {round_index}: best_edge={_pm_edge_from_eval(observed_best):.3f} "
                 f"score={round_best.score if round_best else 0.0:.3f} signal={termination_signal}"
             )
-            for evaluation in ranked[:3]:
+            for evaluation in observed_ranked[:3]:
                 source = evaluation.metrics.get("score_source", "unknown")
-                store.append_progress(f"  Prediction-market score {evaluation.score:.3f} via {source} for {evaluation.variant_id}: {_shorten(evaluation.summary)}")
-            parents = [variant for variant in code_variants if variant.id in {evaluation.variant_id for evaluation in ranked[:2]}]
+                eligible = "eligible" if evaluation.metrics.get("score_eligible", True) else "unmeasured"
+                store.append_progress(f"  Prediction-market score {evaluation.score:.3f} ({eligible}) via {source} for {evaluation.variant_id}: {_shorten(evaluation.summary)}")
+            self._promote_round_champion(store, round_index, code_variants, observed_ranked, loop_name="challenge_optimizer_loop")
+            parents = [variant for variant in code_variants if variant.id in {evaluation.variant_id for evaluation in ranked[: self.parent_count]}]
+            if not parents:
+                parents = code_variants[: self.parent_count]
             _record_timing_trace(
                 store,
                 self.run_id,
@@ -1213,6 +1417,14 @@ class EvolutionaryOuterLoop:
                 status="completed",
                 output_summary=f"Selected {len(parents)} strategy parent(s); signal={termination_signal}.",
             )
+            if (
+                termination_signal == "continue"
+                and plateau.plateau_count == 1
+                and round_index > 1
+                and round_best is not None
+                and round_best.metrics.get("score_eligible", True)
+            ):
+                await self._record_literature_grounding(store, f"prediction_market_first_stall_round_{round_index}")
             if termination_signal == "score_plateau":
                 await self._record_literature_grounding(store, f"prediction_market_plateau_round_{round_index}")
                 self._apply_plateau_recovery(plateau, store, round_index, termination_signal)
@@ -1279,12 +1491,131 @@ class EvolutionaryOuterLoop:
         )
         store.append_progress(f"Loop decision {loop_name} round {iteration}: {decision} - {reason}")
 
+    def _direction_specs(
+        self,
+        outer_iteration: int,
+        parents: list[Variant],
+        store: Optional[ArtifactStore],
+    ) -> list[DirectionSpec]:
+        if not self.force_direction_entropy:
+            return []
+        return _forced_direction_specs(
+            goal=self.goal,
+            task_mode=self.task_mode,
+            population_size=self.population_size,
+            outer_iteration=outer_iteration,
+            novelty_fraction=self.novelty_fraction,
+            champion_payload=self._champion_payload,
+            parents=parents,
+            store=store,
+        )
+
+    def _apply_direction_specs(self, variants: list[Variant], directions: list[DirectionSpec], *, kind: str) -> None:
+        if not directions:
+            return
+        for index, variant in enumerate(variants):
+            direction = directions[index % len(directions)]
+            variant.metadata.update(_direction_metadata(direction, kind=kind))
+            if direction.parent_policy in {"ignore_parents", "ignore_champion"}:
+                variant.parent_ids = []
+            if direction.entropy_role == "ablation":
+                variant.metadata["ablation_round"] = True
+            if direction.entropy_role == "multi_model_convergence":
+                variant.metadata["convergence_check"] = {
+                    "lane": direction.convergence_lane,
+                    "compare_mechanism": direction.mechanism_hypothesis,
+                }
+
+    def _promote_round_champion(
+        self,
+        store: ArtifactStore,
+        round_index: int,
+        variants: list[Variant],
+        evaluations: list[VariantEvaluation],
+        *,
+        loop_name: str,
+    ) -> None:
+        if not evaluations:
+            return
+        variant_lookup = {variant.id: variant for variant in variants}
+        round_winner = evaluations[0]
+        round_variant = variant_lookup.get(round_winner.variant_id)
+        if round_variant is None:
+            return
+        promoted_global = round_winner.score >= self._champion_score
+        if promoted_global:
+            self._champion_variant_id = round_variant.id
+            self._champion_payload = round_variant.payload
+            self._champion_score = round_winner.score
+        champion_payload = {
+            "run_id": self.run_id,
+            "round_index": round_index,
+            "loop_name": loop_name,
+            "round_winner": {
+                "variant_id": round_variant.id,
+                "score": round_winner.score,
+                "parent_ids": round_variant.parent_ids,
+                "payload": round_variant.payload,
+                "metrics": round_winner.metrics,
+                "summary": round_winner.summary,
+            },
+            "global_champion": {
+                "variant_id": self._champion_variant_id,
+                "score": self._champion_score,
+                "payload": self._champion_payload,
+                "promoted_this_round": promoted_global,
+            },
+        }
+        path = store.write_round_champion(round_index, champion_payload)
+        self._write_champion_tree(store)
+        store.append_progress(
+            f"Champion promotion round {round_index}: winner={round_variant.id} "
+            f"score={round_winner.score:.3f}; global={self._champion_variant_id}; artifact={path}"
+        )
+
+    def _write_champion_tree(self, store: ArtifactStore) -> None:
+        evaluations = {str(row.get("variant_id")): row for row in store.list("variant_evaluations")}
+        rounds = store.list("evolution_rounds")
+        round_winners = {str(row.get("best_variant_id")) for row in rounds if row.get("best_variant_id")}
+        nodes = []
+        edges = []
+        for row in store.list("variants"):
+            variant_id = str(row.get("id"))
+            evaluation = evaluations.get(variant_id, {})
+            parent_ids = [str(parent_id) for parent_id in row.get("parent_ids", [])]
+            nodes.append(
+                {
+                    "id": variant_id,
+                    "outer_iteration": row.get("outer_iteration"),
+                    "kind": row.get("kind"),
+                    "parent_ids": parent_ids,
+                    "score": float(evaluation.get("score", 0.0) or 0.0),
+                    "is_round_winner": variant_id in round_winners,
+                    "is_global_champion": variant_id == self._champion_variant_id,
+                    "highlight": "global_champion" if variant_id == self._champion_variant_id else ("round_winner" if variant_id in round_winners else "candidate"),
+                    "summary": evaluation.get("summary", ""),
+                }
+            )
+            for parent_id in parent_ids:
+                edges.append({"from": parent_id, "to": variant_id})
+        store.write_champion_tree(
+            {
+                "run_id": self.run_id,
+                "global_champion_variant_id": self._champion_variant_id,
+                "global_champion_score": self._champion_score,
+                "nodes": nodes,
+                "edges": edges,
+            }
+        )
+
     def _should_stop_outer_loop(
         self,
         termination_signal: str,
         best_eval: Optional[VariantEvaluation],
         outer_iteration: int,
     ) -> bool:
+        if self.task_mode == "optimize" and termination_signal == "score_plateau" and self.continue_on_optimize_plateau:
+            return outer_iteration >= self.max_outer_iterations
         if termination_signal in {"score_plateau", "coverage_plateau"} and self.objective.no_stop_until_target:
             return outer_iteration >= self.max_outer_iterations
         if termination_signal == "score_threshold" and self.objective.has_explicit_target:
@@ -1333,10 +1664,22 @@ class EvolutionaryOuterLoop:
     def _prediction_market_objective_met(self, best_eval: Optional[VariantEvaluation]) -> bool:
         if not best_eval:
             return False
+        if not best_eval.metrics.get("score_eligible", best_eval.metrics.get("official_measured", False)):
+            return False
         edge = _pm_edge_from_eval(best_eval)
         if self.objective.target is None:
             return best_eval.score >= 0.8
         return edge >= self.objective.target
+
+    async def _evaluate_prediction_market_variant_capped(
+        self,
+        variant: Variant,
+        store: ArtifactStore,
+        round_index: int,
+        semaphore: asyncio.Semaphore,
+    ) -> VariantEvaluation:
+        async with semaphore:
+            return await self._evaluate_prediction_market_variant(variant, store, round_index)
 
     async def _record_literature_grounding(self, store: ArtifactStore, reason: str) -> None:
         if any(
@@ -1398,12 +1741,15 @@ class EvolutionaryOuterLoop:
         )
 
     def _literature_grounding_query(self, reason: str, store: Optional[ArtifactStore] = None) -> str:
+        if self.evaluator_name == "prediction_market" and ("plateau" in reason or "stall" in reason):
+            return _prediction_market_plateau_literature_query(store)
         context_parts = [self.goal, reason.replace("_", " ")]
         if store:
             for item in _score_history(store, mode="optimize", limit=3):
                 context_parts.append(str(item.get("summary", "")))
                 context_parts.append(str(item.get("payload", ""))[:240])
             context_parts.extend(_recent_literature_grounding_notes(store, limit=3))
+            context_parts.extend(_recent_user_steering_notes(store, limit=3))
         terms = _context_terms(" ".join(context_parts), limit=28)
         return " ".join(terms) if terms else self.goal
 
@@ -1422,44 +1768,70 @@ class EvolutionaryOuterLoop:
         self._recovery_forced_retriever = None
         self._recovery_temperature = 0.7
         self._recovery_inject_mutation = False
+        self._recovery_entropy_intent = None
 
         history_mode = "optimize" if self.task_mode in {"optimize", "optimize_query"} else "research"
         score_context = json.dumps(_score_history(store, mode=history_mode, limit=4), sort_keys=True)
         action = plateau.next_recovery(f"{self.goal}|{reason}|{score_context}")
+        entropy_intent = _plateau_entropy_intent(action, self.goal, score_context, self.evaluator_name)
+        if history_mode == "optimize":
+            old_population = self.population_size
+            self.population_size = min(64, max(64 if self.population_size >= 48 else 32, self.population_size + self.parent_count, int(self.population_size * 1.25)))
+            self._recovery_temperature = 1.15
+            entropy_intent["population_before"] = old_population
+            entropy_intent["population_after"] = self.population_size
 
-        if action == "rotate_retriever":
+        if action == "fresh_search_context":
             retrievers = [item.retriever for item in self.source_strategy] or ["local"]
             retriever = retrievers[self._recovery_retriever_index % len(retrievers)]
             self._recovery_retriever_index += 1
             self._recovery_forced_retriever = retriever
-            action_note = f"context-derived retriever rotation -> {retriever}"
-        elif action == "boost_temperature":
-            self._recovery_temperature = 1.2
-            action_note = "context-derived temperature increase -> 1.2"
-        else:
+            entropy_intent["search_context"] = retriever
+            action_note = f"fresh search context via {retriever}"
+        elif action == "new_strategy_family":
             self._recovery_inject_mutation = True
-            action_note = "context-derived numeric perturbation of parent payloads"
+            action_note = str(entropy_intent["exploration_path"])
+        else:
+            self._recovery_temperature = max(self._recovery_temperature, 1.05)
+            action_note = str(entropy_intent["exploration_path"])
+        self._recovery_entropy_intent = entropy_intent
 
-        store.append_progress(f"Plateau recovery round {round_index} ({reason}): {action_note}")
+        store.append_progress(
+            f"Plateau entropy round {round_index} ({reason}): {action_note}; "
+            f"expected_generalization={entropy_intent['expected_generalization']}"
+        )
 
         # Record a traceable source/claim so the recovery appears in the artifact trail.
         source = store.add_source(
             Source(
                 url=f"memory://plateau-recovery/{self.run_id}/{round_index}/{reason}",
-                title=f"Plateau recovery: {action} at round {round_index}",
+                title=f"Plateau entropy: {action} at round {round_index}",
                 author="research-harness",
                 date=now_iso().split("T")[0],
                 source_type="memory",
-                summary=f"Loop plateaued ({reason}). Applied recovery action: {action_note}. Provenance: user goal, score history, and plateau reason.",
-                relevance_score=0.82,
-                credibility_score=0.72,
+                summary=(
+                    f"Loop plateaued ({reason}). Introduced meaningful entropy through {action_note}. "
+                    f"Expected to improve generalization: {entropy_intent['expected_generalization']}. "
+                    "This is not a hyperparameter-only retry."
+                ),
+                relevance_score=0.9,
+                credibility_score=0.8,
+                evidence_sections={
+                    "exploration_path": str(entropy_intent["exploration_path"]),
+                    "expected_generalization": str(entropy_intent["expected_generalization"]),
+                    "evidence_basis": str(entropy_intent["evidence_basis"]),
+                    "anti_reward_hack_rule": str(entropy_intent["anti_reward_hack_rule"]),
+                },
             )
         )
         store.add_claim(
             Claim(
-                text=f"Round {round_index} plateaued ({reason}); context-derived recovery '{action}': {action_note}.",
+                text=(
+                    f"Round {round_index} plateaued ({reason}); exploration path '{action}' is expected to improve "
+                    f"generalization because {entropy_intent['expected_generalization']}"
+                ),
                 source_ids=[source.id],
-                confidence=0.78,
+                confidence=0.82,
                 support_level="instrumented",
                 created_by_agent="plateau_recovery_policy",
                 run_id=self.run_id,
@@ -1478,9 +1850,12 @@ class EvolutionaryOuterLoop:
         store.append_progress(f"  Candidate eval start {variant.id}: {candidate_path}")
         result = await asyncio.to_thread(_run_prediction_market_official, candidate_path)
         edge = float(result.get("mean_edge", 0.0))
-        score = _normalize_prediction_market_edge(edge)
+        score_eligible = bool(result.get("score_eligible", result.get("official_measured", False)))
+        score = _normalize_prediction_market_edge(edge) if score_eligible else 0.0
         result["candidate_path"] = str(candidate_path)
-        store.append_progress(f"  Candidate eval done {variant.id}: mean_edge={edge:.3f} score={score:.3f}")
+        result["score_eligible"] = score_eligible
+        result["direction"] = _variant_direction_metadata(variant)
+        store.append_progress(f"  Candidate eval done {variant.id}: mean_edge={edge:.3f} score={score:.3f} eligible={score_eligible}")
         score_source = str(result.get("score_source", "unknown"))
         measured_label = "upstream orderbook-pm" if result.get("official_measured") else "local challenge fallback"
         return VariantEvaluation(
@@ -1493,10 +1868,11 @@ class EvolutionaryOuterLoop:
             summary=(
                 f"{measured_label} mean_edge={edge:.3f}; "
                 f"score_source={score_source}; "
+                f"score_eligible={score_eligible}; "
                 f"successes={int(result.get('success_count', 0))}; failures={int(result.get('failure_count', 0))}; "
                 f"candidate={candidate_path}."
             ),
-            passed=score >= 0.8,
+            passed=score_eligible and score >= 0.8,
         )
 
     def _write_optimization_outputs(
@@ -1506,6 +1882,11 @@ class EvolutionaryOuterLoop:
         best_eval: Optional[VariantEvaluation],
     ) -> None:
         if not best_eval:
+            if self.evaluator_name == "prediction_market":
+                self._write_unmeasured_prediction_market_result(store)
+            return
+        if self.evaluator_name == "prediction_market" and not best_eval.metrics.get("score_eligible", False):
+            self._write_unmeasured_prediction_market_result(store, best_eval)
             return
         started = time.perf_counter()
         started_at = now_iso()
@@ -1526,11 +1907,13 @@ class EvolutionaryOuterLoop:
         if self.evaluator_name == "prediction_market":
             official_result = {
                 "measured": bool(best_eval.metrics.get("official_measured", False)),
+                "score_eligible": bool(best_eval.metrics.get("score_eligible", False)),
                 "profit_usd": best_eval.metrics.get("mean_edge"),
                 "target_profit_usd": self.objective.target,
                 "target_met": self._prediction_market_objective_met(best_eval),
                 "score_source": best_eval.metrics.get("score_source", "unknown"),
                 "sandbox_executed": best_eval.metrics.get("sandbox_executed", False),
+                "docker_sandbox": best_eval.metrics.get("docker_sandbox", False),
                 "actions_seen": best_eval.metrics.get("actions_seen"),
                 "simulations": best_eval.metrics.get("simulations"),
                 "required_evaluator": "https://github.com/danrobinson/prediction-market-challenge",
@@ -1546,6 +1929,7 @@ class EvolutionaryOuterLoop:
             "score_variable": "score",
             "score": best_eval.score,
             "metrics": best_eval.metrics,
+            "evaluator_responses": _json_evaluator_responses(store, mode="optimize"),
             "best_variant_id": best_eval.variant_id,
             "best_candidate_path": str(store.optimized_candidate_path),
             "optimal_code_path": optimal_code_path,
@@ -1576,6 +1960,56 @@ class EvolutionaryOuterLoop:
             started=started,
             status="completed",
             output_summary=f"Wrote optimization outputs for best variant {best_eval.variant_id}.",
+        )
+
+    def _write_unmeasured_prediction_market_result(
+        self,
+        store: ArtifactStore,
+        best_eval: Optional[VariantEvaluation] = None,
+    ) -> None:
+        objective = _objective_metadata(self.evaluator_name)
+        metrics = best_eval.metrics if best_eval else {}
+        candidate_path = metrics.get("candidate_path")
+        payload = {
+            "run_id": self.run_id,
+            "evaluator_name": self.evaluator_name or "unknown",
+            "objective_name": objective["objective_name"],
+            "objective_direction": objective["objective_direction"],
+            "score_variable": "score",
+            "score": 0.0,
+            "metrics": metrics,
+            "evaluator_responses": _json_evaluator_responses(store, mode="optimize"),
+            "best_variant_id": best_eval.variant_id if best_eval else None,
+            "best_candidate_path": None,
+            "optimal_code_path": None,
+            "official_result": {
+                "measured": False,
+                "score_eligible": False,
+                "profit_usd": metrics.get("mean_edge"),
+                "target_profit_usd": self.objective.target,
+                "target_met": False,
+                "score_source": metrics.get("score_source", "unmeasured_official_scorer_unavailable"),
+                "sandbox_executed": metrics.get("sandbox_executed", False),
+                "docker_sandbox": metrics.get("docker_sandbox", False),
+                "required_evaluator": "https://github.com/danrobinson/prediction-market-challenge",
+                "candidate_path": candidate_path,
+                "error": metrics.get("error") or metrics.get("sandbox_error"),
+            },
+            "objective_target": {
+                "kind": self.objective.kind,
+                "target": self.objective.target,
+                "no_stop_until_target": self.objective.no_stop_until_target,
+                "met": False,
+            },
+            "note": (
+                "Prediction-market official scorer did not produce an eligible sandboxed score. "
+                "No optimal_code.py or solution.py was promoted from fallback/proxy scoring."
+            ),
+        }
+        store.write_optimization_result(payload)
+        store.append_progress(
+            "Optimization result marked unmeasured: official sandbox scorer unavailable or failed; "
+            "no fallback winner promoted."
         )
 
     def _build_optimizer_seed_context(self, store: ArtifactStore, result: Optional[InnerLoopResult]) -> dict[str, object]:
@@ -1631,16 +2065,21 @@ class EvolutionaryOuterLoop:
             if isinstance(claims, list) and claims and isinstance(claims[0], dict):
                 claim_text = f" -> {str(claims[0].get('text', ''))[:180]}"
             summary_parts.append(f"{item['query']}{claim_text}")
+        user_steering = _recent_user_steering_notes(store, limit=8)
         summary = "; ".join(summary_parts)
+        if user_steering:
+            summary = "; ".join([summary, *user_steering]).strip("; ")
         return {
             "run_id": self.run_id,
             "goal": self.goal,
             "mode": "optimize_query",
             "summary": summary,
             "top_query_findings": top_items,
+            "user_steering": user_steering,
             "optimizer_instruction": (
                 "Use the retrieved supporting claims and source summaries as strategy context when proposing "
-                "optimization variants. Do not rely on query wording alone."
+                "optimization variants. Treat user_steering as live user-provided context, not as proof of success. "
+                "Do not rely on query wording alone."
             ),
             "has_evaluator": self.evaluator is not None,
             "evaluator_name": self.evaluator_name or None,
@@ -1679,31 +2118,49 @@ class EvolutionaryOuterLoop:
         # Consume one-shot recovery flags so they only affect this round.
         forced_retriever = self._recovery_forced_retriever
         temperature = self._recovery_temperature
+        entropy_intent = self._recovery_entropy_intent
         self._recovery_forced_retriever = None
         self._recovery_temperature = 0.7
         self._recovery_inject_mutation = False  # not used for query variants
+        self._recovery_entropy_intent = None
+        directions = self._direction_specs(outer_iteration, parents, store)
 
         llm_variants = self._llm_query_variants(
             outer_iteration,
             parents,
             temperature=temperature,
             forced_retriever=forced_retriever,
+            directions=directions,
             store=store,
         )
         if llm_variants:
+            self._apply_direction_specs(llm_variants, directions, kind="query")
+            if entropy_intent:
+                for variant in llm_variants:
+                    variant.metadata["meaningful_entropy_intent"] = entropy_intent
             return llm_variants
 
         # Fallback (no live LLM): build variants from source strategy or parent mutations.
         if not parents:
             variants = []
-            for item in self.source_strategy[: self.population_size]:
+            source_items = self.source_strategy or [
+                SourceStrategyItem(
+                    name="forced_direction_fallback",
+                    retriever="local",
+                    purpose="forced direction fallback",
+                    queries=[self.goal],
+                    limit=6,
+                )
+            ]
+            for index, direction in enumerate(directions[: self.population_size]):
+                item = source_items[index % len(source_items)]
                 retriever = forced_retriever or item.retriever
                 variants.append(
                     Variant(
                         run_id=self.run_id,
                         outer_iteration=outer_iteration,
                         kind="query",
-                        payload=item.queries[0],
+                        payload=_directional_query_payload(item.queries[0], direction),
                         parent_ids=[],
                         metadata={
                             "retriever": retriever,
@@ -1711,10 +2168,12 @@ class EvolutionaryOuterLoop:
                             "limit": item.limit,
                             "research_role": "parallel_research_subagent",
                             "search_phase": "broad" if outer_iteration == 1 else "narrow",
-                            **({"recovery": "rotate_retriever"} if forced_retriever else {}),
+                            **({"recovery": "fresh_search_context"} if forced_retriever else {}),
+                            **({"meaningful_entropy_intent": entropy_intent} if entropy_intent else {}),
                         },
                     )
                 )
+            self._apply_direction_specs(variants, directions, kind="query")
             return variants
 
         suffixes = _contextual_query_suffixes(self.goal, parents, self.population_size)
@@ -1723,6 +2182,10 @@ class EvolutionaryOuterLoop:
             for item in self.prior_run_memory.get("unresolved_directions", [])
             if str(item).strip()
         ]
+        user_steering = _recent_user_steering_notes(store, limit=4)
+        if user_steering:
+            steering_suffixes = [" ".join(_context_terms(note, limit=6)) for note in user_steering]
+            suffixes = [suffix for suffix in steering_suffixes if suffix] + suffixes
         if unresolved:
             memory_suffixes = [_context_terms(item, limit=4) for item in unresolved]
             suffixes = [
@@ -1731,26 +2194,30 @@ class EvolutionaryOuterLoop:
                 if terms
             ] + suffixes
         variants = []
-        for index, suffix in enumerate(suffixes[: self.population_size]):
-            parent = parents[index % len(parents)]
+        for index, direction in enumerate(directions[: self.population_size]):
+            suffix = suffixes[index % len(suffixes)] if suffixes else direction.strategy_family
+            parent_pool = [] if direction.parent_policy == "ignore_parents" else parents
+            parent = parent_pool[index % len(parent_pool)] if parent_pool else parents[index % len(parents)]
             retriever = forced_retriever or str(parent.metadata.get("retriever", "local"))
             variants.append(
                 Variant(
                     run_id=self.run_id,
                     outer_iteration=outer_iteration,
                     kind="query",
-                    payload=f"{parent.payload} {suffix}",
-                    parent_ids=[parent.id],
+                    payload=_directional_query_payload(f"{parent.payload} {suffix}", direction),
+                    parent_ids=[] if direction.parent_policy == "ignore_parents" else [parent.id],
                     metadata={
                         **parent.metadata,
                         "retriever": retriever,
                         "search_phase": "narrow",
                         "narrowing_suffix": suffix,
                         "suffix_provenance": "context-derived from goal and parent variants",
-                        **({"recovery": "rotate_retriever"} if forced_retriever else {}),
+                        **({"recovery": "fresh_search_context"} if forced_retriever else {}),
+                        **({"meaningful_entropy_intent": entropy_intent} if entropy_intent else {}),
                     },
                 )
             )
+        self._apply_direction_specs(variants, directions, kind="query")
         return variants
 
     def _propose_code_variants(
@@ -1762,33 +2229,63 @@ class EvolutionaryOuterLoop:
         # Consume one-shot recovery flags.
         temperature = self._recovery_temperature
         inject_mutation = self._recovery_inject_mutation
+        entropy_intent = self._recovery_entropy_intent
         self._recovery_forced_retriever = None
         self._recovery_temperature = 0.7
         self._recovery_inject_mutation = False
+        self._recovery_entropy_intent = None
+        directions = self._direction_specs(outer_iteration, parents, store)
 
-        llm_variants = self._llm_code_variants(outer_iteration, parents, temperature=temperature, store=store)
+        llm_variants = self._llm_code_variants(outer_iteration, parents, temperature=temperature, directions=directions, store=store)
         if llm_variants:
+            self._apply_direction_specs(llm_variants, directions, kind="code")
+            if entropy_intent:
+                suffix = _entropy_payload_suffix(entropy_intent)
+                for variant in llm_variants:
+                    variant.payload = f"{variant.payload} {suffix}"
+                    variant.metadata["meaningful_entropy_intent"] = entropy_intent
             return llm_variants
 
         # Fallback seeds (no live LLM).
         if not parents:
             seeds = [
-                "baseline direct implementation",
-                "vectorized implementation",
-                "cached implementation",
-                "branch-reduced implementation",
+                _directional_code_seed("baseline direct implementation", direction)
+                for direction in directions
             ]
         else:
             if all(parent.kind == "query" for parent in parents):
                 challenge_context = self._optimizer_seed_prefix()
                 seeds = [
-                    f"{challenge_context} Optimization variant informed by query finding: {parent.payload} refined pass {outer_iteration}"
-                    for parent in parents
+                    _directional_code_seed(
+                        f"{challenge_context} Optimization variant informed by query finding: {parents[index % len(parents)].payload} refined pass {outer_iteration}",
+                        direction,
+                    )
+                    for index, direction in enumerate(directions)
                 ]
-                seeds.extend(f"{challenge_context} Alternative optimization mutation from query finding: {parent.payload}" for parent in parents)
             else:
-                seeds = [f"{parent.payload} refined pass {outer_iteration}" for parent in parents]
-                seeds.extend(f"{parent.payload} alternative mutation {outer_iteration}" for parent in parents)
+                seeds = []
+                for index, direction in enumerate(directions):
+                    parent_pool = [] if direction.parent_policy == "ignore_parents" else parents
+                    parent = parent_pool[index % len(parent_pool)] if parent_pool else parents[index % len(parents)]
+                    base = f"{parent.payload} refined pass {outer_iteration}" if direction.parent_policy != "ignore_parents" else f"fresh non-descendant implementation for {self.goal}"
+                    seeds.append(_directional_code_seed(base, direction))
+        if self._champion_payload:
+            champion_prefix = (
+                f"diff_against_champion champion_score={self._champion_score:.3f} "
+                f"champion_variant={self._champion_variant_id} champion_payload='{self._champion_payload[:300]}'"
+            )
+            seeds = [
+                payload if directions[index % len(directions)].parent_policy == "ignore_champion"
+                else f"{champion_prefix} mutation={payload}"
+                for index, payload in enumerate(seeds)
+            ]
+
+        if entropy_intent:
+            suffix = _entropy_payload_suffix(entropy_intent)
+            seeds = [f"{payload} {suffix}" for payload in seeds]
+        user_steering = _recent_user_steering_notes(store, limit=2)
+        if user_steering:
+            seeds = [f"{payload} user_steering='{user_steering[index % len(user_steering)]}'" for index, payload in enumerate(seeds)]
 
         variants = [
             Variant(
@@ -1797,7 +2294,10 @@ class EvolutionaryOuterLoop:
                 kind="code",
                 payload=payload,
                 parent_ids=[parent.id for parent in parents],
-                metadata={"goal": self.goal},
+                metadata={
+                    "goal": self.goal,
+                    **({"meaningful_entropy_intent": entropy_intent} if entropy_intent else {}),
+                },
             )
             for payload in seeds[: self.population_size]
         ]
@@ -1805,6 +2305,7 @@ class EvolutionaryOuterLoop:
         if inject_mutation:
             variants = [_randomly_mutate_variant(v, outer_iteration) for v in variants]
 
+        self._apply_direction_specs(variants, directions, kind="code")
         return variants
 
     def _optimizer_seed_prefix(self) -> str:
@@ -1818,12 +2319,17 @@ class EvolutionaryOuterLoop:
     ) -> list[Variant]:
         temperature = self._recovery_temperature
         inject_mutation = self._recovery_inject_mutation
+        entropy_intent = self._recovery_entropy_intent
+        self._recovery_forced_retriever = None
         self._recovery_temperature = 0.7
         self._recovery_inject_mutation = False
+        self._recovery_entropy_intent = None
+        directions = self._direction_specs(outer_iteration, parents, store)
 
         score_history = _score_history(store, mode="optimize") if store else []
         literature_notes = _recent_literature_grounding_notes(store) if store else []
-        context_text = " ".join([self.goal, *literature_notes])
+        user_steering_notes = _recent_user_steering_notes(store) if store else []
+        context_text = " ".join([self.goal, *literature_notes, *user_steering_notes])
         templates = [
             _contextual_prediction_market_payload(context_text, outer_iteration, index)
             for index in range(max(self.population_size, 4))
@@ -1871,6 +2377,25 @@ class EvolutionaryOuterLoop:
                         f"parent='{parent.payload[:120]}'"
                     )
             templates = parent_mutations + templates
+        if self._champion_payload:
+            champion_params = _prediction_market_params(self._champion_payload)
+            champion_templates = []
+            for delta, size_factor, inventory_factor, skew_delta in [
+                (-1, 1.05, 1.00, -1),
+                (1, 0.95, 0.95, 1),
+                (3, 0.80, 0.80, 3),
+                (6, 0.60, 0.70, 5),
+            ]:
+                champion_templates.append(
+                    f"pm_strategy=champion_diff champion_variant={self._champion_variant_id} "
+                    f"champion_score={self._champion_score:.3f} "
+                    f"spread={max(2, int(champion_params['spread']) + delta)} "
+                    f"size={max(0.05, float(champion_params['size']) * size_factor):.2f} "
+                    f"inventory={max(1.0, float(champion_params['inventory']) * inventory_factor):.1f} "
+                    f"skew={max(1.0, float(champion_params['skew_divisor']) + skew_delta):.1f} "
+                    f"parent='{self._champion_payload[:120]}'"
+                )
+            templates = champion_templates + templates
         elif parents:
             context = self._optimizer_seed_prefix()
             templates = [
@@ -1885,26 +2410,46 @@ class EvolutionaryOuterLoop:
                 f"{template} fresh_literature='{literature_notes[index % len(literature_notes)]}'"
                 for index, template in enumerate(templates)
             ]
+        if user_steering_notes:
+            templates = [
+                f"{template} user_steering='{user_steering_notes[index % len(user_steering_notes)]}'"
+                for index, template in enumerate(templates)
+            ]
+        if entropy_intent:
+            suffix = _entropy_payload_suffix(entropy_intent)
+            templates = [f"{template} {suffix}" for template in templates]
         deterministic_variants = [
             Variant(
                 run_id=self.run_id,
                 outer_iteration=outer_iteration,
                 kind="code",
-                payload=payload,
+                payload=_directional_code_seed(payload, directions[index % len(directions)]) if directions else payload,
                 parent_ids=[parent.id for parent in parents],
-                metadata={"goal": self.goal, "challenge": "prediction_market"},
+                metadata={
+                    "goal": self.goal,
+                    "challenge": "prediction_market",
+                    **({"meaningful_entropy_intent": entropy_intent} if entropy_intent else {}),
+                },
             )
-            for payload in templates[: self.population_size]
+            for index, payload in enumerate(templates[: self.population_size])
         ]
         if inject_mutation:
             deterministic_variants = [_randomly_mutate_variant(variant, outer_iteration) for variant in deterministic_variants]
+        self._apply_direction_specs(deterministic_variants, directions, kind="code")
 
         llm_variants = self._llm_prediction_market_code_variants(
             outer_iteration,
             parents,
             temperature=temperature,
+            directions=directions,
             store=store,
         )
+        self._apply_direction_specs(llm_variants, directions, kind="code")
+        if entropy_intent:
+            suffix = _entropy_payload_suffix(entropy_intent)
+            for variant in llm_variants:
+                variant.payload = f"{variant.payload}\n# {suffix}"
+                variant.metadata["meaningful_entropy_intent"] = entropy_intent
         return _dedupe_prediction_market_variants(
             [*llm_variants, *deterministic_variants],
             store=store,
@@ -1935,6 +2480,7 @@ class EvolutionaryOuterLoop:
         *,
         temperature: float = 0.7,
         forced_retriever: Optional[str] = None,
+        directions: Optional[list[DirectionSpec]] = None,
         store: Optional[ArtifactStore] = None,
     ) -> list[Variant]:
         if not self.llm.is_live:
@@ -1974,6 +2520,7 @@ class EvolutionaryOuterLoop:
             "- Do NOT repeat prior_report_avoid_directions unless the user explicitly asked for replication.\n"
             "- Prefer prior_report_unresolved_directions when they are directly related to the current goal.\n"
             "- Iteration 1: start broad and wide. Later iterations: narrow based on parent findings.\n"
+            "- Obey forced_directions exactly: each returned variant must test its assigned strategy_family and mechanism_hypothesis.\n"
             + recovery_note + "\n\n"
             "Return JSON only: {\"variants\": [{\"query\": str, \"retriever\": str, \"purpose\": str}]}"
         )
@@ -1985,7 +2532,9 @@ class EvolutionaryOuterLoop:
                 "already_tried": already_tried,
                 "prior_report_avoid_directions": avoid_directions,
                 "prior_report_unresolved_directions": unresolved_directions,
+                "user_steering": _recent_user_steering_notes(store, limit=6),
                 "available_strategy": strategy,
+                "forced_directions": [_direction_metadata(direction, kind="query") for direction in (directions or [])],
                 "population_size": self.population_size,
                 **({"forced_retriever": forced_retriever} if forced_retriever else {}),
             },
@@ -2043,7 +2592,7 @@ class EvolutionaryOuterLoop:
                         "research_role": "parallel_research_subagent",
                         "search_phase": "broad" if outer_iteration == 1 else "narrow",
                         **({"recovery_temperature": temperature} if temperature != 0.7 else {}),
-                        **({"recovery": "rotate_retriever"} if forced_retriever else {}),
+                        **({"recovery": "fresh_search_context"} if forced_retriever else {}),
                     },
                 )
             )
@@ -2070,6 +2619,7 @@ class EvolutionaryOuterLoop:
         parents: list[Variant],
         *,
         temperature: float = 0.7,
+        directions: Optional[list[DirectionSpec]] = None,
         store: Optional[ArtifactStore] = None,
     ) -> list[Variant]:
         if not self.llm.is_live:
@@ -2079,6 +2629,7 @@ class EvolutionaryOuterLoop:
                 outer_iteration,
                 parents,
                 temperature=temperature,
+                directions=directions,
                 store=store,
             )
         started = time.perf_counter()
@@ -2086,15 +2637,24 @@ class EvolutionaryOuterLoop:
         tokens_before = self.llm.total_prompt_tokens + self.llm.total_completion_tokens
         system = (
             "You are the outer orchestrator in an evolutionary optimization harness. "
-            "Propose candidate code or strategy variants as JSON only: {\"variants\": [{\"payload\": str}]}."
+            "Propose candidate code or strategy variants as JSON only: {\"variants\": [{\"payload\": str}]}. "
+            "Obey forced_directions exactly: every variant must test its assigned strategy_family and mechanism_hypothesis."
         )
         user = json.dumps(
             {
                 "goal": self.goal,
                 "outer_iteration": outer_iteration,
                 "parents": [parent.payload for parent in parents],
+                "champion": {
+                    "variant_id": self._champion_variant_id,
+                    "score": self._champion_score,
+                    "payload": self._champion_payload,
+                    "instruction": "Every proposed variant should be a deliberate diff against the champion unless exploring a new strategy family.",
+                },
+                "forced_directions": [_direction_metadata(direction, kind="code") for direction in (directions or [])],
                 "population_size": self.population_size,
                 "score_history": _score_history(store, mode="optimize") if store else [],
+                "user_steering": _recent_user_steering_notes(store, limit=6),
             },
             indent=2,
             sort_keys=True,
@@ -2162,6 +2722,7 @@ class EvolutionaryOuterLoop:
         parents: list[Variant],
         *,
         temperature: float = 0.7,
+        directions: Optional[list[DirectionSpec]] = None,
         store: Optional[ArtifactStore] = None,
     ) -> list[Variant]:
         """Ask the LLM to write complete, executable Python Strategy classes.
@@ -2191,7 +2752,8 @@ class EvolutionaryOuterLoop:
             "```\n\n"
             "SCORING: mean_edge is computed by the evaluator from fills and market state. Higher is better. "
             "Infer strategy choices only from the user goal, parent strategies, retrieved evidence, and score history; "
-            "do not assume a fixed named trading doctrine unless the prompt or retrieved evidence supports it.\n\n"
+            "do not assume a fixed named trading doctrine unless the prompt or retrieved evidence supports it. "
+            "Obey forced_directions exactly: every variant must test its assigned strategy_family and mechanism_hypothesis.\n\n"
             f"Return JSON only: {{\"variants\": [{{\"payload\": \"<complete Python source>\", \"description\": str}}]}} "
             f"with exactly {self.population_size} variants. Each must be a fully self-contained Python file "
             "with the imports and class definition. No placeholders or TODO comments."
@@ -2201,7 +2763,15 @@ class EvolutionaryOuterLoop:
                 "goal": self.goal,
                 "outer_iteration": outer_iteration,
                 "parent_strategies": parent_snippets,
+                "champion": {
+                    "variant_id": self._champion_variant_id,
+                    "score": self._champion_score,
+                    "payload": self._champion_payload[:1200],
+                    "instruction": "Each strategy should either be a deliberate diff against this champion or a clearly labeled new strategy family.",
+                },
                 "literature_seed_context": literature_seed_context,
+                "user_steering": _recent_user_steering_notes(store, limit=6),
+                "forced_directions": [_direction_metadata(direction, kind="code") for direction in (directions or [])],
                 "population_size": self.population_size,
                 "instruction": (
                     "Generate diverse strategies that differ meaningfully in logic. "
@@ -2387,6 +2957,185 @@ def _score_history(store: Optional[ArtifactStore], *, mode: str, limit: int = 8)
     return history
 
 
+def _json_evaluator_responses(store: ArtifactStore, *, mode: str) -> list[dict[str, object]]:
+    rows = [row for row in store.list("variant_evaluations") if str(row.get("inner_loop")) == mode]
+    responses: list[dict[str, object]] = []
+    for row in rows:
+        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+        response = metrics.get("json_response") if isinstance(metrics, dict) else None
+        if not isinstance(response, dict):
+            response = {
+                "status": metrics.get("evaluator_status", "completed") if isinstance(metrics, dict) else "completed",
+                "score": float(row.get("score", 0.0) or 0.0),
+                "metrics": metrics,
+                "diagnostics": metrics.get("diagnostics", {}) if isinstance(metrics, dict) else {},
+                "loss_reason": metrics.get("loss_reason", "") if isinstance(metrics, dict) else "",
+                "summary": row.get("summary", ""),
+            }
+        responses.append(
+            {
+                "variant_id": row.get("variant_id"),
+                "inner_loop": row.get("inner_loop"),
+                **response,
+            }
+        )
+    return responses
+
+
+def _forced_direction_specs(
+    *,
+    goal: str,
+    task_mode: TaskMode,
+    population_size: int,
+    outer_iteration: int,
+    novelty_fraction: float,
+    champion_payload: str,
+    parents: list[Variant],
+    store: Optional[ArtifactStore],
+) -> list[DirectionSpec]:
+    if population_size <= 0:
+        return []
+    terms = _context_terms(goal, limit=8)
+    topic = " ".join(terms[:4]) or "objective"
+    score_patterns = _score_history(store, mode="optimize" if task_mode in {"optimize", "optimize_query"} else "research", limit=4) if store else []
+    observed_failure = " ".join(str(item.get("summary", "")) for item in score_patterns)[:240]
+    novelty_slots = max(1, int(round(population_size * novelty_fraction))) if population_size >= 4 else 1
+    base_families = [
+        ("control_baseline", f"establish a simple baseline for {topic}"),
+        ("champion_diff", "make one deliberate change to the current champion and keep everything else fixed"),
+        ("new_strategy_family", f"test a structurally different approach to {topic}"),
+        ("mechanism_transfer", "import a mechanism from retrieved evidence or prior findings"),
+        ("failure_mode_targeting", f"target the most visible failure mode: {observed_failure or 'unknown failure'}"),
+        ("regime_specific_probe", "specialize behavior for a distinct input/data/evaluation regime"),
+        ("constraint_relaxation", "relax or invert one assumption held by parent variants"),
+        ("risk_control", "add a conservative guardrail or kill-switch for brittle cases"),
+        ("ablation", "remove or disable one champion component to identify load-bearing features"),
+        ("multi_model_convergence", "solve independently from a different reasoning lane and compare mechanisms"),
+    ]
+    specs: list[DirectionSpec] = []
+    for slot in range(population_size):
+        family, mechanism = base_families[slot % len(base_families)]
+        entropy_role = family
+        parent_policy = "use_parents"
+        if slot >= population_size - novelty_slots or family == "new_strategy_family":
+            entropy_role = "novelty"
+            parent_policy = "ignore_parents"
+        if family == "champion_diff" and champion_payload:
+            parent_policy = "use_champion"
+        if family == "ablation":
+            entropy_role = "ablation"
+            parent_policy = "use_champion" if champion_payload else "use_parents"
+        if family == "multi_model_convergence":
+            entropy_role = "multi_model_convergence"
+            parent_policy = "ignore_champion"
+        if outer_iteration > 1 and slot % 7 == 0:
+            entropy_role = "regime_probe"
+            family = "regime_specific_probe"
+        regime_focus = [
+            "common_random_seeds",
+            "edge_case_regime",
+            "high_variance_regime",
+            "small_input_regime",
+            "large_input_regime",
+            "post_failure_regime",
+        ][slot % 6]
+        specs.append(
+            DirectionSpec(
+                slot=slot,
+                strategy_family=family,
+                mechanism_hypothesis=mechanism,
+                entropy_role=entropy_role,
+                parent_policy=parent_policy,
+                eval_protocol="paired_crn_same_seeds_across_variants",
+                regime_focus=regime_focus,
+                convergence_lane=f"lane_{slot % 3}",
+                ablation_target=_ablation_target(champion_payload, parents, slot) if family == "ablation" else "",
+            )
+        )
+    return specs
+
+
+def _ablation_target(champion_payload: str, parents: list[Variant], slot: int) -> str:
+    text = champion_payload or " ".join(parent.payload for parent in parents[:2])
+    terms = _context_terms(text, limit=12)
+    if not terms:
+        return "largest_or_most_recent_component"
+    return terms[slot % len(terms)]
+
+
+def _direction_metadata(direction: DirectionSpec, *, kind: str) -> dict[str, object]:
+    return {
+        "direction_slot": direction.slot,
+        "strategy_family": direction.strategy_family,
+        "mechanism_hypothesis": direction.mechanism_hypothesis,
+        "entropy_role": direction.entropy_role,
+        "parent_policy": direction.parent_policy,
+        "eval_protocol": direction.eval_protocol,
+        "paired_crn": True,
+        "regime_focus": direction.regime_focus,
+        "regime_metrics_requested": [direction.regime_focus, "overall", "failure_cases"],
+        "convergence_lane": direction.convergence_lane,
+        "ablation_target": direction.ablation_target,
+        "variant_contract": f"{kind}_variant_must_test_named_mechanism",
+    }
+
+
+def _variant_direction_metadata(variant: Variant) -> dict[str, object]:
+    keys = {
+        "strategy_family",
+        "mechanism_hypothesis",
+        "entropy_role",
+        "eval_protocol",
+        "paired_crn",
+        "regime_focus",
+        "regime_metrics_requested",
+        "convergence_lane",
+        "ablation_target",
+    }
+    return {key: variant.metadata.get(key) for key in keys if key in variant.metadata}
+
+
+def _directional_query_payload(payload: str, direction: DirectionSpec) -> str:
+    return (
+        f"{payload} strategy_family:{direction.strategy_family} "
+        f"mechanism_hypothesis:{direction.mechanism_hypothesis} "
+        f"regime_focus:{direction.regime_focus} entropy_role:{direction.entropy_role}"
+    )
+
+
+def _directional_code_seed(payload: str, direction: DirectionSpec) -> str:
+    ablation = f" ablation_target={direction.ablation_target}" if direction.ablation_target else ""
+    return (
+        f"{payload} strategy_family={direction.strategy_family} "
+        f"mechanism_hypothesis='{direction.mechanism_hypothesis}' "
+        f"entropy_role={direction.entropy_role} parent_policy={direction.parent_policy} "
+        f"eval_protocol={direction.eval_protocol} regime_focus={direction.regime_focus}{ablation}"
+    )
+
+
+def _prediction_market_plateau_literature_query(store: Optional[ArtifactStore]) -> str:
+    history = _score_history(store, mode="optimize", limit=6)
+    observations: list[str] = []
+    for item in history:
+        observations.append(_strip_run_artifacts(str(item.get("summary", ""))))
+        observations.append(_strip_run_artifacts(str(item.get("payload", ""))[:360]))
+        if item.get("mean_edge") is not None:
+            observations.append(f"observed edge {item.get('mean_edge')}")
+    context = " ".join(observations)
+    terms = _context_terms(context, limit=24)
+    if not terms:
+        terms = _context_terms("prediction market observed scorer feedback stalled evaluation", limit=12)
+    return " ".join([*terms[:16], "literature", "mechanism", "generalization"])
+
+
+def _strip_run_artifacts(text: str) -> str:
+    text = re.sub(r"\b(?:outputs|eval_outputs)/\S+", " ", text)
+    text = re.sub(r"\b(?:variant|round)_[A-Za-z0-9_]+\b", " ", text)
+    text = re.sub(r"\b[a-f0-9]{12,}\b", " ", text)
+    text = re.sub(r"\b\w+\.py\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _parent_literature_context(parent: Variant) -> dict[str, object]:
     seed = parent.metadata.get("seed_literature")
     if not isinstance(seed, dict):
@@ -2430,6 +3179,17 @@ def _recent_literature_grounding_notes(store: Optional[ArtifactStore], limit: in
         if claim.get("created_by_agent") == "literature_grounding_policy"
     ]
     return [_shorten(note, 220) for note in notes[-limit:] if note]
+
+
+def _recent_user_steering_notes(store: Optional[ArtifactStore], limit: int = 4) -> list[str]:
+    if not store:
+        return []
+    notes = [
+        str(claim.get("text", ""))
+        for claim in store.list("claims")
+        if claim.get("created_by_agent") == "user_steering"
+    ]
+    return [_shorten(note, 260) for note in notes[-limit:] if note]
 
 
 def _literature_seed_note(parent: Variant) -> str:
@@ -2572,6 +3332,50 @@ def _context_terms(text: str, limit: int = 12) -> list[str]:
         if len(terms) >= limit:
             break
     return terms
+
+
+def _plateau_entropy_intent(action: str, goal: str, score_context: str, evaluator_name: str) -> dict[str, object]:
+    context_terms = _context_terms(f"{goal} {score_context}", limit=10)
+    topic = " ".join(context_terms[:5]) or "the objective"
+    evaluator = evaluator_name or "deterministic evaluator"
+    plans = {
+        "new_strategy_family": {
+            "exploration_path": f"try a new strategy family for {topic}",
+            "evidence_basis": "evolutionary search literature favors structural mutation when local refinements stall",
+            "expected_generalization": "a structurally different family tests assumptions outside the current local optimum instead of tuning the same knobs",
+        },
+        "literature_mechanism": {
+            "exploration_path": f"derive a mechanism from freshly grounded literature for {topic}",
+            "evidence_basis": "literature-backed mechanisms add causal or empirical constraints that are independent of the current score trace",
+            "expected_generalization": "mechanism-guided variants should survive distribution shifts better than score-only parameter changes",
+        },
+        "alternative_evaluator": {
+            "exploration_path": f"judge candidates with an auxiliary robustness lens alongside {evaluator}",
+            "evidence_basis": "multi-objective and out-of-sample validation reduce overfitting to a single proxy score",
+            "expected_generalization": "an alternative evaluator lens penalizes brittle gains that only exploit the current proxy",
+        },
+        "fresh_search_context": {
+            "exploration_path": f"refresh search context for {topic}",
+            "evidence_basis": "retrieval-augmented optimization benefits from new evidence when existing candidates stop improving",
+            "expected_generalization": "fresh context can reveal untried constraints, failure modes, or mechanisms not represented in parent variants",
+        },
+    }
+    selected = plans.get(action, plans["new_strategy_family"])
+    return {
+        "action": action,
+        "exploration_path": selected["exploration_path"],
+        "expected_generalization": selected["expected_generalization"],
+        "evidence_basis": selected["evidence_basis"],
+        "anti_reward_hack_rule": "Do not count temperature changes, random seeds, or scalar hyperparameter nudges unless tied to a new family, mechanism, evaluator, or search context.",
+    }
+
+
+def _entropy_payload_suffix(intent: dict[str, object]) -> str:
+    return (
+        f"meaningful_entropy_action={intent.get('action', '')} "
+        f"exploration_path='{intent.get('exploration_path', '')}' "
+        f"expected_generalization='{intent.get('expected_generalization', '')}'"
+    )
 
 
 def _prediction_market_code_signature(payload: str) -> str:
@@ -2857,16 +3661,99 @@ def _pm_edge_from_eval(evaluation: Optional[VariantEvaluation]) -> float:
 
 
 def _run_prediction_market_official(strategy_path: Path) -> dict[str, object]:
-    strategy_text = strategy_path.read_text(encoding="utf-8")
     upstream_path = _find_pm_upstream_path()
     if upstream_path is None:
-        result = _run_prediction_market_sandbox(strategy_path)
-        result["error"] = (
+        if os.environ.get("PREDICTION_MARKET_ALLOW_LOCAL_FALLBACK") == "1":
+            result = _run_prediction_market_sandbox(strategy_path)
+            result["score_eligible"] = False
+            result["error"] = (
+                "Upstream repo not found. Used debug-only local fallback because "
+                "PREDICTION_MARKET_ALLOW_LOCAL_FALLBACK=1."
+            )
+            return result
+        return _prediction_market_unmeasured_result(
+            "upstream_repo_missing",
             "Upstream repo not found. Install prediction-market-challenge at a known path or "
-            "set PREDICTION_MARKET_CHALLENGE_PATH. Used local sandbox execution instead. "
-            "Set PREDICTION_MARKET_USE_UPSTREAM=0 to suppress this message."
+            "set PREDICTION_MARKET_CHALLENGE_PATH. No fallback score was used for optimization."
         )
-        return result
+
+    simulations = os.environ.get("PREDICTION_MARKET_SIMULATIONS", "200")
+    steps = os.environ.get("PREDICTION_MARKET_STEPS", "600")
+    seed_start = os.environ.get("PREDICTION_MARKET_SEED_START", "0")
+    workers = os.environ.get("PREDICTION_MARKET_WORKERS", "4")
+    if os.environ.get("PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM") == "1":
+        completed = _run_prediction_market_upstream_on_host(
+            upstream_path,
+            strategy_path,
+            simulations=simulations,
+            steps=steps,
+            seed_start=seed_start,
+            workers=workers,
+        )
+        docker_sandbox = False
+    else:
+        runner = DockerSandboxRunner()
+        completed = runner.execute_prediction_market(
+            upstream_path=upstream_path,
+            strategy_path=strategy_path,
+            simulations=simulations,
+            steps=steps,
+            seed_start=seed_start,
+            workers=workers,
+        )
+        docker_sandbox = True
+
+    if completed.returncode != 0:
+        return _prediction_market_unmeasured_result(
+            "official_sandbox_failed",
+            (completed.stderr or completed.stdout or "official scorer failed").strip()[:2000],
+            docker_sandbox=docker_sandbox,
+            exit_code=completed.returncode,
+            timed_out=getattr(completed, "timed_out", False),
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return _prediction_market_unmeasured_result(
+            "official_scorer_json_error",
+            f"JSONDecodeError: {exc}; stdout={completed.stdout[:500]}",
+            docker_sandbox=docker_sandbox,
+        )
+    results = payload.get("simulation_results", [])
+    successes = [result for result in results if not result.get("failed")]
+    if not results or not successes:
+        return _prediction_market_unmeasured_result(
+            "official_scorer_no_successes",
+            f"official scorer returned {len(results)} result(s), {len(successes)} successful.",
+            docker_sandbox=docker_sandbox,
+        )
+    mean_edge = sum(float(result.get("total_edge", 0.0)) for result in successes) / max(len(successes), 1)
+    mean_arb_edge = sum(float(result.get("arb_edge", 0.0)) for result in successes) / max(len(successes), 1)
+    mean_retail_edge = sum(float(result.get("retail_edge", 0.0)) for result in successes) / max(len(successes), 1)
+    return {
+        "official_measured": True,
+        "score_eligible": True,
+        "sandbox_executed": True,
+        "docker_sandbox": docker_sandbox,
+        "mean_edge": round(mean_edge, 6),
+        "mean_arb_edge": round(mean_arb_edge, 6),
+        "mean_retail_edge": round(mean_retail_edge, 6),
+        "success_count": len(successes),
+        "failure_count": len(results) - len(successes),
+        "simulations": len(results),
+        "score_source": "upstream_orderbook_pm_challenge",
+    }
+
+
+def _run_prediction_market_upstream_on_host(
+    upstream_path: Path,
+    strategy_path: Path,
+    *,
+    simulations: str,
+    steps: str,
+    seed_start: str,
+    workers: str,
+):
     cmd = [
         "uv",
         "run",
@@ -2876,13 +3763,13 @@ def _run_prediction_market_official(strategy_path: Path) -> dict[str, object]:
         "run",
         str(strategy_path),
         "--simulations",
-        os.environ.get("PREDICTION_MARKET_SIMULATIONS", "200"),
+        simulations,
         "--steps",
-        os.environ.get("PREDICTION_MARKET_STEPS", "600"),
+        steps,
         "--seed-start",
-        os.environ.get("PREDICTION_MARKET_SEED_START", "0"),
+        seed_start,
         "--workers",
-        os.environ.get("PREDICTION_MARKET_WORKERS", "4"),
+        workers,
         "--json",
     ]
     try:
@@ -2890,7 +3777,7 @@ def _run_prediction_market_official(strategy_path: Path) -> dict[str, object]:
         env.setdefault("UV_CACHE_DIR", "/private/tmp/research-harness-uv-cache")
         env.setdefault("UV_PYTHON_INSTALL_DIR", "/private/tmp/research-harness-uv-python")
         env.setdefault("UV_TOOL_DIR", "/private/tmp/research-harness-uv-tools")
-        completed = subprocess.run(
+        return subprocess.run(
             cmd,
             check=False,
             text=True,
@@ -2898,34 +3785,35 @@ def _run_prediction_market_official(strategy_path: Path) -> dict[str, object]:
             env=env,
             timeout=float(os.environ.get("PREDICTION_MARKET_TIMEOUT_SECONDS", "300")),
         )
+    except subprocess.TimeoutExpired as exc:
+        return type("Completed", (), {"returncode": 124, "stdout": exc.stdout or "", "stderr": exc.stderr or "host upstream execution timed out", "timed_out": True})()
     except Exception as exc:
-        result = _run_prediction_market_sandbox(strategy_path)
-        result["error"] = f"{type(exc).__name__}: {exc}"
-        return result
-    if completed.returncode != 0:
-        result = _run_prediction_market_sandbox(strategy_path)
-        result["error"] = (completed.stderr or completed.stdout).strip()[:1000]
-        return result
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        result = _run_prediction_market_sandbox(strategy_path)
-        result["error"] = f"JSONDecodeError: {exc}; stdout={completed.stdout[:500]}"
-        return result
-    results = payload.get("simulation_results", [])
-    successes = [result for result in results if not result.get("failed")]
-    mean_edge = sum(float(result.get("total_edge", 0.0)) for result in successes) / max(len(successes), 1)
-    mean_arb_edge = sum(float(result.get("arb_edge", 0.0)) for result in successes) / max(len(successes), 1)
-    mean_retail_edge = sum(float(result.get("retail_edge", 0.0)) for result in successes) / max(len(successes), 1)
+        return type("Completed", (), {"returncode": 1, "stdout": "", "stderr": f"{type(exc).__name__}: {exc}", "timed_out": False})()
+
+
+def _prediction_market_unmeasured_result(
+    score_source: str,
+    error: str,
+    *,
+    docker_sandbox: bool = False,
+    exit_code: Optional[int] = None,
+    timed_out: bool = False,
+) -> dict[str, object]:
     return {
-        "official_measured": True,
-        "mean_edge": round(mean_edge, 6),
-        "mean_arb_edge": round(mean_arb_edge, 6),
-        "mean_retail_edge": round(mean_retail_edge, 6),
-        "success_count": len(successes),
-        "failure_count": len(results) - len(successes),
-        "simulations": len(results),
-        "score_source": "upstream_orderbook_pm_challenge",
+        "official_measured": False,
+        "score_eligible": False,
+        "sandbox_executed": False,
+        "docker_sandbox": docker_sandbox,
+        "mean_edge": 0.0,
+        "mean_arb_edge": 0.0,
+        "mean_retail_edge": 0.0,
+        "success_count": 0,
+        "failure_count": 0,
+        "simulations": 0,
+        "score_source": score_source,
+        "error": error,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
     }
 
 
@@ -2946,6 +3834,7 @@ def _run_prediction_market_sandbox(strategy_path: Path) -> dict[str, object]:
     if completed.returncode != 0:
         result = _prediction_market_local_semantic_score(strategy_path.read_text(encoding="utf-8"))
         result["sandbox_executed"] = False
+        result["score_eligible"] = False
         result["score_source"] = "local_semantic_fallback_after_sandbox_failure"
         result["sandbox_error"] = (completed.stderr or completed.stdout).strip()[:1000]
         return result
@@ -2954,11 +3843,13 @@ def _run_prediction_market_sandbox(strategy_path: Path) -> dict[str, object]:
     except json.JSONDecodeError as exc:
         result = _prediction_market_local_semantic_score(strategy_path.read_text(encoding="utf-8"))
         result["sandbox_executed"] = False
+        result["score_eligible"] = False
         result["score_source"] = "local_semantic_fallback_after_sandbox_json_error"
         result["sandbox_error"] = f"JSONDecodeError: {exc}; stdout={completed.stdout[:500]}"
         return result
     payload["official_measured"] = False
     payload["sandbox_executed"] = True
+    payload["score_eligible"] = False
     payload["score_source"] = "local_sandbox_strategy_execution"
     return payload
 

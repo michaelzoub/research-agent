@@ -18,10 +18,45 @@ TASK_MODE_CHOICES = ("auto", "research", "optimize", "optimize_query")
 RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "twitter", "memory", "alchemy")
 LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "local", "multi")
 
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "green": "\033[38;5;35m",
+    "teal": "\033[38;5;43m",
+    "blue": "\033[38;5;39m",
+    "gray": "\033[38;5;245m",
+    "yellow": "\033[38;5;221m",
+    "red": "\033[38;5;203m",
+}
+
+LOGO = r"""
+    _         _                 
+   / \  _   _| |_ ___  _ __ ___ 
+  / _ \| | | | __/ _ \| '__/ _ \
+ / ___ \ |_| | || (_) | | |  __/
+/_/   \_\__,_|\__\___/|_|  \___|
+"""
+
+HELP_EPILOG = """
+Examples:
+  autore
+  autore "Research how multi-agent systems improve literature review quality"
+  autore "Optimize a tiny scoring function" --task-mode optimize --evaluator length_score
+  autore "Get to $10 profit in the prediction market challenge" --task-mode optimize_query --evaluator prediction_market
+
+Useful companions:
+  autore --list-llm-models
+  autore-eval --suite preflight
+  autore-bench --outputs outputs
+"""
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the research harness. Use no arguments for a selection-based setup.",
+        description="Run Autore, the research and optimization agent harness. Use no arguments for the guided setup.",
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("goal", nargs="?", help="High-level research goal. Omit to use the interactive run setup.")
     parser.add_argument(
@@ -61,6 +96,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum outer-loop iterations for the default evolutionary agent loop.",
     )
     parser.add_argument(
+        "--optimization-preset",
+        choices=("standard", "challenge"),
+        default=os.environ.get("RESEARCH_HARNESS_OPTIMIZATION_PRESET", "standard"),
+        help="Use challenge for high-width optimization: 48+ variants, 20+ iterations, top-4 parents, capped evaluator parallelism, and plateau continuation.",
+    )
+    parser.add_argument(
+        "--population-size",
+        type=int,
+        default=int(os.environ.get("RESEARCH_HARNESS_POPULATION_SIZE", "4")),
+        help="Evolutionary variant population per round. The challenge preset raises this to at least 48.",
+    )
+    parser.add_argument(
+        "--parent-count",
+        type=int,
+        default=int(os.environ.get("RESEARCH_HARNESS_PARENT_COUNT", "2")),
+        help="Number of top-scoring variants promoted as parents for the next optimization round.",
+    )
+    parser.add_argument(
+        "--parallel-evaluator-cap",
+        type=int,
+        default=int(os.environ.get("RESEARCH_HARNESS_PARALLEL_EVALUATOR_CAP", "8")),
+        help="Maximum concurrent evaluator calls for optimization/challenge variants.",
+    )
+    parser.add_argument(
+        "--no-direction-entropy",
+        action="store_true",
+        help="Disable deterministic strategy-family/mechanism forcing across generated variants.",
+    )
+    parser.add_argument(
+        "--novelty-fraction",
+        type=float,
+        default=float(os.environ.get("RESEARCH_HARNESS_NOVELTY_FRACTION", "0.25")),
+        help="Fraction of each generation reserved for non-descendant novelty directions.",
+    )
+    parser.add_argument(
         "--task-mode",
         choices=TASK_MODE_CHOICES,
         default=os.environ.get("RESEARCH_HARNESS_TASK_MODE", "auto"),
@@ -91,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet",
         action="store_true",
         help="Do not stream run progress to the terminal; artifacts are still written.",
+    )
+    parser.add_argument(
+        "--no-steering",
+        action="store_true",
+        help="Disable live /article and /steer input while the agent is running.",
     )
     parser.add_argument(
         "--session-projects-dir",
@@ -139,6 +214,92 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _use_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def _paint(text: str, color: str, *, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"{ANSI[color]}{text}{ANSI['reset']}"
+
+
+def _print_cli_banner(
+    *,
+    output_func: Callable[[str], None] = print,
+    color: Optional[bool] = None,
+    compact: bool = False,
+) -> None:
+    use_color = _use_color() if color is None else color
+    if compact:
+        output_func(
+            f"{_paint('Autore', 'teal', enabled=use_color)} "
+            f"{_paint('research + optimize agent harness', 'gray', enabled=use_color)}"
+        )
+        return
+    output_func(_paint(LOGO.rstrip("\n"), "teal", enabled=use_color))
+    output_func(_paint("Research. Optimize. Challenge. Leave artifacts.", "bold", enabled=use_color))
+    output_func("")
+    marker = _paint(">", "green", enabled=use_color)
+    direct_cmd = 'autore "Research ..."'
+    output_func(f"{marker} Guided setup: {_paint('autore', 'blue', enabled=use_color)}")
+    output_func(f"{marker} Direct run:   {_paint(direct_cmd, 'blue', enabled=use_color)}")
+    output_func(f"{marker} Models:       {_paint('autore --list-llm-models', 'blue', enabled=use_color)}")
+    output_func(f"{marker} Evals:        {_paint('autore-eval --suite preflight', 'blue', enabled=use_color)}")
+    output_func("")
+
+
+def _print_run_summary(run, store, *, output_func: Callable[[str], None] = print, color: Optional[bool] = None) -> None:
+    use_color = _use_color() if color is None else color
+    status_color = "green" if run.status == "completed" else "red"
+    output_func("")
+    output_func(_paint("Run complete", "bold", enabled=use_color))
+    output_func(f"{_paint('status', 'gray', enabled=use_color)}   {_paint(run.status, status_color, enabled=use_color)}")
+    output_func(f"{_paint('run', 'gray', enabled=use_color)}      {run.id}")
+    output_func(f"{_paint('home', 'gray', enabled=use_color)}     {store.root}")
+    if run.session_jsonl_path:
+        output_func(f"{_paint('session', 'gray', enabled=use_color)}  {run.session_jsonl_path}")
+
+    primary_artifacts = [
+        ("report", store.report_path),
+        ("prd", store.prd_path),
+        ("benchmark", store.run_benchmark_path),
+        ("notebook", store.run_notebook_path),
+    ]
+    optional_artifacts = [
+        ("seed context", store.optimizer_seed_context_path),
+        ("optimization", store.optimization_result_path),
+        ("candidate", store.optimized_candidate_path),
+        ("optimal code", store.optimal_code_path),
+        ("solution", store.solution_path),
+        ("champion", store.current_champion_path),
+        ("champ tree", store.champion_tree_path),
+        ("champ graph", store.champion_tree_graph_path),
+    ]
+    diagnostics = [
+        ("diagnosis", store.harness_diagnosis_path),
+        ("world db", store.sqlite_path),
+        ("decision dag", store.decision_dag_path),
+        ("timeline", store.agent_timeline_path),
+    ]
+    output_func("")
+    output_func(_paint("Open first", "teal", enabled=use_color))
+    for label, path in primary_artifacts:
+        output_func(f"  {_paint(label.ljust(10), 'gray', enabled=use_color)} {path}")
+    available_optional = [(label, path) for label, path in optional_artifacts if path.exists()]
+    if available_optional:
+        output_func("")
+        output_func(_paint("Optimization artifacts", "teal", enabled=use_color))
+        for label, path in available_optional:
+            output_func(f"  {_paint(label.ljust(10), 'gray', enabled=use_color)} {path}")
+    output_func("")
+    output_func(_paint("Diagnostics", "teal", enabled=use_color))
+    for label, path in diagnostics:
+        output_func(f"  {_paint(label.ljust(10), 'gray', enabled=use_color)} {path}")
+
+
 def prompt_choice(
     title: str,
     options: list[tuple[str, str]],
@@ -153,20 +314,21 @@ def prompt_choice(
         use_arrows = key_reader is not None or sys.stdin.isatty()
     if use_arrows:
         return prompt_arrow_choice(title, options, default=default, key_reader=key_reader)
+    use_color = _use_color()
     output_func("")
-    output_func(title)
+    output_func(_paint(title, "teal", enabled=use_color))
     for index, (value, label) in enumerate(options, start=1):
-        suffix = " [default]" if value == default else ""
-        output_func(f"  {index}. {label}{suffix}")
+        suffix = _paint(" [default]", "green", enabled=use_color) if value == default else ""
+        output_func(f"  {_paint(str(index) + '.', 'gray', enabled=use_color)} {label}{suffix}")
     while True:
-        answer = input_func("Choose a number: ").strip()
+        answer = input_func(_paint("Choose a number: ", "blue", enabled=use_color)).strip()
         if not answer:
             return default
         if answer.isdigit():
             selected_index = int(answer)
             if 1 <= selected_index <= len(options):
                 return options[selected_index - 1][0]
-        output_func(f"Please enter 1-{len(options)}, or press Enter for the default.")
+        output_func(_paint(f"Please enter 1-{len(options)}, or press Enter for the default.", "yellow", enabled=use_color))
 
 
 def prompt_arrow_choice(
@@ -181,14 +343,20 @@ def prompt_arrow_choice(
     selected_index = next((index for index, (value, _label) in enumerate(options) if value == default), 0)
     read_key = key_reader or read_terminal_key
     lines_rendered = 0
+    use_color = _use_color()
 
     while True:
         if lines_rendered:
             sys.stdout.write(f"\033[{lines_rendered}F")
-        lines = [title, "Use Up/Down, then Enter."]
+        lines = [
+            _paint(title, "teal", enabled=use_color),
+            _paint("Use Up/Down, then Enter. Vim keys work too.", "gray", enabled=use_color),
+        ]
         for index, (_value, label) in enumerate(options):
-            prefix = ">" if index == selected_index else " "
-            lines.append(f"{prefix} {label}")
+            if index == selected_index:
+                lines.append(f"{_paint('>', 'green', enabled=use_color)} {_paint(label, 'bold', enabled=use_color)}")
+            else:
+                lines.append(f"  {_paint(label, 'gray', enabled=use_color)}")
         for line in lines:
             sys.stdout.write(f"\033[2K\r{line}\n")
         sys.stdout.flush()
@@ -234,15 +402,16 @@ def prompt_text(
     output_func: Callable[[str], None] = print,
 ) -> str:
     rendered = f"{prompt} [{default}]: " if default else f"{prompt}: "
+    use_color = _use_color()
     while True:
-        answer = input_func(rendered).strip()
+        answer = input_func(_paint(rendered, "blue", enabled=use_color)).strip()
         if answer:
             return answer
         if default is not None:
             return default
         if not required:
             return ""
-        output_func("Please enter a value.")
+        output_func(_paint("Please enter a value.", "yellow", enabled=use_color))
 
 
 def prompt_int(
@@ -252,18 +421,19 @@ def prompt_int(
     input_func: Callable[[str], str] = input,
     output_func: Callable[[str], None] = print,
 ) -> int:
+    use_color = _use_color()
     while True:
-        answer = input_func(f"{prompt} [{default}]: ").strip()
+        answer = input_func(_paint(f"{prompt} [{default}]: ", "blue", enabled=use_color)).strip()
         if not answer:
             return default
         try:
             value = int(answer)
         except ValueError:
-            output_func("Please enter a whole number.")
+            output_func(_paint("Please enter a whole number.", "yellow", enabled=use_color))
             continue
         if value > 0:
             return value
-        output_func("Please enter a number greater than zero.")
+        output_func(_paint("Please enter a number greater than zero.", "yellow", enabled=use_color))
 
 
 def configure_interactive_run(
@@ -273,8 +443,10 @@ def configure_interactive_run(
     output_func: Callable[[str], None] = print,
     key_reader: Optional[Callable[[], str]] = None,
 ) -> argparse.Namespace:
-    output_func("autore run setup")
-    output_func("Existing flags are used as starting values.")
+    _print_cli_banner(output_func=output_func)
+    output_func("Ready to run. Existing flags are used as starting values.")
+    output_func("Tip: press Enter to accept a default; use Up/Down in menus.")
+    output_func("")
     args.goal = prompt_text(
         "What should the agent work on?",
         default=args.goal,
@@ -320,6 +492,7 @@ def configure_interactive_run(
         args.evaluator = evaluator or None
         if args.evaluator == "prediction_market":
             args.task_mode = "optimize_query"
+            args.optimization_preset = "challenge"
     args.retriever = prompt_choice(
         "Where should research evidence come from?",
         [
@@ -342,7 +515,7 @@ def configure_interactive_run(
     )
     args.max_iterations = prompt_int(
         "Iteration budget",
-        default=args.max_iterations,
+        default=max(args.max_iterations, 20) if args.optimization_preset == "challenge" else args.max_iterations,
         input_func=input_func,
         output_func=output_func,
     )
@@ -357,7 +530,7 @@ def configure_interactive_run(
     args.llm_model = selected_model
     args.llm_provider, args.llm_model = resolve_model_selection(args.llm_provider, args.llm_model)
     output_func("")
-    output_func("Starting run.")
+    output_func("Starting run. The artifact trail will be waiting at the finish line.")
     return args
 
 
@@ -383,9 +556,11 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     if args.list_llm_models:
+        _print_cli_banner(compact=True)
         print(format_model_catalog())
         return
     args.llm_provider, args.llm_model = resolve_model_selection(args.llm_provider, args.llm_model)
+    banner_printed = False
     if args.interactive or not args.goal:
         if not sys.stdin.isatty():
             parser.error(
@@ -393,6 +568,11 @@ def main() -> None:
                 "run `autore` in a terminal for the selection setup"
             )
         args = configure_interactive_run(args)
+        banner_printed = True
+    if not args.quiet and not banner_printed:
+        _print_cli_banner()
+        print(f"Ready to work on: {args.goal}")
+        print("")
     if args.preflight:
         run_preflight_evals(args)
     config = HarnessConfig(
@@ -401,6 +581,12 @@ def main() -> None:
         max_loop_iterations=args.max_iterations,
         task_mode=args.task_mode,
         evaluator_name=args.evaluator,
+        evolution_population_size=args.population_size,
+        optimization_preset=args.optimization_preset,
+        optimizer_parent_count=args.parent_count,
+        parallel_evaluator_cap=args.parallel_evaluator_cap,
+        force_direction_entropy=not args.no_direction_entropy,
+        novelty_fraction=args.novelty_fraction,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
         session_projects_dir=args.session_projects_dir,
@@ -408,32 +594,11 @@ def main() -> None:
         fork_session_id=args.fork_session,
         enable_sessions=not args.no_sessions,
         echo_progress=not args.quiet,
+        enable_steering=(not args.no_steering and not args.quiet and sys.stdin.isatty()),
     )
     orchestrator = Orchestrator(args.corpus, args.output, config)
     run, store = asyncio.run(orchestrator.run(args.goal, mode=args.mode))
-    print(f"Run: {run.id}")
-    print(f"Status: {run.status}")
-    print(f"Artifacts: {store.root}")
-    if run.session_jsonl_path:
-        print(f"Session JSONL: {run.session_jsonl_path}")
-    print(f"PRD: {store.prd_path}")
-    if store.optimizer_seed_context_path.exists():
-        print(f"Optimizer seed context: {store.optimizer_seed_context_path}")
-    if store.optimization_result_path.exists():
-        print(f"Optimization result: {store.optimization_result_path}")
-    if store.optimized_candidate_path.exists():
-        print(f"Optimized candidate: {store.optimized_candidate_path}")
-    if store.optimal_code_path.exists():
-        print(f"Optimal code: {store.optimal_code_path}")
-    if store.solution_path.exists():
-        print(f"Solution: {store.solution_path}")
-    print(f"Report: {store.report_path}")
-    print(f"Run benchmark: {store.run_benchmark_path}")
-    print(f"Run notebook: {store.run_notebook_path}")
-    print(f"Harness diagnosis: {store.harness_diagnosis_path}")
-    print(f"World model DB: {store.sqlite_path}")
-    print(f"Decision DAG: {store.decision_dag_path}")
-    print(f"Agent timeline: {store.agent_timeline_path}")
+    _print_run_summary(run, store)
 
 
 def run_preflight_evals(args: argparse.Namespace) -> None:

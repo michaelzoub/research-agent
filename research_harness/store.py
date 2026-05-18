@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -30,6 +31,7 @@ from .schemas import (
     Variant,
     VariantEvaluation,
     EvolutionRound,
+    now_iso,
     to_dict,
 )
 
@@ -94,6 +96,13 @@ class ArtifactStore:
         self.optimal_code_path = self.root / "optimal_code.py"
         self.candidates_dir = self.root / "candidates"
         self.candidates_dir.mkdir(parents=True, exist_ok=True)
+        self.champions_dir = self.root / "champions"
+        self.champions_dir.mkdir(parents=True, exist_ok=True)
+        self.champion_tree_path = self.root / "champion_tree.json"
+        self.champion_tree_graph_path = self.root / "champion_tree.png"
+        self.champion_tree_svg_path = self.root / "champion_tree.svg"
+        self.champion_tree_mermaid_path = self.root / "champion_tree.mmd"
+        self.current_champion_path = self.root / "current_champion.json"
         self.optimization_result_path = self.root / "optimization_result.json"
         self.solution_path = self.root / "solution.py"
         self.run_benchmark_path = self.root / "run_benchmark.html"
@@ -102,9 +111,15 @@ class ArtifactStore:
         self.run_notebook_path = self.root / "run_notebook.ipynb"
         self.harness_diagnosis_path = self.root / "harness_diagnosis.json"
         self.loop_continuation_path = self.root / "loop_continuation_decisions.json"
+        self.user_steering_inbox_path = self.root / "user_steering_inbox.jsonl"
+        self.user_steering_state_path = self.root / "user_steering_state.json"
         self.progress_path = self.root / "progress.txt"
         if not self.progress_path.exists():
             self.progress_path.write_text("", encoding="utf-8")
+        if not self.user_steering_inbox_path.exists():
+            self.user_steering_inbox_path.write_text("", encoding="utf-8")
+        if not self.user_steering_state_path.exists():
+            self.user_steering_state_path.write_text('{"consumed": 0}\n', encoding="utf-8")
         self._migrate_sqlite()
 
     def add_source(self, source: Source) -> Source:
@@ -279,6 +294,52 @@ class ArtifactStore:
         self._append("cost_events", event)
         return event
 
+    def append_user_steering(self, text: str) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        payload = {
+            "text": clean,
+            "created_at": now_iso(),
+        }
+        with self.user_steering_inbox_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        if self.session_store is not None:
+            self.session_store.append_event("user_steering", payload)
+
+    def ingest_pending_user_steering(self, run_id: Optional[str] = None) -> int:
+        lines = self.user_steering_inbox_path.read_text(encoding="utf-8").splitlines()
+        state = _read_json(self.user_steering_state_path, {"consumed": 0})
+        consumed = max(0, int(state.get("consumed") or 0))
+        ingested = 0
+        for index, line in enumerate(lines[consumed:], start=consumed):
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                consumed = index + 1
+                continue
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                consumed = index + 1
+                continue
+            source = self.add_source(_source_from_user_steering(text, run_id or self.root.name))
+            self.add_claim(
+                Claim(
+                    text=f"User steering: {_steering_summary(text)}",
+                    source_ids=[source.id],
+                    confidence=0.9,
+                    support_level="user_provided",
+                    created_by_agent="user_steering",
+                    run_id=run_id or self.root.name,
+                )
+            )
+            ingested += 1
+            consumed = index + 1
+        self.user_steering_state_path.write_text(json.dumps({"consumed": consumed}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if ingested:
+            self.append_progress(f"User steering: ingested {ingested} new note/article(s) into the next round context")
+        return ingested
+
     def append_progress(self, text: str) -> None:
         if self.echo_progress:
             print(_format_progress_for_terminal(text), flush=True)
@@ -399,6 +460,21 @@ class ArtifactStore:
         self.optimization_result_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self._record_artifact_write(self.optimization_result_path, "optimization_result")
         return self.optimization_result_path
+
+    def write_round_champion(self, round_index: int, payload: dict[str, Any]) -> Path:
+        path = self.champions_dir / f"round_{round_index:03d}_champion.json"
+        self._snapshot_before_write(path, "before writing round champion")
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self.current_champion_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(path, "round_champion")
+        self._record_artifact_write(self.current_champion_path, "current_champion")
+        return path
+
+    def write_champion_tree(self, payload: dict[str, Any]) -> Path:
+        self._snapshot_before_write(self.champion_tree_path, "before writing champion tree")
+        self.champion_tree_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(self.champion_tree_path, "champion_tree")
+        return self.champion_tree_path
 
     def write_cost(self, payload: dict[str, Any]) -> Path:
         self._snapshot_before_write(self.cost_path, "before writing cost summary")
@@ -611,6 +687,48 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return default
+
+
+def _source_from_user_steering(text: str, run_id: str) -> Source:
+    url, title, summary = _parse_user_steering_text(text)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return Source(
+        url=url or f"memory://user-steering/{run_id}/{digest}",
+        title=title or _steering_summary(text, limit=80),
+        author="user",
+        date=now_iso().split("T")[0],
+        source_type="user_steering",
+        summary=summary,
+        relevance_score=1.0,
+        credibility_score=0.85,
+        evidence_sections={"user_supplied_text": text},
+    )
+
+
+def _parse_user_steering_text(text: str) -> tuple[str, str, str]:
+    clean = text.strip()
+    if clean.startswith("/article"):
+        clean = clean[len("/article"):].strip()
+    elif clean.startswith("/steer"):
+        clean = clean[len("/steer"):].strip()
+    elif clean.startswith("/note"):
+        clean = clean[len("/note"):].strip()
+    parts = [part.strip() for part in clean.split("|")]
+    url_match = re.search(r"https?://\S+", clean)
+    url = url_match.group(0).rstrip(".,);]") if url_match else ""
+    if len(parts) >= 3:
+        first_is_url = parts[0].startswith(("http://", "https://"))
+        return parts[0] if first_is_url else url, parts[1] if first_is_url else parts[0], parts[2]
+    if len(parts) == 2:
+        first_is_url = parts[0].startswith(("http://", "https://"))
+        return parts[0] if first_is_url else url, parts[1] if first_is_url else parts[0], parts[1] if first_is_url else parts[1]
+    title = _steering_summary(clean, limit=80)
+    return url, title, clean
+
+
+def _steering_summary(text: str, limit: int = 240) -> str:
+    clean = re.sub(r"\s+", " ", text.strip())
+    return clean if len(clean) <= limit else clean[: limit - 1].rstrip() + "…"
 
 
 def _component_from_role(role: str, agent_name: str) -> str:

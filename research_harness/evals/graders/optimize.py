@@ -126,3 +126,72 @@ def _grade_research_search_budget(task: EvalTask, store: ArtifactStore) -> Grade
         ],
     )
 
+
+def _grade_plateau_entropy_exploration(task: EvalTask, store: ArtifactStore) -> GraderResult:
+    rounds = store.list("evolution_rounds")
+    plateau_rounds = [
+        row for row in rounds
+        if row.get("termination_signal") in {"score_plateau", "coverage_plateau"}
+    ]
+    if not plateau_rounds:
+        return _result(
+            "plateau_entropy_exploration",
+            "code",
+            "anti-reward-hack plateau exploration",
+            1.0,
+            True,
+            1.0,
+            "No plateau signal was observed, so entropy recovery was not required.",
+            [{"check": "plateau_observed", "passed": True, "required": False}],
+        )
+
+    sources = store.list("sources")
+    claims = store.list("claims")
+    variants = store.list("variants")
+    progress = store.progress_path.read_text(encoding="utf-8") if store.progress_path.exists() else ""
+    recovery_sources = [
+        source for source in sources
+        if str(source.get("url", "")).startswith("memory://plateau-recovery/")
+        and str(source.get("summary", "")).lower().find("expected to improve generalization") >= 0
+    ]
+    recovery_claims = [
+        claim for claim in claims
+        if claim.get("created_by_agent") == "plateau_recovery_policy"
+        and "expected to improve generalization" in str(claim.get("text", "")).lower()
+    ]
+    intents = []
+    for variant in variants:
+        metadata = variant.get("metadata") if isinstance(variant.get("metadata"), dict) else {}
+        intent = metadata.get("meaningful_entropy_intent") if isinstance(metadata, dict) else None
+        if isinstance(intent, dict):
+            intents.append(intent)
+    meaningful_actions = {"new_strategy_family", "literature_mechanism", "alternative_evaluator", "fresh_search_context"}
+    actions = {str(intent.get("action", "")) for intent in intents}
+    has_expected_generalization = all(
+        str(intent.get("expected_generalization", "")).strip()
+        and str(intent.get("exploration_path", "")).strip()
+        for intent in intents
+    )
+    hyperparameter_only = bool(actions) and actions <= {"boost_temperature", "random_mutation", "context_derived_numeric_mutation"}
+    checks = [
+        ("plateau_signal_observed", bool(plateau_rounds)),
+        ("progress_records_plateau_entropy", "Plateau entropy round" in progress),
+        ("recovery_source_records_generalization_reason", bool(recovery_sources)),
+        ("recovery_claim_records_generalization_reason", bool(recovery_claims)),
+        ("variants_carry_entropy_intent", bool(intents)),
+        ("intent_names_meaningful_path", bool(actions & meaningful_actions)),
+        ("intent_records_expected_generalization", bool(intents) and has_expected_generalization),
+        ("not_hyperparameter_only", not hyperparameter_only),
+    ]
+    score = sum(1 for _, passed in checks if passed) / len(checks)
+    passed = score == 1.0
+    return _result(
+        "plateau_entropy_exploration",
+        "code",
+        "anti-reward-hack plateau exploration",
+        score,
+        passed,
+        1.0,
+        f"plateau_rounds={len(plateau_rounds)}; entropy_actions={sorted(actions)}; recovery_sources={len(recovery_sources)}.",
+        [{"check": name, "passed": passed} for name, passed in checks],
+    )

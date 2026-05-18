@@ -59,7 +59,16 @@ def _grade_prediction_market_official_status(task: EvalTask, store: ArtifactStor
         ("optimization_result_exists", store.optimization_result_path.exists()),
         ("official_result_present", isinstance(official, dict) and bool(official)),
         ("measured_status_truthful", bool(expected_measured)),
-        ("score_source_recorded", source in {"local_sandbox_strategy_execution", "local_official_semantics_fallback", "upstream_orderbook_pm_challenge"}),
+        (
+            "score_source_recorded",
+            source in {
+                "upstream_orderbook_pm_challenge",
+                "upstream_repo_missing",
+                "official_sandbox_failed",
+                "official_scorer_json_error",
+                "official_scorer_no_successes",
+            },
+        ),
         ("candidate_path_recorded", bool(candidate_path)),
     ]
     score = sum(1 for _, passed in checks if passed) / len(checks)
@@ -170,4 +179,3 @@ def _grade_no_repo_root_strategy_files(task: EvalTask, store: ArtifactStore) -> 
         [{"check": "no_repo_root_strategy_files", "passed": passed}]
         + [{"check": "leaked_file", "path": str(path), "passed": False} for path in leaked_files],
     )
-

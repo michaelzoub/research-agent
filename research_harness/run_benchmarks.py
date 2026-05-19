@@ -106,6 +106,38 @@ class _PngCanvas:
         self.rect(x, y, 1, h, color)
         self.rect(x + w - 1, y, 1, h, color)
 
+    def line(self, x0: int, y0: int, x1: int, y1: int, color: str) -> None:
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            self.rect(x0, y0, 2, 2, color)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    def circle(self, cx: int, cy: int, r: int, fill: str, stroke: str) -> None:
+        for yy in range(cy - r, cy + r + 1):
+            for xx in range(cx - r, cx + r + 1):
+                dist = (xx - cx) ** 2 + (yy - cy) ** 2
+                if dist <= r * r:
+                    self.rect(xx, yy, 1, 1, fill)
+        border_outer = r * r
+        border_inner = max(0, (r - 2) * (r - 2))
+        for yy in range(cy - r, cy + r + 1):
+            for xx in range(cx - r, cx + r + 1):
+                dist = (xx - cx) ** 2 + (yy - cy) ** 2
+                if border_inner <= dist <= border_outer:
+                    self.rect(xx, yy, 1, 1, stroke)
+
     def text(self, x: int, y: int, text: str, color: str = "#0f172a", scale: int = 2, max_chars: Optional[int] = None) -> None:
         if max_chars is not None and len(text) > max_chars:
             text = text[: max(0, max_chars - 3)] + "..."
@@ -665,7 +697,7 @@ def _optimizer_trace_rows_html(summary: dict[str, Any]) -> str:
             f'<td style="color:#64748b;">{html.escape(str(item.get("round", "—")))}</td>'
             f'<td><span style="color:{status_color};font-size:11px;font-weight:700;">{html.escape(str(status))}</span></td>'
             f'<td style="font-family:monospace;">{score:.3f}</td>'
-            f'<td style="font-family:monospace;">{html.escape(str(edge if edge is not None else "—"))}</td>'
+            f'<td style="font-family:monospace;">{html.escape(str(edge if edge is not None else "—"))}<br><span style="color:#94a3b8;">spread {float(item.get("round_score_spread") or 0.0):.3f}</span></td>'
             f'<td>{html.escape(str(item.get("best_score_source") or "—"))}</td>'
             f'<td>{item.get("variant_count", 0)} / {item.get("evaluation_count", 0)}</td>'
             f'<td>{"yes" if item.get("uses_prior_parent") else "no"} / {"yes" if item.get("uses_score_feedback") else "no"}</td>'
@@ -684,7 +716,7 @@ def _optimizer_trace_rows_html(summary: dict[str, Any]) -> str:
                 f'<td>{html.escape(change)}</td>'
                 f'<td>{"yes" if variant.get("uses_prior_parent") else "no"} / {"yes" if variant.get("uses_score_feedback") else "no"}</td>'
                 f'<td>{html.escape(str(variant.get("meaningful_entropy_action") or "—"))}</td>'
-                f'<td style="color:#64748b;max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{html.escape(str(variant.get("payload_preview") or ""))}</td>'
+                f'<td style="color:#64748b;max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{html.escape(str(variant.get("change_summary") or variant.get("payload_preview") or ""))}</td>'
                 '</tr>'
             )
     return "\n".join(rows)
@@ -821,6 +853,10 @@ def build_optimizer_trace(rounds: list[dict[str, Any]], variants: list[dict[str,
             for evaluation in evals_by_variant.get(variant_id, [])
         ]
         round_evals.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
+        round_scores = [float(evaluation.get("score", 0.0) or 0.0) for evaluation in round_evals]
+        score_spread = round(max(round_scores) - min(round_scores), 6) if round_scores else 0.0
+        score_mean = sum(round_scores) / len(round_scores) if round_scores else 0.0
+        score_stddev = round((sum((score - score_mean) ** 2 for score in round_scores) / len(round_scores)) ** 0.5, 6) if round_scores else 0.0
         best_eval = next((evaluation for evaluation in round_evals if str(evaluation.get("variant_id")) == best_variant_id), round_evals[0] if round_evals else {})
         best_variant = variant_by_id.get(best_variant_id, {})
         variant_details = [
@@ -853,6 +889,8 @@ def build_optimizer_trace(rounds: list[dict[str, Any]], variants: list[dict[str,
                 "best_variant_id": best_variant_id or None,
                 "best_score": score,
                 "best_score_delta_vs_previous_round": score_delta,
+                "round_score_spread": score_spread,
+                "round_score_stddev": score_stddev,
                 "best_mean_edge": metrics.get("mean_edge"),
                 "best_score_source": metrics.get("score_source"),
                 "best_summary": best_eval.get("summary", ""),
@@ -864,6 +902,7 @@ def build_optimizer_trace(rounds: list[dict[str, Any]], variants: list[dict[str,
                 "entropy_label_only": entropy_label_only,
                 "all_variants_parameter_nudges": parameter_only,
                 "learning_status": learn_status,
+                "round_change_summary": _optimizer_round_change_summary(variant_details),
                 "variants": variant_details,
             }
         )
@@ -909,8 +948,45 @@ def _optimizer_variant_detail(
         "proposal_source": metadata.get("proposal_source"),
         "recovery": metadata.get("recovery"),
         "rendered_code_hash": metadata.get("rendered_code_hash"),
+        "change_summary": _optimizer_variant_change_summary(metadata, payload),
         "payload_preview": _shorten(payload, 360),
     }
+
+
+def _optimizer_variant_change_summary(metadata: dict[str, Any], payload: str) -> str:
+    parts: list[str] = []
+    family = metadata.get("strategy_family")
+    mechanism = metadata.get("mechanism_hypothesis")
+    role = metadata.get("entropy_role")
+    recovery = metadata.get("recovery")
+    source = metadata.get("proposal_source")
+    if family:
+        parts.append(f"family={family}")
+    if mechanism:
+        parts.append(f"mechanism={_shorten(str(mechanism), 90)}")
+    if role:
+        parts.append(f"role={role}")
+    if recovery:
+        parts.append(f"recovery={recovery}")
+    if source:
+        parts.append(f"source={source}")
+    if not parts:
+        parts.append(_shorten(payload, 120))
+    return "; ".join(parts)
+
+
+def _optimizer_round_change_summary(variant_details: list[dict[str, Any]], limit: int = 3) -> list[str]:
+    summaries: list[str] = []
+    seen: set[str] = set()
+    for detail in variant_details:
+        summary = str(detail.get("change_summary") or detail.get("change_type") or "").strip()
+        if not summary or summary in seen:
+            continue
+        seen.add(summary)
+        summaries.append(summary)
+        if len(summaries) >= limit:
+            break
+    return summaries
 
 
 def _optimizer_change_type(payload: str, metadata: dict[str, Any], has_entropy: bool) -> str:
@@ -1047,7 +1123,8 @@ def optimizer_flow_mermaid(summary: dict[str, Any]) -> str:
         label = (
             f"Round {round_trace.get('round')}\\n"
             f"{round_trace.get('variant_count', 0)} variants, {learned}\\n"
-            f"{change}"
+            f"{change}\\n"
+            f"spread {float(round_trace.get('round_score_spread') or 0.0):.3f}, stddev {float(round_trace.get('round_score_stddev') or 0.0):.3f}"
         )
         best_label = (
             f"Best {float(round_trace.get('best_score') or 0.0):.3f}\\n"
@@ -1059,6 +1136,9 @@ def optimizer_flow_mermaid(summary: dict[str, Any]) -> str:
             if round_trace.get("uses_prior_parent") or round_trace.get("uses_score_feedback")
             else "No parent/score link detected"
         )
+        change_summaries = round_trace.get("round_change_summary") if isinstance(round_trace.get("round_change_summary"), list) else []
+        if change_summaries:
+            feedback_label = f"{feedback_label}\\n" + "\\n".join(str(item)[:90] for item in change_summaries[:2])
         lines.append(f'  {round_node}["{_mermaid(label)}"]')
         lines.append(f'  {best_node}["{_mermaid(best_label)}"]')
         lines.append(f'  {feedback_node}["{_mermaid(feedback_label)}"]')
@@ -1077,7 +1157,7 @@ def optimizer_flow_svg(summary: dict[str, Any]) -> str:
             'No optimizer rounds recorded.</text></svg>'
         )
     card_w = 250
-    card_h = 156
+    card_h = 210
     gap_x = 26
     gap_y = 34
     left = 28
@@ -1113,9 +1193,13 @@ def optimizer_flow_svg(summary: dict[str, Any]) -> str:
         parts.append(f'<text x="{x + 12}" y="{y + 47}" font-size="11" fill="#334155">best score: {score:.3f}</text>')
         parts.append(f'<text x="{x + 12}" y="{y + 66}" font-size="11" fill="#334155">mean edge: {html.escape(str(edge if edge is not None else "n/a"))}</text>')
         parts.append(f'<text x="{x + 12}" y="{y + 85}" font-size="11" fill="#334155">variants: {round_trace.get("variant_count", 0)} / evals: {round_trace.get("evaluation_count", 0)}</text>')
-        parts.append(f'<text x="{x + 12}" y="{y + 104}" font-size="11" fill="#334155">feedback: {html.escape(status)}</text>')
-        parts.append(f'<text x="{x + 12}" y="{y + 123}" font-size="11" fill="#334155">change: {html.escape(change)}</text>')
-        parts.append(f'<text x="{x + 12}" y="{y + 142}" font-size="11" fill="#64748b">{html.escape(str(round_trace.get("termination_signal", ""))[:28])}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 104}" font-size="11" fill="#334155">score spread: {float(round_trace.get("round_score_spread") or 0.0):.3f}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 123}" font-size="11" fill="#334155">score stddev: {float(round_trace.get("round_score_stddev") or 0.0):.3f}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 142}" font-size="11" fill="#334155">feedback: {html.escape(status)}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 161}" font-size="11" fill="#334155">change: {html.escape(change)}</text>')
+        for change_index, change_item in enumerate((round_trace.get("round_change_summary") if isinstance(round_trace.get("round_change_summary"), list) else [])[:2]):
+            parts.append(f'<text x="{x + 12}" y="{y + 180 + change_index * 15}" font-size="10" fill="#475569">{html.escape(_shorten(str(change_item), 42))}</text>')
+        parts.append(f'<text x="{x + 12}" y="{y + 203}" font-size="10" fill="#64748b">{html.escape(str(round_trace.get("termination_signal", ""))[:34])}</text>')
         if index < len(trace) - 1:
             next_row = (index + 1) // cards_per_row
             next_col = (index + 1) % cards_per_row
@@ -1137,7 +1221,7 @@ def optimizer_flow_svg(summary: dict[str, Any]) -> str:
                 delta_y = mid_y - 4
             delta = trace[index + 1].get("best_score_delta_vs_previous_round")
             if delta is not None:
-                parts.append(f'<text x="{delta_x}" y="{delta_y}" font-size="10" fill="#64748b">Δ {float(delta):+.3f}</text>')
+                parts.append(f'<text x="{delta_x}" y="{delta_y}" font-size="10" fill="#64748b">score delta {float(delta):+.3f}</text>')
     parts.append("</svg>")
     return "\n".join(parts)
 
@@ -1146,7 +1230,7 @@ def optimizer_flow_png(summary: dict[str, Any]) -> bytes:
     trace = summary.get("optimizer_trace") or []
     cards_per_row = 4
     card_w = 250
-    card_h = 136
+    card_h = 170
     gap_x = 24
     gap_y = 28
     row_count = max(1, (len(trace) + cards_per_row - 1) // cards_per_row)
@@ -1172,8 +1256,12 @@ def optimizer_flow_png(summary: dict[str, Any]) -> bytes:
         canvas.text(x + 10, y + 12, f"Round {round_trace.get('round')}", "#0f172a", 1)
         canvas.text(x + 10, y + 34, f"score {float(round_trace.get('best_score') or 0.0):.3f}", "#334155", 1)
         canvas.text(x + 10, y + 54, f"edge {round_trace.get('best_mean_edge', 'n/a')}", "#334155", 1)
-        canvas.text(x + 10, y + 74, "prior yes" if learned else "prior no", "#334155", 1)
-        canvas.text(x + 10, y + 94, "entropy-label" if entropy_label_only else "param-only" if parameter_only else "struct/mixed", "#334155", 1)
+        canvas.text(x + 10, y + 74, f"spread {float(round_trace.get('round_score_spread') or 0.0):.3f}", "#334155", 1)
+        canvas.text(x + 10, y + 94, "prior yes" if learned else "prior no", "#334155", 1)
+        canvas.text(x + 10, y + 114, "entropy-label" if entropy_label_only else "param-only" if parameter_only else "struct/mixed", "#334155", 1)
+        summaries = round_trace.get("round_change_summary") if isinstance(round_trace.get("round_change_summary"), list) else []
+        if summaries:
+            canvas.text(x + 10, y + 134, _shorten(str(summaries[0]), 32), "#475569", 1)
     return canvas.png()
 
 
@@ -1181,8 +1269,8 @@ def champion_tree_mermaid(tree: dict[str, Any]) -> str:
     nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
     edges = tree.get("edges") if isinstance(tree.get("edges"), list) else []
     if not nodes:
-        return 'flowchart LR\n  none["No champion tree recorded"]\n'
-    lines = ["flowchart LR"]
+        return 'flowchart TD\n  none["No champion tree recorded"]\n'
+    lines = ["flowchart TD"]
     for index, node in enumerate(nodes):
         node_id = _mermaid_node_id(str(node.get("id") or f"node_{index}"))
         label = (
@@ -1215,75 +1303,159 @@ def champion_tree_svg(tree: dict[str, Any]) -> str:
             '<rect width="100%" height="100%" fill="#fff"/><text x="24" y="64" font-size="14" fill="#94a3b8">'
             'No champion tree recorded.</text></svg>'
         )
-    ordered = sorted(nodes, key=lambda node: (int(node.get("outer_iteration") or 0), str(node.get("id") or "")))
-    shown = ordered[:80]
-    columns = 4
-    card_w = 250
-    card_h = 116
-    gap_x = 26
-    gap_y = 26
-    left = 28
-    row_count = (len(shown) + columns - 1) // columns
-    width = max(960, left * 2 + columns * card_w + (columns - 1) * gap_x)
-    height = 92 + row_count * card_h + max(0, row_count - 1) * gap_y + 34
+    layout = _champion_tree_layout(tree, max_nodes=80)
+    shown = layout["nodes"]
+    positions = layout["positions"]
+    shown_ids = {str(node.get("id")) for node in shown}
+    edges = [edge for edge in layout["edges"] if str(edge.get("from")) in shown_ids and str(edge.get("to")) in shown_ids]
+    width = int(layout["width"])
+    height = int(layout["height"])
+    radius = int(layout["radius"])
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
         'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;">',
+        '<defs><marker id="treeArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 Z" fill="#334155"/></marker></defs>',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<text x="24" y="32" font-size="18" font-weight="700" fill="#0f172a">Champion tree</text>',
-        '<text x="24" y="52" font-size="11" fill="#64748b">Green is the current global champion; blue nodes are round winners. Showing up to 80 variants.</text>',
+        '<text x="24" y="52" font-size="11" fill="#64748b">Actual parent-to-child lineage. Green is the current global champion; blue rings are round winners.</text>',
     ]
-    for index, node in enumerate(shown):
-        row = index // columns
-        col = index % columns
-        x = left + col * (card_w + gap_x)
-        y = 82 + row * (card_h + gap_y)
+    for edge in edges:
+        x1, y1 = positions[str(edge.get("from"))]
+        x2, y2 = positions[str(edge.get("to"))]
+        parts.append(
+            f'<path d="M{x1},{y1 + radius} C{x1},{(y1 + y2) // 2} {x2},{(y1 + y2) // 2} {x2},{y2 - radius}" '
+            'fill="none" stroke="#334155" stroke-width="1.8" marker-end="url(#treeArrow)"/>'
+        )
+    for node in shown:
+        x, y = positions[str(node.get("id"))]
         highlight = str(node.get("highlight") or "candidate")
-        fill = "#dcfce7" if highlight == "global_champion" else "#e0f2fe" if highlight == "round_winner" else "#f8fafc"
-        border = "#16a34a" if highlight == "global_champion" else "#0284c7" if highlight == "round_winner" else "#cbd5e1"
+        fill = "#dcfce7" if highlight == "global_champion" else "#ffffff"
+        border = "#dc2626" if highlight == "global_champion" else "#0284c7" if highlight == "round_winner" else "#0f172a"
+        stroke_width = 3 if highlight == "global_champion" else 2 if highlight == "round_winner" else 1.5
         score = float(node.get("score") or 0.0)
-        label = str(node.get("id") or "")[:18]
-        family = _direction_from_summary(str(node.get("summary") or ""))
-        parts.append(f'<rect x="{x}" y="{y}" width="{card_w}" height="{card_h}" rx="8" fill="{fill}" stroke="{border}" stroke-width="1.5"/>')
-        parts.append(f'<text x="{x + 12}" y="{y + 24}" font-size="12" font-weight="700" fill="#0f172a">{html.escape(label)}</text>')
-        parts.append(f'<text x="{x + 12}" y="{y + 45}" font-size="11" fill="#334155">round {html.escape(str(node.get("outer_iteration") or "n/a"))} · score {score:.3f}</text>')
-        parts.append(f'<text x="{x + 12}" y="{y + 66}" font-size="11" fill="#334155">{html.escape(highlight)}</text>')
-        parts.append(f'<text x="{x + 12}" y="{y + 87}" font-size="11" fill="#64748b">{html.escape(family[:36])}</text>')
-    if len(ordered) > len(shown):
-        parts.append(f'<text x="24" y="{height - 14}" font-size="11" fill="#64748b">+ {len(ordered) - len(shown)} additional nodes in champion_tree.json</text>')
+        label = f"{score:.2f}" if score else str(node.get("id") or "")[-2:]
+        parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="{fill}" stroke="{border}" stroke-width="{stroke_width}"/>')
+        parts.append(f'<text x="{x}" y="{y + 4}" text-anchor="middle" font-size="12" font-weight="700" fill="#0f172a">{html.escape(label)}</text>')
+        parts.append(f'<title>{html.escape(str(node.get("id") or ""))} · round {html.escape(str(node.get("outer_iteration") or "n/a"))} · score {score:.3f} · {html.escape(highlight)}</title>')
+    if layout["hidden_count"]:
+        parts.append(f'<text x="24" y="{height - 14}" font-size="11" fill="#64748b">+ {layout["hidden_count"]} additional nodes in champion_tree.json</text>')
     parts.append("</svg>")
     return "\n".join(parts)
 
 
 def champion_tree_png(tree: dict[str, Any]) -> bytes:
     nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
-    shown = sorted(nodes, key=lambda node: (int(node.get("outer_iteration") or 0), str(node.get("id") or "")))[:40]
-    columns = 4
-    card_w = 220
-    card_h = 96
-    gap = 18
-    rows = max(1, (len(shown) + columns - 1) // columns)
-    width = 32 + columns * card_w + (columns - 1) * gap
-    height = 68 + rows * card_h + (rows - 1) * gap + 24
+    layout = _champion_tree_layout(tree, max_nodes=40)
+    shown = layout["nodes"]
+    positions = layout["positions"]
+    shown_ids = {str(node.get("id")) for node in shown}
+    edges = [edge for edge in layout["edges"] if str(edge.get("from")) in shown_ids and str(edge.get("to")) in shown_ids]
+    width = int(layout["width"])
+    height = int(layout["height"])
+    radius = int(layout["radius"])
     canvas = _PngCanvas(width, height, "#ffffff")
     canvas.text(24, 18, "Champion tree", "#0f172a", 2)
     if not shown:
         canvas.text(24, 62, "No champion tree recorded", "#94a3b8", 2)
         return canvas.png()
-    for index, node in enumerate(shown):
-        row = index // columns
-        col = index % columns
-        x = 24 + col * (card_w + gap)
-        y = 64 + row * (card_h + gap)
+    for edge in edges:
+        x1, y1 = positions[str(edge.get("from"))]
+        x2, y2 = positions[str(edge.get("to"))]
+        canvas.line(int(x1), int(y1 + radius), int(x2), int(y2 - radius), "#334155")
+    for node in shown:
+        x, y = positions[str(node.get("id"))]
         highlight = str(node.get("highlight") or "candidate")
-        fill = "#dcfce7" if highlight == "global_champion" else "#e0f2fe" if highlight == "round_winner" else "#f8fafc"
-        border = "#16a34a" if highlight == "global_champion" else "#0284c7" if highlight == "round_winner" else "#cbd5e1"
-        canvas.rect(x, y, card_w, card_h, fill)
-        canvas.outline(x, y, card_w, card_h, border)
-        canvas.text(x + 10, y + 10, str(node.get("id") or "")[:16], "#0f172a", 1)
-        canvas.text(x + 10, y + 32, f"r{node.get('outer_iteration')} score {float(node.get('score') or 0.0):.3f}", "#334155", 1)
-        canvas.text(x + 10, y + 54, highlight[:24], "#334155", 1)
+        fill = "#dcfce7" if highlight == "global_champion" else "#ffffff"
+        border = "#dc2626" if highlight == "global_champion" else "#0284c7" if highlight == "round_winner" else "#0f172a"
+        canvas.circle(int(x), int(y), radius, fill, border)
+        canvas.text(int(x - radius + 8), int(y - 5), f"{float(node.get('score') or 0.0):.1f}", "#0f172a", 1)
     return canvas.png()
+
+
+def _champion_tree_layout(tree: dict[str, Any], *, max_nodes: int) -> dict[str, Any]:
+    all_nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
+    all_edges = tree.get("edges") if isinstance(tree.get("edges"), list) else []
+    ordered = sorted(all_nodes, key=lambda node: (int(node.get("outer_iteration") or 0), str(node.get("id") or "")))
+    champion_id = str(tree.get("global_champion_variant_id") or "")
+    champion_ancestors = _champion_ancestor_ids(champion_id, all_edges)
+    priority = [
+        node for node in ordered
+        if str(node.get("id")) == champion_id or str(node.get("id")) in champion_ancestors or node.get("is_round_winner")
+    ]
+    rest = [node for node in ordered if node not in priority]
+    shown = (priority + rest)[:max_nodes]
+    shown_ids = {str(node.get("id")) for node in shown}
+    edges = [
+        edge for edge in all_edges
+        if str(edge.get("from")) in shown_ids and str(edge.get("to")) in shown_ids
+    ]
+    parents_by_child: dict[str, list[str]] = {}
+    children_by_parent: dict[str, list[str]] = {}
+    for edge in edges:
+        parent = str(edge.get("from"))
+        child = str(edge.get("to"))
+        parents_by_child.setdefault(child, []).append(parent)
+        children_by_parent.setdefault(parent, []).append(child)
+    depth: dict[str, int] = {}
+    roots = [str(node.get("id")) for node in shown if str(node.get("id")) not in parents_by_child]
+    queue = list(roots)
+    for root in roots:
+        depth[root] = 0
+    while queue:
+        current = queue.pop(0)
+        for child in children_by_parent.get(current, []):
+            next_depth = depth[current] + 1
+            if child not in depth or next_depth > depth[child]:
+                depth[child] = next_depth
+                queue.append(child)
+    for node in shown:
+        node_id = str(node.get("id"))
+        depth.setdefault(node_id, max(0, int(node.get("outer_iteration") or 1) - 1))
+    levels: dict[int, list[dict[str, Any]]] = {}
+    for node in shown:
+        levels.setdefault(depth[str(node.get("id"))], []).append(node)
+    for level_nodes in levels.values():
+        level_nodes.sort(key=lambda node: (0 if str(node.get("id")) == champion_id else 1, str(node.get("id") or "")))
+    radius = 24
+    x_gap = 92
+    y_gap = 112
+    top = 92
+    left = 48
+    max_width_count = max((len(level_nodes) for level_nodes in levels.values()), default=1)
+    width = max(960, left * 2 + max_width_count * x_gap)
+    height = max(180, top + (max(levels.keys(), default=0) + 1) * y_gap + 40)
+    positions: dict[str, tuple[int, int]] = {}
+    for level, level_nodes in levels.items():
+        row_width = (len(level_nodes) - 1) * x_gap
+        start_x = max(left + radius, (width - row_width) // 2)
+        y = top + level * y_gap
+        for index, node in enumerate(level_nodes):
+            positions[str(node.get("id"))] = (start_x + index * x_gap, y)
+    return {
+        "nodes": shown,
+        "edges": edges,
+        "positions": positions,
+        "width": width,
+        "height": height,
+        "radius": radius,
+        "hidden_count": max(0, len(ordered) - len(shown)),
+    }
+
+
+def _champion_ancestor_ids(champion_id: str, edges: list[Any]) -> set[str]:
+    parents_by_child: dict[str, list[str]] = {}
+    for edge in edges:
+        if isinstance(edge, dict):
+            parents_by_child.setdefault(str(edge.get("to")), []).append(str(edge.get("from")))
+    ancestors: set[str] = set()
+    stack = list(parents_by_child.get(champion_id, []))
+    while stack:
+        parent = stack.pop()
+        if parent in ancestors:
+            continue
+        ancestors.add(parent)
+        stack.extend(parents_by_child.get(parent, []))
+    return ancestors
 
 
 def _mermaid_node_id(value: str) -> str:

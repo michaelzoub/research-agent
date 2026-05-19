@@ -14,21 +14,37 @@ import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
-from typing import Callable, Optional, Protocol, Union
-
-from challenges.prediction_market import prediction_market_score
+from typing import Callable, Optional, Protocol
 
 from .llm import LLMClient
+from .loop_evaluators import (
+    EvaluatorResult,
+    evaluator_json_response as _evaluator_json_response,
+    exception_evaluator_result as _exception_evaluator_result,
+    normalize_evaluator_result as _normalize_evaluator_result,
+)
+from .loop_objectives import (
+    LoopObjective,
+    loop_objective_from_goal as _loop_objective_from_goal,
+    objective_metadata as _objective_metadata,
+)
+from .loop_utils import (
+    context_terms as _context_terms,
+    json_evaluator_responses as _json_evaluator_responses,
+    record_timing_trace as _record_timing_trace,
+    score_history as _score_history,
+    shorten as _shorten,
+    strip_run_artifacts as _strip_run_artifacts,
+    support_level as _support_level,
+)
+from .loop_routing import EvaluatorFn, EvaluatorRegistry, TaskRouter
 from .schemas import (
-    AgentTrace,
     Claim,
     EvolutionRound,
     FailedPath,
     LoopContinuationDecision,
-    ProductAgent,
     Source,
     SourceStrategyItem,
-    TaskIngestionDecision,
     TaskMode,
     Variant,
     VariantEvaluation,
@@ -38,23 +54,12 @@ from .search import SearchBackend
 from .sandbox import DockerSandboxRunner
 from .store import ArtifactStore
 
-
-@dataclass(frozen=True)
-class EvaluatorResult:
-    score: float
-    status: str = "completed"
-    metrics: Optional[dict[str, object]] = None
-    diagnostics: Optional[dict[str, object]] = None
-    loss_reason: str = ""
-    summary: str = ""
-
-
-EvaluatorPayload = Union[float, int, dict[str, object], EvaluatorResult]
-EvaluatorFn = Callable[[str], EvaluatorPayload]
 SearchFactory = Callable[[str], SearchBackend]
 
-PREDICTION_MARKET_DEFAULT_SIMULATIONS = "24"
+PREDICTION_MARKET_DEFAULT_SIMULATION_COUNT = 24
+PREDICTION_MARKET_DEFAULT_SIMULATIONS = str(PREDICTION_MARKET_DEFAULT_SIMULATION_COUNT)
 PREDICTION_MARKET_DEFAULT_SEED_START = "0"
+PREDICTION_MARKET_EVAL_PROTOCOL = "paired_crn_fixed_seed_range"
 
 
 def _find_pm_upstream_path() -> Optional[Path]:
@@ -96,288 +101,6 @@ def _is_pm_upstream_repo(path: Path) -> bool:
     except OSError:
         return False
     return 'orderbook-pm = "orderbook_pm_challenge.cli:main"' in text
-
-
-def _normalize_evaluator_result(raw_result: EvaluatorPayload) -> EvaluatorResult:
-    if isinstance(raw_result, EvaluatorResult):
-        return EvaluatorResult(
-            score=max(0.0, min(1.0, float(raw_result.score))),
-            status=raw_result.status or "completed",
-            metrics=dict(raw_result.metrics or {}),
-            diagnostics=dict(raw_result.diagnostics or {}),
-            loss_reason=raw_result.loss_reason,
-            summary=raw_result.summary,
-        )
-    if isinstance(raw_result, dict):
-        score = float(raw_result.get("score", raw_result.get("deterministic_score", 0.0)) or 0.0)
-        diagnostics = raw_result.get("diagnostics") if isinstance(raw_result.get("diagnostics"), dict) else {}
-        metrics = raw_result.get("metrics") if isinstance(raw_result.get("metrics"), dict) else {}
-        if not metrics:
-            metrics = {
-                key: value
-                for key, value in raw_result.items()
-                if key not in {"score", "deterministic_score", "status", "diagnostics", "loss_reason", "summary"}
-            }
-        return EvaluatorResult(
-            score=max(0.0, min(1.0, score)),
-            status=str(raw_result.get("status") or "completed"),
-            metrics=dict(metrics),
-            diagnostics=dict(diagnostics),
-            loss_reason=str(raw_result.get("loss_reason") or raw_result.get("failure_reason") or ""),
-            summary=str(raw_result.get("summary") or ""),
-        )
-    score = max(0.0, min(1.0, float(raw_result)))
-    return EvaluatorResult(
-        score=score,
-        status="completed",
-        metrics={"scalar_score": score},
-        diagnostics={},
-        loss_reason="" if score > 0 else "zero_score",
-        summary=f"Deterministic scalar evaluator returned {score:.3f}.",
-    )
-
-
-def _exception_evaluator_result(exc: Exception) -> EvaluatorResult:
-    exc_type = type(exc).__name__
-    lower = str(exc).lower()
-    if "timeout" in lower or exc_type.lower().find("timeout") >= 0:
-        reason = "timeout"
-    elif "compile" in lower or "syntax" in lower:
-        reason = "compile_error"
-    elif "correct" in lower or "assert" in lower:
-        reason = "correctness_fail"
-    elif "slow" in lower or "baseline" in lower:
-        reason = "slower_than_baseline"
-    else:
-        reason = "runtime_error"
-    return EvaluatorResult(
-        score=0.0,
-        status="failed",
-        metrics={},
-        diagnostics={"exception_type": exc_type, "exception": str(exc)},
-        loss_reason=reason,
-        summary=f"{exc_type}: {exc}",
-    )
-
-
-def _evaluator_json_response(result: EvaluatorResult) -> dict[str, object]:
-    return {
-        "status": result.status,
-        "score": result.score,
-        "metrics": result.metrics or {},
-        "diagnostics": result.diagnostics or {},
-        "loss_reason": result.loss_reason,
-        "summary": result.summary,
-    }
-
-
-OPTIMIZE_HINTS = {
-    "benchmark",
-    "kernel",
-    "latency",
-    "optimize",
-    "performance",
-    "score",
-    "speed",
-    "strategy",
-    "swe-bench",
-    "throughput",
-}
-
-
-class EvaluatorRegistry:
-    """Registry for deterministic evaluators.
-
-    Optimize mode is only valid when a deterministic evaluator is available.
-    The tiny built-in evaluator is for smoke tests and architecture demos; real
-    tasks should register domain evaluators such as a benchmark harness.
-    """
-
-    def __init__(self) -> None:
-        self._evaluators: dict[str, EvaluatorFn] = {
-            "length_score": lambda payload: 1.0 / max(1, len(payload.split())),
-            "prediction_market": prediction_market_score,
-        }
-
-    def get(self, name: Optional[str]) -> Optional[EvaluatorFn]:
-        if not name:
-            return None
-        return self._evaluators.get(name)
-
-    def register(self, name: str, evaluator: EvaluatorFn) -> None:
-        self._evaluators[name] = evaluator
-
-
-class TaskRouter:
-    def __init__(self, evaluator_registry: EvaluatorRegistry, llm: Optional[LLMClient] = None):
-        self.evaluator_registry = evaluator_registry
-        self.llm = llm
-
-    def decide(self, goal: str, requested_mode: str = "auto", evaluator_name: Optional[str] = None) -> TaskIngestionDecision:
-        requested = requested_mode.lower()
-        evaluator = self.evaluator_registry.get(evaluator_name)
-
-        # Explicit mode flags bypass LLM routing — the user already decided.
-        if requested != "auto":
-            return self._decide_explicit(goal, requested, evaluator_name, evaluator)
-
-        # Try LLM-based classification for auto mode.
-        if self.llm and self.llm.is_live:
-            try:
-                return self._llm_decide(goal, evaluator_name, evaluator)
-            except Exception:
-                pass
-
-        # Heuristic fallback when LLM is unavailable.
-        return self._heuristic_decide(goal, requested_mode, evaluator_name, evaluator)
-
-    def _decide_explicit(
-        self,
-        goal: str,
-        requested: str,
-        evaluator_name: Optional[str],
-        evaluator: Optional[object],
-    ) -> TaskIngestionDecision:
-        if requested == "research":
-            return TaskIngestionDecision(
-                requested_mode=requested,
-                selected_mode="research",
-                reason="Research mode was explicitly requested via --task-mode.",
-                product_agent="research",
-            )
-        if requested == "optimize_query":
-            product_agent = _product_agent_for("optimize_query", goal, evaluator_name)
-            return TaskIngestionDecision(
-                requested_mode=requested,
-                selected_mode="optimize_query",
-                evaluator_name=evaluator_name if evaluator else None,
-                product_agent=product_agent,
-                reason=(
-                    f"{product_agent.title()} agent selected optimization-query loop (explicit --task-mode); "
-                    + (f"evaluator '{evaluator_name}' is registered." if evaluator else "no evaluator registered.")
-                ),
-            )
-        if requested == "optimize" and evaluator_name == "prediction_market" and evaluator:
-            return TaskIngestionDecision(
-                requested_mode=requested,
-                selected_mode="optimize_query",
-                evaluator_name=evaluator_name,
-                product_agent="challenge",
-                reason=(
-                    "Challenge agent selected optimization-query loop because the prediction_market evaluator "
-                    "requires challenge strategy research before scoring."
-                ),
-            )
-        if requested == "optimize" and evaluator:
-            product_agent = _product_agent_for("optimize", goal, evaluator_name)
-            return TaskIngestionDecision(
-                requested_mode=requested,
-                selected_mode="optimize",
-                evaluator_name=evaluator_name,
-                product_agent=product_agent,
-                reason=f"{product_agent.title()} agent selected optimize loop (explicit --task-mode) with evaluator '{evaluator_name}'.",
-            )
-        if requested == "optimize" and not evaluator:
-            return TaskIngestionDecision(
-                requested_mode=requested,
-                selected_mode="research",
-                evaluator_name=evaluator_name,
-                product_agent="research",
-                reason="Optimize mode requested explicitly but no deterministic evaluator was registered; falling back to research mode.",
-            )
-        return self._heuristic_decide(goal, requested, evaluator_name, evaluator)
-
-    def _llm_decide(
-        self,
-        goal: str,
-        evaluator_name: Optional[str],
-        evaluator: Optional[object],
-    ) -> TaskIngestionDecision:
-        """Classify the task mode using an LLM call, with full reasoning logged."""
-        assert self.llm is not None
-        system = (
-            "You are the task router in a research-and-optimization harness. "
-            "Classify the user's goal into exactly one of three modes and explain your reasoning.\n\n"
-            "Modes:\n"
-            "- research: open-ended literature review or knowledge synthesis with no deterministic score.\n"
-            "- optimize: direct optimization against a registered deterministic evaluator (no research phase needed).\n"
-            "- optimize_query: research-then-optimize; the agent first explores literature to build strategy context, "
-            "then runs an optimizer. Use this when the goal mentions researching before optimizing, or when the task "
-            "is a challenge that benefits from domain grounding.\n\n"
-            "Return JSON only: {\"selected_mode\": str, \"product_agent\": str, \"confidence\": float, \"reason\": str}\n"
-            "product_agent must be one of: research, optimize, challenge.\n"
-            "Use 'challenge' when the goal references a specific scored competition or external evaluator."
-        )
-        user = json.dumps(
-            {
-                "goal": goal,
-                "evaluator_registered": evaluator_name if evaluator else None,
-                "available_modes": ["research", "optimize", "optimize_query"],
-            },
-            indent=2,
-        )
-        payload = self.llm.complete_json(system, user, max_output_tokens=400)
-        selected_mode = str(payload.get("selected_mode", "research")).lower()
-        product_agent = str(payload.get("product_agent", "research")).lower()
-        reason = str(payload.get("reason", "LLM router selected this mode."))
-        confidence = float(payload.get("confidence", 0.8))
-
-        if selected_mode not in {"research", "optimize", "optimize_query"}:
-            selected_mode = "research"
-        if product_agent not in {"research", "optimize", "challenge"}:
-            product_agent = "research"
-
-        return TaskIngestionDecision(
-            requested_mode="auto",
-            selected_mode=selected_mode,  # type: ignore[arg-type]
-            evaluator_name=evaluator_name if evaluator else None,
-            product_agent=product_agent,  # type: ignore[arg-type]
-            reason=f"[LLM router, confidence={confidence:.2f}] {reason}",
-        )
-
-    def _heuristic_decide(
-        self,
-        goal: str,
-        requested_mode: str,
-        evaluator_name: Optional[str],
-        evaluator: Optional[object],
-    ) -> TaskIngestionDecision:
-        """Keyword/pattern-based fallback routing when no LLM is available."""
-        if _looks_like_optimization_query(goal):
-            product_agent = _product_agent_for("optimize_query", goal, evaluator_name)
-            return TaskIngestionDecision(
-                requested_mode=requested_mode,
-                selected_mode="optimize_query",
-                evaluator_name=evaluator_name if evaluator else None,
-                product_agent=product_agent,
-                reason=(
-                    f"[heuristic router] Prompt contains research+optimization signals; "
-                    f"routed to optimize_query for {product_agent} agent"
-                    + (" with registered evaluator." if evaluator else ".")
-                ),
-            )
-        if evaluator:
-            product_agent = _product_agent_for("optimize", goal, evaluator_name)
-            return TaskIngestionDecision(
-                requested_mode=requested_mode,
-                selected_mode="optimize",
-                evaluator_name=evaluator_name,
-                product_agent=product_agent,
-                reason=f"[heuristic router] Deterministic evaluator '{evaluator_name}' is registered; selected optimize mode.",
-            )
-        if any(hint in goal.lower() for hint in OPTIMIZE_HINTS):
-            return TaskIngestionDecision(
-                requested_mode=requested_mode,
-                selected_mode="research",
-                product_agent="research",
-                reason="[heuristic router] Prompt looks optimization-shaped but no evaluator is registered; using research mode.",
-            )
-        return TaskIngestionDecision(
-            requested_mode=requested_mode,
-            selected_mode="research",
-            product_agent="research",
-            reason="[heuristic router] No evaluator registered and no optimization signal found; defaulting to research mode.",
-        )
 
 
 @dataclass
@@ -858,17 +581,6 @@ class PlateauDetector:
 
 
 @dataclass(frozen=True)
-class LoopObjective:
-    kind: str = "score"
-    target: Optional[float] = None
-    no_stop_until_target: bool = False
-
-    @property
-    def has_explicit_target(self) -> bool:
-        return self.target is not None
-
-
-@dataclass(frozen=True)
 class DirectionSpec:
     slot: int
     strategy_family: str
@@ -894,6 +606,7 @@ class EvolutionaryOuterLoop:
         llm: Optional[LLMClient] = None,
         max_outer_iterations: int = 4,
         population_size: int = 4,
+        query_population_size: Optional[int] = None,
         parent_count: int = 2,
         parallel_evaluator_cap: int = 8,
         optimize_plateau_patience: int = 2,
@@ -912,6 +625,7 @@ class EvolutionaryOuterLoop:
         self.llm = llm or LLMClient()
         self.max_outer_iterations = max_outer_iterations
         self.population_size = population_size
+        self.query_population_size = max(1, query_population_size) if query_population_size else None
         self.parent_count = max(1, parent_count)
         self.parallel_evaluator_cap = max(1, parallel_evaluator_cap)
         self.optimize_plateau_patience = max(1, optimize_plateau_patience)
@@ -1034,6 +748,8 @@ class EvolutionaryOuterLoop:
             should_stop = self._should_stop_outer_loop(termination_signal, round_best, outer_iteration)
             if not should_stop and outer_iteration >= self.max_outer_iterations:
                 should_stop = True
+            if self.task_mode == "optimize" and not should_stop:
+                await self._record_literature_grounding(store, f"optimizer_entropy_after_round_{outer_iteration}")
             self._record_continuation_decision(
                 store,
                 loop_name="lead_researcher_outer_loop",
@@ -1074,11 +790,22 @@ class EvolutionaryOuterLoop:
         plateau = PlateauDetector("research")
         parents: list[Variant] = []
         last_result: Optional[InnerLoopResult] = None
+        optimizer_population_size = self.population_size
+        query_population_size = min(optimizer_population_size, self.query_population_size) if self.query_population_size else optimizer_population_size
+        if query_population_size != optimizer_population_size:
+            store.append_progress(
+                f"Optimization-query research fan-out capped at {query_population_size}; optimizer population remains {optimizer_population_size}."
+            )
         for outer_iteration in range(1, self.max_outer_iterations + 1):
             store.ingest_pending_user_steering(self.run_id)
             propose_started = time.perf_counter()
             propose_started_at = now_iso()
-            variants = self._propose_query_variants(outer_iteration, parents, store)
+            previous_population_size = self.population_size
+            self.population_size = query_population_size
+            try:
+                variants = self._propose_query_variants(outer_iteration, parents, store)
+            finally:
+                self.population_size = previous_population_size
             _record_timing_trace(
                 store,
                 self.run_id,
@@ -1197,6 +924,7 @@ class EvolutionaryOuterLoop:
 
         store.append_progress("Optimizer phase: starting code/strategy variants from query seed context")
         seed_parents = self._seed_context_variants(seed_context)
+        self.population_size = optimizer_population_size
         if self.evaluator_name == "prediction_market":
             await self._run_prediction_market_optimizer(store, seed_parents, seed_context)
             return
@@ -1300,6 +1028,8 @@ class EvolutionaryOuterLoop:
             should_stop = self._should_stop_optimizer_loop(termination_signal, round_best, round_index)
             if not should_stop and round_index >= self.max_outer_iterations:
                 should_stop = True
+            if not should_stop:
+                await self._record_literature_grounding(store, f"optimizer_entropy_after_round_{round_index}")
             self._record_continuation_decision(
                 store,
                 loop_name="optimizer_loop",
@@ -1434,6 +1164,8 @@ class EvolutionaryOuterLoop:
             should_stop = self._should_stop_optimizer_loop(termination_signal, round_best, round_index)
             if not should_stop and round_index >= self.max_outer_iterations:
                 should_stop = True
+            if not should_stop:
+                await self._record_literature_grounding(store, f"prediction_market_entropy_after_round_{round_index}")
             self._record_continuation_decision(
                 store,
                 loop_name="challenge_optimizer_loop",
@@ -1695,8 +1427,9 @@ class EvolutionaryOuterLoop:
         started_at = now_iso()
         query = self._literature_grounding_query(reason, store)
         strategy_index = 0
-        if "plateau" in reason and self.source_strategy:
+        if any(token in reason for token in ["plateau", "entropy_after_round"]) and self.source_strategy:
             strategy_index = min(len(self.source_strategy) - 1, self._recovery_retriever_index % len(self.source_strategy))
+            self._recovery_retriever_index += 1
         item = self.source_strategy[strategy_index] if self.source_strategy else None
         retriever_name = item.retriever if item else "local"
         limit = min(3, item.limit if item else 3)
@@ -1744,8 +1477,10 @@ class EvolutionaryOuterLoop:
         )
 
     def _literature_grounding_query(self, reason: str, store: Optional[ArtifactStore] = None) -> str:
-        if self.evaluator_name == "prediction_market" and ("plateau" in reason or "stall" in reason):
-            return _prediction_market_plateau_literature_query(store)
+        if self.evaluator_name == "prediction_market" and any(token in reason for token in ["plateau", "stall", "entropy_after_round"]):
+            base_query = _prediction_market_plateau_literature_query(store)
+            entropy_axis = self._llm_literature_entropy_axis(reason, store)
+            return f"{base_query} {entropy_axis}".strip()
         context_parts = [self.goal, reason.replace("_", " ")]
         if store:
             for item in _score_history(store, mode="optimize", limit=3):
@@ -1753,8 +1488,77 @@ class EvolutionaryOuterLoop:
                 context_parts.append(str(item.get("payload", ""))[:240])
             context_parts.extend(_recent_literature_grounding_notes(store, limit=3))
             context_parts.extend(_recent_user_steering_notes(store, limit=3))
+        context_parts.append(self._llm_literature_entropy_axis(reason, store))
         terms = _context_terms(" ".join(context_parts), limit=28)
         return " ".join(terms) if terms else self.goal
+
+    def _llm_literature_entropy_axis(self, reason: str, store: Optional[ArtifactStore]) -> str:
+        if "entropy_after_round" not in reason and "plateau" not in reason and "stall" not in reason:
+            return ""
+        started = time.perf_counter()
+        started_at = now_iso()
+        tokens_before = self.llm.total_prompt_tokens + self.llm.total_completion_tokens
+        score_history = _score_history(store, mode="optimize", limit=5) if store else []
+        prior_literature = _recent_literature_grounding_notes(store, limit=8) if store else []
+        user_steering = _recent_user_steering_notes(store, limit=4) if store else []
+        system = (
+            "You are the entropy policy inside an optimization agent. "
+            "Choose a new literature-search axis for the next optimizer iteration as JSON only: "
+            "{\"axis\": str, \"rationale\": str, \"query_terms\": [str]}. "
+            "Do not choose from a fixed list. Invent a fresh, goal-relevant axis that is meaningfully different "
+            "from recent literature notes and score-only parameter tuning."
+        )
+        user = json.dumps(
+            {
+                "goal": self.goal,
+                "reason": reason,
+                "evaluator_name": self.evaluator_name,
+                "score_history": score_history,
+                "recent_literature_notes": prior_literature,
+                "user_steering": user_steering,
+                "instruction": (
+                    "Return one novel literature axis and compact query terms that could steer code generation "
+                    "toward a new mechanism, constraint, regime, or evaluator lens."
+                ),
+            },
+            sort_keys=True,
+        )
+        status = "completed"
+        errors: list[str] = []
+        axis = ""
+        rationale = ""
+        try:
+            payload = self.llm.complete_json(system, user, max_output_tokens=400, temperature=1.05)
+            axis = str(payload.get("axis") or "").strip()
+            rationale = str(payload.get("rationale") or "").strip()
+            query_terms = payload.get("query_terms") if isinstance(payload.get("query_terms"), list) else []
+            query_text = " ".join(str(term) for term in query_terms if str(term).strip())
+            axis = " ".join([axis, query_text]).strip()
+        except Exception as exc:
+            status = "failed"
+            errors.append(f"{type(exc).__name__}: {exc}")
+        if not axis or axis.lower().startswith("local fallback"):
+            status = "fallback" if status == "completed" else status
+            axis = _contextual_entropy_literature_axis(self.goal, reason, score_history, prior_literature, user_steering)
+            rationale = "Context-derived fallback because the model did not return a usable novel axis."
+        if store:
+            tokens_after = self.llm.total_prompt_tokens + self.llm.total_completion_tokens
+            _record_timing_trace(
+                store,
+                self.run_id,
+                agent_name=f"llm_entropy_literature_axis:{reason}",
+                role="literature_grounding_policy",
+                prompt=user,
+                model=self.llm.model_label,
+                started_at=started_at,
+                started=started,
+                status=status,
+                output_summary=f"Selected entropy literature axis: {_shorten(axis, 180)}"
+                + (f" Rationale: {_shorten(rationale, 160)}" if rationale else ""),
+                token_usage=tokens_after - tokens_before,
+                errors=errors,
+            )
+        return axis
 
     def _apply_plateau_recovery(self, plateau: PlateauDetector, store: ArtifactStore, round_index: int, reason: str) -> None:
         """Apply a context-derived recovery action and set one-shot flags for the next proposal round."""
@@ -2641,13 +2445,17 @@ class EvolutionaryOuterLoop:
         system = (
             "You are the outer orchestrator in an evolutionary optimization harness. "
             "Propose candidate code or strategy variants as JSON only: {\"variants\": [{\"payload\": str}]}. "
-            "Obey forced_directions exactly: every variant must test its assigned strategy_family and mechanism_hypothesis."
+            "Obey forced_directions exactly: every variant must test its assigned strategy_family and mechanism_hypothesis. "
+            "When optimizer_seed_context or literature_refresh_notes are present, use their retrieved claims/source summaries "
+            "as concrete design inputs and name the claim or source insight reflected in each payload."
         )
         user = json.dumps(
             {
                 "goal": self.goal,
                 "outer_iteration": outer_iteration,
                 "parents": [parent.payload for parent in parents],
+                "optimizer_seed_context": _optimizer_prompt_seed_context(store, parents),
+                "literature_refresh_notes": _recent_literature_grounding_notes(store, limit=6),
                 "champion": {
                     "variant_id": self._champion_variant_id,
                     "score": self._champion_score,
@@ -2737,6 +2545,7 @@ class EvolutionaryOuterLoop:
         parent_snippets = [p.payload[:600] for p in parents if "class Strategy" in p.payload]
         literature_seed_context = [_parent_literature_context(parent) for parent in parents]
         literature_seed_context = [item for item in literature_seed_context if item]
+        literature_refresh_notes = _recent_literature_grounding_notes(store, limit=6)
         system = (
             "You are an expert market-making strategy developer for prediction markets. "
             "Generate complete, executable Python Strategy classes for the upstream orderbook_pm_challenge evaluator.\n\n"
@@ -2772,7 +2581,9 @@ class EvolutionaryOuterLoop:
                     "payload": self._champion_payload[:1200],
                     "instruction": "Each strategy should either be a deliberate diff against this champion or a clearly labeled new strategy family.",
                 },
+                "optimizer_seed_context": _optimizer_prompt_seed_context(store, parents),
                 "literature_seed_context": literature_seed_context,
+                "literature_refresh_notes": literature_refresh_notes,
                 "user_steering": _recent_user_steering_notes(store, limit=6),
                 "forced_directions": [_direction_metadata(direction, kind="code") for direction in (directions or [])],
                 "population_size": self.population_size,
@@ -2860,64 +2671,6 @@ class EvolutionaryOuterLoop:
         return variants
 
 
-def _record_timing_trace(
-    store: ArtifactStore,
-    run_id: str,
-    *,
-    agent_name: str,
-    role: str,
-    prompt: str,
-    model: str,
-    started_at: str,
-    started: float,
-    status: str,
-    output_summary: str,
-    token_usage: int = 0,
-    tools_used: Optional[list[str]] = None,
-    tool_calls: Optional[list[dict[str, object]]] = None,
-    errors: Optional[list[str]] = None,
-) -> None:
-    store.add_trace(
-        AgentTrace(
-            run_id=run_id,
-            agent_name=agent_name,
-            role=role,
-            prompt=prompt,
-            model=model,
-            tools_used=tools_used or [],
-            tool_calls=tool_calls or [],
-            token_usage=max(0, token_usage),
-            runtime_ms=max(0, int((time.perf_counter() - started) * 1000)),
-            status=status,
-            errors=errors or [],
-            output_summary=output_summary,
-            started_at=started_at,
-            prompt_version=hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16],
-            prompt_tokens=max(0, token_usage),
-            failure_component=_trace_component(role, agent_name),
-        )
-    )
-
-
-def _trace_component(role: str, agent_name: str) -> str:
-    text = f"{role} {agent_name}".lower()
-    if any(term in text for term in ["search", "literature", "retriever", "memory"]):
-        return "retrieval"
-    if "hypothesis" in text:
-        return "hypothesis_generation"
-    if "critic" in text:
-        return "critic"
-    if "synthesis" in text:
-        return "synthesis"
-    if any(term in text for term in ["optimize", "evaluator", "prediction_market"]):
-        return "optimizer"
-    if "loop_controller" in text:
-        return "loop_control"
-    if "orchestration" in text:
-        return "orchestration"
-    return "unknown"
-
-
 def _continuation_reason(
     termination_signal: str,
     best_eval: Optional[VariantEvaluation],
@@ -2935,54 +2688,6 @@ def _continuation_reason(
     if termination_signal in {"score_plateau", "coverage_plateau"}:
         return f"Plateau detected after {plateau_count} stalled round(s); recovery may run, then loop exits unless objective requires more iterations."
     return f"More research/evaluation is needed; best score {score:.3f}, plateau count {plateau_count}."
-
-
-def _score_history(store: Optional[ArtifactStore], *, mode: str, limit: int = 8) -> list[dict[str, object]]:
-    if store is None:
-        return []
-    variants = {str(row.get("id")): row for row in store.list("variants")}
-    rows = [row for row in store.list("variant_evaluations") if str(row.get("inner_loop")) == mode]
-    rows.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
-    history: list[dict[str, object]] = []
-    for row in rows[:limit]:
-        variant = variants.get(str(row.get("variant_id")), {})
-        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
-        history.append(
-            {
-                "variant_id": row.get("variant_id"),
-                "score": row.get("score"),
-                "mean_edge": metrics.get("mean_edge"),
-                "score_source": metrics.get("score_source"),
-                "payload": str(variant.get("payload", ""))[:900],
-                "summary": str(row.get("summary", ""))[:400],
-            }
-        )
-    return history
-
-
-def _json_evaluator_responses(store: ArtifactStore, *, mode: str) -> list[dict[str, object]]:
-    rows = [row for row in store.list("variant_evaluations") if str(row.get("inner_loop")) == mode]
-    responses: list[dict[str, object]] = []
-    for row in rows:
-        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
-        response = metrics.get("json_response") if isinstance(metrics, dict) else None
-        if not isinstance(response, dict):
-            response = {
-                "status": metrics.get("evaluator_status", "completed") if isinstance(metrics, dict) else "completed",
-                "score": float(row.get("score", 0.0) or 0.0),
-                "metrics": metrics,
-                "diagnostics": metrics.get("diagnostics", {}) if isinstance(metrics, dict) else {},
-                "loss_reason": metrics.get("loss_reason", "") if isinstance(metrics, dict) else "",
-                "summary": row.get("summary", ""),
-            }
-        responses.append(
-            {
-                "variant_id": row.get("variant_id"),
-                "inner_loop": row.get("inner_loop"),
-                **response,
-            }
-        )
-    return responses
 
 
 def _forced_direction_specs(
@@ -3131,12 +2836,27 @@ def _prediction_market_plateau_literature_query(store: Optional[ArtifactStore]) 
     return " ".join([*terms[:16], "literature", "mechanism", "generalization"])
 
 
-def _strip_run_artifacts(text: str) -> str:
-    text = re.sub(r"\b(?:outputs|eval_outputs)/\S+", " ", text)
-    text = re.sub(r"\b(?:variant|round)_[A-Za-z0-9_]+\b", " ", text)
-    text = re.sub(r"\b[a-f0-9]{12,}\b", " ", text)
-    text = re.sub(r"\b\w+\.py\b", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+def _contextual_entropy_literature_axis(
+    goal: str,
+    reason: str,
+    score_history: list[dict[str, object]],
+    prior_literature: list[str],
+    user_steering: list[str],
+) -> str:
+    context = " ".join(
+        [
+            goal,
+            reason.replace("_", " "),
+            *[str(item.get("summary", "")) for item in score_history],
+            *[str(item.get("payload", ""))[:280] for item in score_history],
+            *prior_literature,
+            *user_steering,
+        ]
+    )
+    terms = _context_terms(context, limit=16)
+    if not terms:
+        return "novel literature mechanism constraints generalization"
+    return " ".join([*terms[:12], "novel", "literature", "mechanism", "generalization"])
 
 
 def _parent_literature_context(parent: Variant) -> dict[str, object]:
@@ -3171,6 +2891,55 @@ def _parent_literature_context(parent: Variant) -> dict[str, object]:
         "claims": trimmed_claims,
         "sources": trimmed_sources,
     }
+
+
+def _optimizer_prompt_seed_context(store: Optional[ArtifactStore], parents: list[Variant]) -> dict[str, object]:
+    context: dict[str, object] = {}
+    if store and store.optimizer_seed_context_path.exists():
+        try:
+            raw = json.loads(store.optimizer_seed_context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        if isinstance(raw, dict):
+            context["summary"] = str(raw.get("summary", ""))[:1200]
+            findings = raw.get("top_query_findings") if isinstance(raw.get("top_query_findings"), list) else []
+            trimmed_findings = []
+            for item in findings[:6]:
+                if not isinstance(item, dict):
+                    continue
+                trimmed_findings.append(
+                    {
+                        "query": str(item.get("query", ""))[:500],
+                        "score": item.get("score", 0.0),
+                        "summary": str(item.get("summary", ""))[:500],
+                        "supporting_claims": [
+                            {
+                                "text": str(claim.get("text", ""))[:500],
+                                "confidence": claim.get("confidence", 0.0),
+                                "source_ids": claim.get("source_ids", []),
+                            }
+                            for claim in (item.get("supporting_claims") if isinstance(item.get("supporting_claims"), list) else [])[:5]
+                            if isinstance(claim, dict)
+                        ],
+                        "supporting_sources": [
+                            {
+                                "title": str(source.get("title", ""))[:240],
+                                "summary": str(source.get("summary", ""))[:500],
+                                "source_type": str(source.get("source_type", "")),
+                                "url": str(source.get("url", "")),
+                            }
+                            for source in (item.get("supporting_sources") if isinstance(item.get("supporting_sources"), list) else [])[:4]
+                            if isinstance(source, dict)
+                        ],
+                    }
+                )
+            context["top_query_findings"] = trimmed_findings
+            context["optimizer_instruction"] = str(raw.get("optimizer_instruction", ""))[:500]
+    parent_context = [_parent_literature_context(parent) for parent in parents]
+    parent_context = [item for item in parent_context if item]
+    if parent_context:
+        context["parent_literature_context"] = parent_context[:6]
+    return context
 
 
 def _recent_literature_grounding_notes(store: Optional[ArtifactStore], limit: int = 4) -> list[str]:
@@ -3298,45 +3067,6 @@ def _contextual_query_suffixes(goal: str, parents: list[Variant], limit: int) ->
     return suffixes[:limit]
 
 
-CONTEXT_STOPWORDS = {
-    "and",
-    "are",
-    "but",
-    "candidate",
-    "challenge",
-    "code",
-    "for",
-    "from",
-    "goal",
-    "into",
-    "none",
-    "optimization",
-    "optimize",
-    "query",
-    "research",
-    "round",
-    "score",
-    "strategy",
-    "the",
-    "this",
-    "variant",
-    "with",
-}
-
-
-def _context_terms(text: str, limit: int = 12) -> list[str]:
-    terms: list[str] = []
-    seen: set[str] = set()
-    for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", text.lower().replace("-", " ")):
-        if token in CONTEXT_STOPWORDS or token in seen:
-            continue
-        seen.add(token)
-        terms.append(token)
-        if len(terms) >= limit:
-            break
-    return terms
-
-
 def _plateau_entropy_intent(action: str, goal: str, score_context: str, evaluator_name: str) -> dict[str, object]:
     context_terms = _context_terms(f"{goal} {score_context}", limit=10)
     topic = " ".join(context_terms[:5]) or "the objective"
@@ -3415,14 +3145,6 @@ def _randomly_mutate_variant(variant: Variant, seed: int) -> Variant:
     )
 
 
-def _support_level(confidence: float) -> str:
-    if confidence >= 0.75:
-        return "strong"
-    if confidence >= 0.55:
-        return "moderate"
-    return "weak"
-
-
 def _retriever_fallbacks(retriever_name: str) -> list[str]:
     scholarly = {"arxiv", "openalex", "semantic_scholar"}
     if retriever_name in scholarly:
@@ -3460,46 +3182,6 @@ def _stable_judge_score(payload: str, metrics: dict[str, float]) -> float:
     jitter = int(digest[:4], 16) / 0xFFFF
     weighted = (metrics["coverage"] * 0.35) + (metrics["corroboration"] * 0.35) + (metrics["credibility"] * 0.25)
     return round(min(1.0, weighted + (jitter * 0.05)), 3)
-
-
-def _looks_like_optimization_query(goal: str) -> bool:
-    normalized = goal.lower()
-    query_terms = {"research", "find", "query", "search", "investigate", "explore", "look for"}
-    return any(term in normalized for term in query_terms) and any(term in normalized for term in OPTIMIZE_HINTS)
-
-
-def _product_agent_for(selected_mode: TaskMode, goal: str, evaluator_name: Optional[str]) -> ProductAgent:
-    normalized = goal.lower()
-    if evaluator_name == "prediction_market" or "challenge" in normalized:
-        return "challenge"
-    if selected_mode == "research":
-        return "research"
-    return "optimize"
-
-
-def _loop_objective_from_goal(goal: str, evaluator_name: Optional[str]) -> LoopObjective:
-    normalized = goal.lower()
-    no_stop = bool(re.search(r"\bdo\s*not\s*stop\b|\bdon't\s*stop\b|\bdont\s*stop\b|until\s+you", normalized))
-    if evaluator_name == "prediction_market":
-        target = _profit_target_from_goal(goal)
-        return LoopObjective(kind="profit_usd", target=target, no_stop_until_target=no_stop and target is not None)
-    return LoopObjective(kind="score", target=None, no_stop_until_target=no_stop)
-
-
-def _profit_target_from_goal(goal: str) -> Optional[float]:
-    normalized = goal.lower()
-    patterns = [
-        r"(?:get\s+to|reach|hit|achieve|make|earn)\s*\$?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:\$|usd|dollars?)?\s*(?:profit|edge)?",
-        r"\$+\s*([0-9]+(?:\.[0-9]+)?)\s*(?:profit|edge|usd|dollars?)",
-        r"([0-9]+(?:\.[0-9]+)?)\s*(?:\$|usd|dollars?)\s*(?:profit|edge)",
-    ]
-    if not any(term in normalized for term in ["profit", "profitable", "edge", "$", "usd", "dollar"]):
-        return None
-    for pattern in patterns:
-        match = re.search(pattern, normalized)
-        if match:
-            return float(match.group(1))
-    return None
 
 
 def _implementability_score(text: str) -> float:
@@ -3740,6 +3422,10 @@ def _run_prediction_market_official(strategy_path: Path) -> dict[str, object]:
         "score_eligible": True,
         "sandbox_executed": True,
         "docker_sandbox": docker_sandbox,
+        "paired_crn": True,
+        "eval_protocol": PREDICTION_MARKET_EVAL_PROTOCOL,
+        "seed_start": int(seed_start) if seed_start.isdigit() else seed_start,
+        "steps": int(steps) if steps.isdigit() else steps,
         "mean_edge": round(mean_edge, 6),
         "mean_arb_edge": round(mean_arb_edge, 6),
         "mean_retail_edge": round(mean_retail_edge, 6),
@@ -3809,6 +3495,8 @@ def _prediction_market_unmeasured_result(
         "score_eligible": False,
         "sandbox_executed": False,
         "docker_sandbox": docker_sandbox,
+        "paired_crn": False,
+        "eval_protocol": "unmeasured",
         "mean_edge": 0.0,
         "mean_arb_edge": 0.0,
         "mean_retail_edge": 0.0,
@@ -3873,6 +3561,9 @@ import types
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+
+PREDICTION_MARKET_DEFAULT_SIMULATIONS = "24"
+PREDICTION_MARKET_EVAL_PROTOCOL = "fixed_rng_stream_same_across_variants"
 
 
 class BaseStrategy:
@@ -4014,6 +3705,10 @@ def main(path: str) -> None:
         "failure_count": failures,
         "simulations": simulations,
         "actions_seen": actions_seen,
+        "paired_crn": True,
+        "eval_protocol": PREDICTION_MARKET_EVAL_PROTOCOL,
+        "seed_start": 0,
+        "rng_seed": 20260509,
     }))
 
 
@@ -4103,6 +3798,10 @@ def _prediction_market_local_semantic_score(strategy_text: str, simulations: int
         "failure_count": failures,
         "simulations": simulations,
         "score_source": "local_official_semantics_fallback",
+        "paired_crn": True,
+        "eval_protocol": "fixed_rng_stream_same_across_variants",
+        "seed_start": 0,
+        "rng_seed": 20260507,
     }
 
 
@@ -4121,41 +3820,3 @@ def _params_from_strategy_text(strategy_text: str) -> dict[str, object]:
         "quote_mode": mode_match.group(1) if mode_match else "contextual",
     }
 
-
-def _objective_metadata(evaluator_name: str) -> dict[str, object]:
-    if evaluator_name == "prediction_market":
-        return {
-            "objective_name": "prediction_market_mean_edge",
-            "objective_direction": "maximize",
-            "official_result": {
-                "measured": True,
-                "profit_usd": None,
-                "score_source": "upstream_orderbook_pm_challenge_when_available",
-                "required_evaluator": "https://github.com/danrobinson/prediction-market-challenge",
-                "reason": "Optimization evaluates generated candidates with the upstream orderbook-pm runner when available.",
-            },
-            "note": (
-                "Prediction-market optimization uses upstream mean edge when the orderbook_pm_challenge repo is available. "
-                "The normalized score is derived from mean edge for harness aggregation."
-            ),
-        }
-    if evaluator_name == "length_score":
-        return {
-            "objective_name": "length_score",
-            "objective_direction": "maximize",
-            "official_result": {"measured": True, "score_source": "local_deterministic_evaluator"},
-            "note": "This evaluator maximizes 1 / token_count for smoke-test optimization.",
-        }
-    return {
-        "objective_name": evaluator_name or "deterministic_score",
-        "objective_direction": "maximize",
-        "official_result": {"measured": True, "score_source": "local_deterministic_evaluator"},
-        "note": "Optimization result from the registered deterministic evaluator.",
-    }
-
-
-def _shorten(text: str, limit: int = 140) -> str:
-    compact = " ".join(text.split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: limit - 3] + "..."

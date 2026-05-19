@@ -108,6 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evolutionary variant population per round. The challenge preset raises this to at least 48.",
     )
     parser.add_argument(
+        "--query-population-size",
+        type=int,
+        default=int(os.environ["RESEARCH_HARNESS_QUERY_POPULATION_SIZE"]) if os.environ.get("RESEARCH_HARNESS_QUERY_POPULATION_SIZE") else None,
+        help="Optional optimize_query research fan-out cap. Challenge preset defaults this to 16 while keeping optimizer population wide.",
+    )
+    parser.add_argument(
         "--parent-count",
         type=int,
         default=int(os.environ.get("RESEARCH_HARNESS_PARENT_COUNT", "2")),
@@ -519,6 +525,7 @@ def configure_interactive_run(
         input_func=input_func,
         output_func=output_func,
     )
+    args.max_iterations_explicit = True
     selected_model = prompt_choice(
         "Which model/lab should run the harness?",
         model_choices(),
@@ -555,6 +562,10 @@ def main() -> None:
     load_dotenv(Path(".env.local"), override=True)
     parser = build_parser()
     args = parser.parse_args()
+    args.max_iterations_explicit = any(
+        item == "--max-iterations" or item.startswith("--max-iterations=")
+        for item in sys.argv[1:]
+    )
     if args.list_llm_models:
         _print_cli_banner(compact=True)
         print(format_model_catalog())
@@ -579,9 +590,11 @@ def main() -> None:
         mode=args.mode or "evolutionary",
         retriever=args.retriever,
         max_loop_iterations=args.max_iterations,
+        max_loop_iterations_explicit=getattr(args, "max_iterations_explicit", False),
         task_mode=args.task_mode,
         evaluator_name=args.evaluator,
         evolution_population_size=args.population_size,
+        query_population_size=args.query_population_size,
         optimization_preset=args.optimization_preset,
         optimizer_parent_count=args.parent_count,
         parallel_evaluator_cap=args.parallel_evaluator_cap,

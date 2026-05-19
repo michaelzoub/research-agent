@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,45 @@ def write_trajectory_graph_artifacts(store: ArtifactStore, trial_root: Path) -> 
     return {"mmd": mmd_path, "svg": svg_path, "json": json_path}
 
 
+def trajectory_optimizer_flow(store: ArtifactStore) -> str:
+    rounds = store.list("evolution_rounds")
+    claims = store.list("claims")
+    sources_by_id = {str(source.get("id")): source for source in store.list("sources")}
+    lines = ["flowchart TD", '  start["Optimizer trajectory"]']
+    previous_node = "start"
+    for index, round_record in enumerate(rounds, start=1):
+        iteration = _round_iteration(round_record, index)
+        signal = str(round_record.get("termination_signal", "unknown"))
+        mode = str(round_record.get("mode", "unknown"))
+        score = float(round_record.get("best_score", 0.0) or 0.0)
+        round_node = f"round_{iteration}"
+        entropy_node = f"entropy_{iteration}"
+        label = f"Round {iteration}\\n{mode} best={score:.3f}\\nsignal={signal}"
+        lines.append(f'  {round_node}["{_mmd(label)}"]')
+        lines.append(f"  {previous_node} --> {round_node}")
+        previous_node = round_node
+        if signal == "continue":
+            entropy = _post_round_entropy_record(round_record, iteration, claims, sources_by_id)
+            if entropy["introduced_after_round"]:
+                entropy_label = (
+                    f"Post-round entropy introduced\\n"
+                    f"{entropy['reason']}\\n"
+                    f"{entropy['source_title']}"
+                )
+                edge_label = "fresh literature before next proposal"
+            else:
+                entropy_label = (
+                    "Missing post-round entropy\\n"
+                    f"expected {entropy['reason']}\\n"
+                    "no later source evidence found"
+                )
+                edge_label = "entropy missing"
+            lines.append(f'  {entropy_node}["{_mmd(entropy_label)}"]')
+            lines.append(f"  {round_node} -->|{_mmd(edge_label)}| {entropy_node}")
+            previous_node = entropy_node
+    return "\n".join(lines) + "\n"
+
+
 def normalized_trajectory_events(store: ArtifactStore) -> list[dict[str, str]]:
     runs = store.list("runs")
     run = runs[0] if runs else {}
@@ -143,6 +183,59 @@ def graph_trajectory_match(graph: dict[str, Any], required_edges: list[list[str]
         "missing_edges": missing,
         "actual_edges": sorted([list(edge) for edge in actual_edges]),
     }
+
+
+def _round_iteration(round_record: dict[str, Any], fallback: int) -> int:
+    try:
+        return int(round_record.get("outer_iteration") or fallback)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _post_round_entropy_record(
+    round_record: dict[str, Any],
+    iteration: int,
+    claims: list[dict[str, Any]],
+    sources_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    mode = str(round_record.get("mode", ""))
+    reasons = [f"optimizer_entropy_after_round_{iteration}"]
+    if mode in {"optimize", "optimize_query"}:
+        reasons.append(f"prediction_market_entropy_after_round_{iteration}")
+    round_completed = _parse_iso(str(round_record.get("completed_at", "")))
+    for reason in reasons:
+        matching_claims = [
+            claim
+            for claim in claims
+            if claim.get("created_by_agent") == "literature_grounding_policy"
+            and f"Literature grounding ({reason})" in str(claim.get("text", ""))
+        ]
+        for claim in matching_claims:
+            for source_id in claim.get("source_ids", []):
+                source = sources_by_id.get(str(source_id))
+                if not source:
+                    continue
+                retrieved_at = _parse_iso(str(source.get("retrieved_at", "")))
+                if retrieved_at is None or round_completed is None or retrieved_at >= round_completed:
+                    return {
+                        "introduced_after_round": True,
+                        "reason": reason,
+                        "source_title": str(source.get("title") or source.get("url") or source_id),
+                    }
+    return {
+        "introduced_after_round": False,
+        "reason": reasons[0],
+        "source_title": "",
+    }
+
+
+def _parse_iso(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _event_key(event: dict[str, str]) -> tuple[str, str]:
@@ -214,5 +307,3 @@ def _trajectory_graph_svg(graph: dict[str, Any]) -> str:
         ry += 42
     parts.append("</svg>")
     return "\n".join(parts)
-
-

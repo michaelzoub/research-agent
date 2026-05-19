@@ -94,10 +94,12 @@ class HarnessConfig:
     hypothesis_agent_count: int = 2
     include_debugger: bool = True
     max_loop_iterations: int = 12
+    max_loop_iterations_explicit: bool = False
     max_task_attempts: int = 2
     task_mode: str = "auto"
     evaluator_name: Optional[str] = None
     evolution_population_size: int = 4
+    query_population_size: Optional[int] = None
     optimization_preset: str = "standard"
     optimizer_parent_count: int = 2
     parallel_evaluator_cap: int = 8
@@ -124,8 +126,11 @@ class Orchestrator:
         self.output_root = output_root
         self.config = config or HarnessConfig()
         if self.config.optimization_preset == "challenge":
-            self.config.max_loop_iterations = max(self.config.max_loop_iterations, 20)
+            if not self.config.max_loop_iterations_explicit:
+                self.config.max_loop_iterations = max(self.config.max_loop_iterations, 20)
             self.config.evolution_population_size = max(self.config.evolution_population_size, 48)
+            if self.config.query_population_size is None:
+                self.config.query_population_size = 16
             self.config.optimizer_parent_count = max(self.config.optimizer_parent_count, 4)
             self.config.parallel_evaluator_cap = 16 if self.config.parallel_evaluator_cap == 8 else max(1, self.config.parallel_evaluator_cap)
             self.config.optimize_plateau_patience = max(self.config.optimize_plateau_patience, 5)
@@ -175,6 +180,9 @@ class Orchestrator:
             else:
                 raise ValueError(f"Unknown mode: {selected_mode}")
             run.status = "failed" if _has_incomplete_required_loop_tasks(store) else "completed"
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            run.status = "cancelled"
+            await self._synthesize_interrupted_run(run, store)
         except Exception:
             run.status = "failed"
             raise
@@ -223,6 +231,65 @@ class Orchestrator:
             if steering_handle is not None:
                 steering_handle.stop()
         return run, store
+
+    async def _synthesize_interrupted_run(self, run: RunRecord, store: ArtifactStore) -> None:
+        """Turn a first Ctrl+C into "package current findings" instead of a hard stop."""
+        store.append_progress("Interrupt received: stopping exploration and synthesizing partial run artifacts.")
+        self._mark_running_loop_tasks_interrupted(store)
+        task = self._synthesis_task_for_interrupt(store)
+        iteration = len(store.list("loop_iterations")) + 1
+        synthesis = SynthesisAgent(
+            name="interrupt_synthesis",
+            role="synthesis_agent",
+            prompt_template=_prompt("synthesis_agent"),
+            budget=self._budget("append_only"),
+            llm=self.llm,
+        )
+        try:
+            result = await synthesis.execute(run, store)
+        except Exception as exc:
+            summary = f"Interrupt synthesis failed: {type(exc).__name__}: {exc}"
+            store.write_report(_interrupted_report(run, store, summary))
+            result = AgentResult("interrupt_synthesis", summary, [summary])
+        await self._record_task_result(run, store, task, iteration, result)
+        if store.report_path.exists():
+            report = store.report_path.read_text(encoding="utf-8", errors="replace")
+            if "## Run Interrupted" not in report:
+                store.write_report(
+                    report.rstrip()
+                    + "\n\n## Run Interrupted\n"
+                    + "- This report was synthesized after an interrupt signal. Treat conclusions as partial and inspect `progress.txt`, `prd.json`, and optimization artifacts for the exact stopping point.\n"
+                )
+        store.append_progress("Interrupt synthesis complete: partial final_report.md and run artifacts were written.")
+
+    def _mark_running_loop_tasks_interrupted(self, store: ArtifactStore) -> None:
+        for row in store.list("loop_tasks"):
+            if row.get("status") == "running":
+                task = LoopTask(**row)
+                task.status = "failed"
+                task.passes = False
+                task.last_error = "Interrupted by user before this task completed."
+                task.result_summary = task.last_error
+                task.completed_at = now_iso()
+                store.update_loop_task(task)
+        self._update_prd_tasks(store)
+
+    def _synthesis_task_for_interrupt(self, store: ArtifactStore) -> LoopTask:
+        tasks = [LoopTask(**row) for row in store.list("loop_tasks")]
+        for task in tasks:
+            if task.action == "synthesize":
+                task.status = "running"
+                store.update_loop_task(task)
+                return task
+        task = LoopTask(
+            title="Synthesize interrupted run report",
+            action="synthesize",
+            priority=(max([task.priority for task in tasks], default=0) + 1),
+            params={"interrupted": True},
+            acceptance_criteria=["Partial final_report.md was written from available artifacts"],
+            status="running",
+        )
+        return store.add_loop_task(task)
 
     def _start_session_store(self, goal: str, run: RunRecord) -> Optional[SessionStore]:
         if not self.config.enable_sessions:
@@ -671,6 +738,7 @@ class Orchestrator:
             evaluator_name=decision.evaluator_name,
             max_outer_iterations=self.config.max_loop_iterations,
             population_size=population_size,
+            query_population_size=self.config.query_population_size,
             parent_count=self.config.optimizer_parent_count,
             parallel_evaluator_cap=self.config.parallel_evaluator_cap,
             optimize_plateau_patience=self.config.optimize_plateau_patience,
@@ -1907,6 +1975,51 @@ def _read_json_if_exists(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _interrupted_report(run: RunRecord, store: ArtifactStore, reason: str) -> str:
+    rounds = store.list("evolution_rounds")
+    evaluations = store.list("variant_evaluations")
+    best_eval = max(evaluations, key=lambda row: float(row.get("score", 0.0) or 0.0), default={})
+    lines = [
+        f"# Partial Report: {run.user_goal}",
+        "",
+        "## Key Takeaways",
+        "- The run was interrupted before normal completion, so this report packages the artifacts available at the stopping point.",
+        f"- Completed evolutionary rounds: {len(rounds)}.",
+        f"- Recorded variant evaluations: {len(evaluations)}.",
+    ]
+    if best_eval:
+        lines.append(
+            f"- Best retained evaluation: `{best_eval.get('variant_id', 'unknown')}` with score {float(best_eval.get('score', 0.0) or 0.0):.3f}."
+        )
+    lines.extend(
+        [
+            "",
+            "## Important Artifacts",
+            f"- Progress log: `{store.progress_path.name}`",
+            f"- PRD/status: `{store.prd_path.name}`",
+            f"- Cost: `{store.cost_path.name}`",
+            f"- Failed paths: `{store.failed_paths_path.name}`",
+            f"- Harness changes: `{store.harness_changes_path.name}`",
+        ]
+    )
+    if store.optimization_result_path.exists():
+        lines.append(f"- Optimization result: `{store.optimization_result_path.name}`")
+    if store.optimal_code_path.exists():
+        lines.append(f"- Optimal code: `{store.optimal_code_path.name}`")
+    if store.champion_tree_path.exists():
+        lines.append(f"- Champion tree: `{store.champion_tree_path.name}`")
+    lines.extend(
+        [
+            "",
+            "## Run Interrupted",
+            f"- Reason: {reason}",
+            "- Treat conclusions as partial and use the artifact trail to resume or inspect the exact stopping point.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _first_json_row(path: Path) -> dict[str, object]:

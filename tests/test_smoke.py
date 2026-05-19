@@ -26,12 +26,13 @@ from research_harness.evals import (
     preflight_eval_suite,
     select_eval_tasks,
     graph_trajectory_match,
+    trajectory_optimizer_flow,
     trajectory_match,
 )
 from research_harness.evals.cli import build_parser as build_eval_parser
 from research_harness.agents import SynthesisAgent
 from research_harness.llm import LLMClient, LLMError
-from research_harness.loops import EvaluatorRegistry, EvaluatorResult, EvolutionaryOuterLoop, OptimizeLoop, PlateauDetector, ResearchLoop, TaskRouter
+from research_harness.loops import EvaluatorRegistry, EvaluatorResult, EvolutionaryOuterLoop, InnerLoopResult, OptimizeLoop, PlateauDetector, ResearchLoop, TaskRouter
 from research_harness.orchestrator import HarnessConfig, Orchestrator, goal_slug
 from research_harness.schemas import AgentTrace, Claim, Contradiction, EvolutionRound, Hypothesis, RunRecord, Source, SourceStrategyItem, Variant, VariantEvaluation
 from research_harness.search import CorpusDocument, LocalCorpusSearch, OpenAlexSearch, SemanticScholarSearch, _parse_arxiv_feed, _score_documents
@@ -197,6 +198,7 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(configured.task_mode, "optimize_query")
         self.assertEqual(configured.evaluator, "prediction_market")
         self.assertEqual(configured.optimization_preset, "challenge")
+        self.assertTrue(configured.max_iterations_explicit)
 
     def test_cli_accepts_optimization_challenge_knobs(self) -> None:
         parser = build_parser()
@@ -239,10 +241,87 @@ class SmokeTest(unittest.TestCase):
 
         self.assertEqual(orchestrator.config.max_loop_iterations, 20)
         self.assertEqual(orchestrator.config.evolution_population_size, 48)
+        self.assertEqual(orchestrator.config.query_population_size, 16)
         self.assertEqual(orchestrator.config.optimizer_parent_count, 4)
         self.assertEqual(orchestrator.config.parallel_evaluator_cap, 16)
         self.assertEqual(orchestrator.config.optimize_plateau_patience, 5)
         self.assertTrue(orchestrator.config.continue_on_optimize_plateau)
+
+    def test_challenge_preset_respects_explicit_iteration_cap(self) -> None:
+        config = HarnessConfig(
+            optimization_preset="challenge",
+            max_loop_iterations=2,
+            max_loop_iterations_explicit=True,
+        )
+        orchestrator = Orchestrator(
+            Path("examples/corpus/research_corpus.json"),
+            Path("outputs"),
+            config=config,
+        )
+
+        self.assertEqual(orchestrator.config.max_loop_iterations, 2)
+        self.assertEqual(orchestrator.config.evolution_population_size, 48)
+        self.assertEqual(orchestrator.config.query_population_size, 16)
+
+    def test_optimize_query_research_fanout_can_be_capped_separately(self) -> None:
+        async def fake_evaluate(_self, variants, _store):
+            return InnerLoopResult(
+                ranked_evaluations=[
+                    VariantEvaluation(
+                        run_id="run_query_cap",
+                        variant_id=variants[0].id,
+                        inner_loop="optimize_query",
+                        score=0.5,
+                        metrics={},
+                        judge_scores=[0.5],
+                        summary="fake",
+                        passed=False,
+                    )
+                ],
+                termination_signal="continue",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            outer = EvolutionaryOuterLoop(
+                run_id="run_query_cap",
+                goal="prediction market challenge",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator=lambda payload: len(payload) / 100.0,
+                evaluator_name="prediction_market",
+                max_outer_iterations=1,
+                population_size=48,
+                query_population_size=3,
+            )
+            observed_populations: list[int] = []
+
+            def propose_query(round_index, _parents, _store):
+                observed_populations.append(outer.population_size)
+                return [
+                    Variant(
+                        run_id=outer.run_id,
+                        outer_iteration=round_index,
+                        kind="query",
+                        payload=f"query {index}",
+                        parent_ids=[],
+                        metadata={},
+                    )
+                    for index in range(outer.population_size)
+                ]
+
+            async def skip_optimizer(_store, _parents, _seed_context):
+                observed_populations.append(outer.population_size)
+
+            outer._propose_query_variants = propose_query  # type: ignore[method-assign]
+            outer._run_prediction_market_optimizer = skip_optimizer  # type: ignore[method-assign]
+            with unittest.mock.patch("research_harness.loops.OptimizationQueryLoop.evaluate", fake_evaluate):
+                asyncio.run(outer._run_optimize_query(store))
+            variant_count = len([row for row in store.list("variants") if row["kind"] == "query"])
+
+        self.assertEqual(observed_populations, [3, 48])
+        self.assertEqual(variant_count, 3)
 
     def test_prediction_market_evaluator_overrides_plain_optimize_to_challenge_flow(self) -> None:
         router = TaskRouter(EvaluatorRegistry())
@@ -478,6 +557,33 @@ class SmokeTest(unittest.TestCase):
             self.assertTrue(run.id.startswith("001_run_multi-agent-systems-improve-automated-literature-review-quality"))
             self.assertTrue(store.prd_path.exists())
             self.assertGreaterEqual(len(json.loads(store.prd_path.read_text(encoding="utf-8"))["organized_tasks"]), 1)
+
+    def test_interrupt_synthesizes_partial_artifacts(self) -> None:
+        async def interrupted_outer_loop(_loop, _store):
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = Orchestrator(
+                corpus_path=Path("examples/corpus/research_corpus.json"),
+                output_root=Path(directory),
+                config=HarnessConfig(retriever="local", max_loop_iterations=3, include_debugger=False, echo_progress=False),
+            )
+            with unittest.mock.patch("research_harness.orchestrator.EvolutionaryOuterLoop.run", interrupted_outer_loop):
+                run, store = asyncio.run(
+                    orchestrator.run(
+                        "Research how multi-agent systems improve automated literature review quality",
+                    )
+                )
+
+            self.assertEqual(run.status, "cancelled")
+            self.assertTrue(store.report_path.exists())
+            self.assertIn("## Run Interrupted", store.report_path.read_text(encoding="utf-8"))
+            self.assertTrue(store.prd_path.exists())
+            self.assertTrue(store.cost_path.exists())
+            self.assertTrue(store.run_benchmark_path.exists())
+            progress = store.progress_path.read_text(encoding="utf-8")
+            self.assertIn("Interrupt received", progress)
+            self.assertIn("Interrupt synthesis complete", progress)
 
     def test_world_model_dedup_provenance_and_observability_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1069,6 +1175,60 @@ class SmokeTest(unittest.TestCase):
             result = default_graders()["report_no_fabricated_sources"].grade(task, store)
             self.assertTrue(result.passed, result.assertions)
 
+    def test_local_corpus_sources_are_labeled_as_fixtures_not_external_literature(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            run = RunRecord(
+                id="run_local_fixture_report",
+                user_goal="Research how multi-agent systems improve automated literature review quality.",
+                task_type="open_ended",
+                task_mode="research",
+                product_agent="research",
+                harness_config_id="test",
+                prompt_versions={},
+                harness_config_snapshot={},
+            )
+            source = store.add_source(
+                Source(
+                    url="https://example.org/multi-agent-review-quality-2025",
+                    title="Parallel Agent Review Improves Evidence Recall In Literature Tasks",
+                    author="A. Rivera and S. Chen",
+                    date="2025-02-14",
+                    source_type="paper",
+                    summary="Bundled deterministic fixture.",
+                    relevance_score=0.7,
+                    credibility_score=0.5,
+                )
+            )
+            store.add_claim(
+                Claim(
+                    text="Parallel query framings can increase recall in a deterministic fixture.",
+                    source_ids=[source.id],
+                    confidence=0.7,
+                    support_level="medium",
+                    created_by_agent="test",
+                    run_id=run.id,
+                )
+            )
+
+            asyncio.run(
+                SynthesisAgent(
+                    name="test_synthesis",
+                    role="synthesis_agent",
+                    prompt_template="test",
+                    llm=LLMClient(provider="local"),
+                ).run(run, store)
+            )
+
+            report = store.report_path.read_text(encoding="utf-8")
+            tex = store.report_tex_path.read_text(encoding="utf-8")
+
+        self.assertIn("No externally verifiable sources were retained", report)
+        self.assertIn("Local Corpus Fixtures", report)
+        self.assertIn("not external sources", report)
+        self.assertNotIn("](https://example.org", report)
+        self.assertNotIn(r"\url{https://example.org", tex)
+
     def test_research_key_takeaways_do_not_import_unrelated_agentic_storyline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory) / "run_entropy")
@@ -1345,6 +1505,74 @@ class EvaluationHarnessTest(unittest.TestCase):
         self.assertIn("research_source_diversity", research_task.grader_ids)
         self.assertEqual(research_task.metadata["min_distinct_source_families"], 4)
 
+    def test_trajectory_optimizer_flow_marks_post_round_entropy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            source = store.add_source(
+                Source(
+                    url="memory://entropy/round-1",
+                    title="Fresh Bandit Literature",
+                    author="research-harness",
+                    date="2026-05-19",
+                    source_type="paper",
+                    summary="Fresh exploration literature.",
+                    relevance_score=0.8,
+                    credibility_score=0.8,
+                    retrieved_at="2026-05-19T10:00:05+00:00",
+                )
+            )
+            store.add_claim(
+                Claim(
+                    text="Literature grounding (optimizer_entropy_after_round_1) found: bandit exploration can add useful entropy.",
+                    source_ids=[source.id],
+                    confidence=0.8,
+                    support_level="retrieved",
+                    created_by_agent="literature_grounding_policy",
+                    run_id="run_flow",
+                )
+            )
+            store.add_evolution_round(
+                EvolutionRound(
+                    run_id="run_flow",
+                    outer_iteration=1,
+                    mode="optimize",
+                    variant_ids=[],
+                    best_variant_id=None,
+                    best_score=0.4,
+                    termination_signal="continue",
+                    plateau_count=0,
+                    completed_at="2026-05-19T10:00:00+00:00",
+                )
+            )
+
+            flow = trajectory_optimizer_flow(store)
+
+        self.assertIn("Post-round entropy introduced", flow)
+        self.assertIn("optimizer_entropy_after_round_1", flow)
+        self.assertIn("Fresh Bandit Literature", flow)
+
+    def test_trajectory_optimizer_flow_flags_missing_post_round_entropy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            store.add_evolution_round(
+                EvolutionRound(
+                    run_id="run_flow_missing",
+                    outer_iteration=1,
+                    mode="optimize",
+                    variant_ids=[],
+                    best_variant_id=None,
+                    best_score=0.4,
+                    termination_signal="continue",
+                    plateau_count=0,
+                    completed_at="2026-05-19T10:00:00+00:00",
+                )
+            )
+
+            flow = trajectory_optimizer_flow(store)
+
+        self.assertIn("Missing post-round entropy", flow)
+        self.assertIn("expected optimizer_entropy_after_round_1", flow)
+
     def test_eval_cli_can_select_specific_eval_ids(self) -> None:
         parser = build_eval_parser()
         args = parser.parse_args(["--suite", "preflight", "--eval", "research_uses_at_least_four_source_families"])
@@ -1525,6 +1753,115 @@ class EvaluationHarnessTest(unittest.TestCase):
 
         self.assertEqual(score, 0.75)
         self.assertFalse(passed)
+
+    def test_model_style_graders_emit_dag_right_wrong_judgments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            store.progress_path.write_text("<promise>complete</promise>\n", encoding="utf-8")
+            store.write_report(
+                "# Summary\nFindings cite source evidence and claims. "
+                "The synthesis includes caveats, limitations, confidence, and recommendations. "
+                "This report discusses source quality and evidence across enough detail to be judged. " * 4
+            )
+            source = store.add_source(
+                Source(
+                    url="https://example.test/paper",
+                    title="Grounded Research",
+                    author="A. Reviewer",
+                    date="2026-05-19",
+                    source_type="paper",
+                    summary="Evidence.",
+                    relevance_score=0.9,
+                    credibility_score=0.9,
+                )
+            )
+            claim = store.add_claim(
+                Claim(
+                    text="Grounded claims are supported by sources.",
+                    source_ids=[source.id],
+                    confidence=0.9,
+                    support_level="strong",
+                    created_by_agent="test",
+                    run_id="run",
+                )
+            )
+            store.add_hypothesis(
+                Hypothesis(
+                    text="Independent retrieval checks improve evidence reliability over single-pass summaries.",
+                    supporting_claim_ids=[claim.id],
+                    contradicting_claim_ids=[],
+                    confidence=0.8,
+                    novelty_score=0.9,
+                    testability_score=0.9,
+                    next_experiment="Compare one-pass and multi-pass retrieval on citation accuracy.",
+                    run_id="run",
+                )
+            )
+            store.add_variant_evaluation(
+                VariantEvaluation(
+                    run_id="run",
+                    variant_id="variant_research",
+                    inner_loop="research",
+                    score=0.9,
+                    metrics={
+                        "factual_accuracy": 0.9,
+                        "citation_accuracy": 0.9,
+                        "completeness": 0.9,
+                        "source_quality": 0.9,
+                        "tool_efficiency": 0.9,
+                    },
+                    judge_scores=[0.9],
+                    summary="research metrics",
+                    passed=True,
+                )
+            )
+            task = EvalTask(
+                id="dag_model",
+                name="DAG model graders",
+                prompt="Research grounded evidence reliability",
+                task_mode="research",
+                success_criteria=[],
+            )
+            graders = default_graders()
+
+            results = [
+                graders["model_report_rubric"].grade(task, store),
+                graders["llm_research_quality_challenger"].grade(task, store),
+                graders["llm_hypothesis_novelty_challenger"].grade(task, store),
+                graders["llm_open_ended_judgment_challenger"].grade(task, store),
+            ]
+
+        for result in results:
+            self.assertEqual(result.grader_type, "model")
+            self.assertTrue(result.assertions)
+            dag = result.assertions[0]
+            self.assertEqual(dag["type"], "deep_acyclic_graph")
+            self.assertIn("right_behaviors", dag)
+            self.assertIn("wrong_behaviors", dag)
+            self.assertIn("nodes", dag)
+            self.assertGreater(len(dag["right_behaviors"]), 0)
+            self.assertIn("Right:", result.summary)
+            self.assertIn("Wrong:", result.summary)
+
+    def test_model_style_dag_graders_negative_control_reports_wrong_behaviors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            store.write_report("Tiny unrelated text.")
+            task = EvalTask(
+                id="dag_model_negative",
+                name="DAG model negative",
+                prompt="Research grounded evidence reliability",
+                task_mode="research",
+                success_criteria=[],
+            )
+
+            result = default_graders()["llm_open_ended_judgment_challenger"].grade(task, store)
+
+        dag = result.assertions[0]
+        self.assertEqual(dag["type"], "deep_acyclic_graph")
+        self.assertFalse(result.passed)
+        self.assertGreater(len(dag["wrong_behaviors"]), 0)
+        self.assertIn("Report appears off-topic.", dag["wrong_behaviors"])
 
 class ArxivRetrieverTest(unittest.TestCase):
     def test_parse_arxiv_feed(self) -> None:
@@ -1813,6 +2150,227 @@ class ArxivRetrieverTest(unittest.TestCase):
         self.assertEqual(top_finding["supporting_claims"][0]["id"], claim.id)
         self.assertEqual(top_finding["supporting_sources"][0]["title"], "Prediction Market Scoring Rules")
         self.assertIn("Risk-aware quoting", seed_variant.metadata["seed_literature"]["claims"][0]["text"])
+
+    def test_code_generation_prompt_sees_optimizer_literature_context(self) -> None:
+        class CapturingLLM:
+            is_live = True
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            model_label = "capturing"
+
+            def __init__(self) -> None:
+                self.user = ""
+
+            def complete_json(self, _system: str, user: str, **_kwargs: object) -> dict[str, object]:
+                self.user = user
+                return {"variants": [{"payload": "use source claim about risk-aware quoting"}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            store.write_optimizer_seed_context(
+                {
+                    "summary": "Risk-aware quoting seed context",
+                    "top_query_findings": [
+                        {
+                            "query": "prediction market strategy risk",
+                            "score": 0.8,
+                            "summary": "Source-backed evidence.",
+                            "supporting_claims": [
+                                {"text": "Risk-aware quoting can reduce loss-making fills.", "confidence": 0.78, "source_ids": ["s1"]}
+                            ],
+                            "supporting_sources": [
+                                {"title": "Prediction Market Scoring Rules", "summary": "Liquidity costs and risk controls.", "source_type": "paper"}
+                            ],
+                        }
+                    ],
+                    "optimizer_instruction": "Use retrieved claims as strategy context.",
+                }
+            )
+            llm = CapturingLLM()
+            outer = EvolutionaryOuterLoop(
+                run_id="run_lit_prompt",
+                goal="optimize strategy",
+                task_mode="optimize",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="length_score",
+                llm=llm,
+            )
+
+            variants = outer._llm_code_variants(1, [], store=store)
+            prompt_payload = json.loads(llm.user)
+
+        self.assertTrue(variants)
+        self.assertIn("optimizer_seed_context", prompt_payload)
+        self.assertIn("Risk-aware quoting can reduce loss-making fills.", json.dumps(prompt_payload))
+        self.assertIn("Prediction Market Scoring Rules", json.dumps(prompt_payload))
+
+    def test_optimizer_rounds_refresh_literature_before_next_code_round(self) -> None:
+        class FakeOptimizeLoop:
+            async def evaluate(self, variants, store):
+                score = 0.4 + (0.1 * len(store.list("evolution_rounds")))
+                return InnerLoopResult(
+                    ranked_evaluations=[
+                        VariantEvaluation(
+                            run_id="run_round_entropy",
+                            variant_id=variants[0].id,
+                            inner_loop="optimize",
+                            score=score,
+                            metrics={},
+                            judge_scores=[score],
+                            summary="fake optimizer result",
+                            passed=False,
+                        )
+                    ],
+                    termination_signal="continue",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            store.write_optimizer_seed_context({"summary": "seed"})
+            outer = EvolutionaryOuterLoop(
+                run_id="run_round_entropy",
+                goal="prediction market challenge",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator=lambda payload: len(payload) / 100.0,
+                evaluator_name="length_score",
+                max_outer_iterations=2,
+                population_size=2,
+            )
+            refresh_reasons: list[str] = []
+
+            async def record_literature(_store, reason):
+                refresh_reasons.append(reason)
+
+            outer._record_literature_grounding = record_literature  # type: ignore[method-assign]
+            asyncio.run(outer._run_generic_optimizer_rounds(store, FakeOptimizeLoop(), [], {"summary": "seed"}))
+
+        self.assertEqual(refresh_reasons, ["optimizer_entropy_after_round_1"])
+
+    def test_prediction_market_entropy_literature_axis_is_chosen_by_llm(self) -> None:
+        class AxisLLM:
+            is_live = True
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            model_label = "axis-llm"
+
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def complete_json(self, _system: str, user: str, **_kwargs: object) -> dict[str, object]:
+                self.prompts.append(user)
+                payload = json.loads(user)
+                reason = str(payload["reason"])
+                return {
+                    "axis": f"LLM selected fresh mechanism for {reason}",
+                    "rationale": "Use a new mechanism instead of a fixed axis.",
+                    "query_terms": ["causal failure mode", "out of sample robustness"],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            llm = AxisLLM()
+            outer = EvolutionaryOuterLoop(
+                run_id="run_query_entropy",
+                goal="prediction market challenge",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="prediction_market",
+                llm=llm,
+            )
+
+            query = outer._literature_grounding_query("prediction_market_entropy_after_round_1", store)
+            traces = store.list("agent_traces")
+
+        self.assertTrue(llm.prompts)
+        self.assertIn("LLM selected fresh mechanism for prediction_market_entropy_after_round_1", query)
+        self.assertIn("causal failure mode", query)
+        self.assertTrue(any(trace.get("agent_name") == "llm_entropy_literature_axis:prediction_market_entropy_after_round_1" for trace in traces))
+
+    def test_prediction_market_entropy_literature_axis_fallback_is_context_derived(self) -> None:
+        outer = EvolutionaryOuterLoop(
+            run_id="run_query_entropy",
+            goal="prediction market challenge",
+            task_mode="optimize_query",
+            source_strategy=[],
+            search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+            evaluator_name="prediction_market",
+        )
+
+        first = outer._literature_grounding_query("prediction_market_entropy_after_round_1")
+        second = outer._literature_grounding_query("prediction_market_entropy_after_round_2")
+
+        self.assertIn("literature", first)
+        self.assertIn("literature", second)
+
+    def test_optimizer_trace_records_score_spread_and_change_summary(self) -> None:
+        from research_harness.run_benchmarks import build_optimizer_trace
+
+        variant = Variant(
+            run_id="run_trace",
+            outer_iteration=1,
+            kind="code",
+            payload="candidate strategy_family=risk_control",
+            parent_ids=[],
+            metadata={
+                "strategy_family": "risk_control",
+                "mechanism_hypothesis": "add guardrail",
+                "entropy_role": "risk_control",
+            },
+        )
+        other = Variant(run_id="run_trace", outer_iteration=1, kind="code", payload="other", parent_ids=[], metadata={})
+        round_record = EvolutionRound(
+            run_id="run_trace",
+            outer_iteration=1,
+            mode="optimize",
+            variant_ids=[variant.id, other.id],
+            best_variant_id=variant.id,
+            best_score=0.7,
+            termination_signal="continue",
+            plateau_count=0,
+        )
+        evaluations = [
+            VariantEvaluation(run_id="run_trace", variant_id=variant.id, inner_loop="optimize", score=0.7, metrics={}, judge_scores=[0.7], summary="", passed=True),
+            VariantEvaluation(run_id="run_trace", variant_id=other.id, inner_loop="optimize", score=0.2, metrics={}, judge_scores=[0.2], summary="", passed=False),
+        ]
+
+        trace = build_optimizer_trace(
+            [round_record.__dict__],
+            [variant.__dict__, other.__dict__],
+            [evaluation.__dict__ for evaluation in evaluations],
+        )
+
+        self.assertAlmostEqual(trace[0]["round_score_spread"], 0.5)
+        self.assertGreater(trace[0]["round_score_stddev"], 0)
+        self.assertIn("family=risk_control", trace[0]["round_change_summary"][0])
+
+    def test_champion_tree_svg_renders_actual_lineage_tree(self) -> None:
+        from research_harness.run_benchmarks import champion_tree_mermaid, champion_tree_svg
+
+        tree = {
+            "global_champion_variant_id": "variant_root",
+            "nodes": [
+                {"id": "variant_root", "outer_iteration": 1, "score": 0.9, "highlight": "global_champion", "is_global_champion": True},
+                {"id": "variant_left", "outer_iteration": 2, "score": 0.7, "highlight": "candidate"},
+                {"id": "variant_right", "outer_iteration": 2, "score": 0.5, "highlight": "round_winner", "is_round_winner": True},
+            ],
+            "edges": [
+                {"from": "variant_root", "to": "variant_left"},
+                {"from": "variant_root", "to": "variant_right"},
+            ],
+        }
+
+        svg = champion_tree_svg(tree)
+        mermaid = champion_tree_mermaid(tree)
+
+        self.assertIn("flowchart TD", mermaid)
+        self.assertIn("<circle", svg)
+        self.assertIn("<path", svg)
+        self.assertIn("#dc2626", svg)
+        self.assertIn("Actual parent-to-child lineage", svg)
 
     def test_prediction_market_optimizer_forces_distinct_rendered_code_across_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2223,7 +2781,7 @@ class PredictionMarketSandboxTest(unittest.TestCase):
     # ------------------------------------------------------------------ happy path
 
     def test_sandbox_noop_strategy_returns_zero_edge(self) -> None:
-        from research_harness.loops import _run_prediction_market_sandbox
+        from research_harness.loops import PREDICTION_MARKET_DEFAULT_SIMULATION_COUNT, _run_prediction_market_sandbox
         with tempfile.TemporaryDirectory() as d:
             result = _run_prediction_market_sandbox(self._strategy_path(d, self._NOOP))
 
@@ -2231,7 +2789,9 @@ class PredictionMarketSandboxTest(unittest.TestCase):
         self.assertFalse(result["official_measured"])
         self.assertEqual(result["score_source"], "local_sandbox_strategy_execution")
         self.assertAlmostEqual(float(result["mean_edge"]), 0.0, places=4)
-        self.assertEqual(int(result["simulations"]), 200)
+        self.assertEqual(int(result["simulations"]), PREDICTION_MARKET_DEFAULT_SIMULATION_COUNT)
+        self.assertTrue(result["paired_crn"])
+        self.assertEqual(result["seed_start"], 0)
         self.assertIn("success_count", result)
         self.assertIn("failure_count", result)
         self.assertIn("actions_seen", result)

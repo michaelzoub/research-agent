@@ -9,6 +9,7 @@ from .trajectory import (
     normalized_trajectory_events,
     outcome_from_store,
     trajectory_graph,
+    trajectory_optimizer_flow,
     trajectory_match,
     write_trajectory_graph_artifacts,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "preflight_eval_suite",
     "select_eval_tasks",
     "trajectory_graph",
+    "trajectory_optimizer_flow",
     "trajectory_match",
     "write_trajectory_graph_artifacts",
 ]

@@ -694,7 +694,8 @@ def _dedupe_by_text(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 def _citation(source: dict[str, object]) -> str:
-    return f"{source['title']} ({source['date']})"
+    suffix = " local corpus fixture, not external literature" if _is_placeholder_source(source) else ""
+    return f"{source['title']} ({source['date']}{suffix})"
 
 
 PREDICTION_MARKET_REPORT_TERMS = {
@@ -884,7 +885,7 @@ def _prediction_market_relevance_score(row: dict[str, object]) -> int:
 
 def _is_placeholder_source(row: dict[str, object]) -> bool:
     text = " ".join(str(value) for value in row.values()).lower()
-    return any(domain in text for domain in ["example.org", "example.com", "example.net", "example.invalid"])
+    return any(domain in text for domain in ["example.org", "example.com", "example.net", "example.edu", "example.invalid"])
 
 
 def _is_prediction_market_artifact(row: dict[str, object]) -> bool:
@@ -1056,13 +1057,19 @@ def _build_report(
 ) -> str:
     source_lookup = {source["id"]: source for source in sources}
     claims_by_id = {claim["id"]: claim for claim in claims}
+    external_sources = _external_report_sources(sources)
+    fixture_sources = [source for source in sources if _is_placeholder_source(source)]
+    source_count_note = (
+        f"{len(external_sources)} externally verifiable; {len(fixture_sources)} local fixture(s)"
+        if fixture_sources else str(len(sources))
+    )
     lines = [
         f"# Research Report: {run.user_goal}",
         "",
         f"- Run ID: `{run.id}`",
         f"- Task type: `{run.task_type}`",
         f"- Completed: {now_iso()}",
-        f"- Sources reviewed: {len(sources)}",
+        f"- Sources reviewed: {source_count_note}",
         f"- Claims extracted: {len(claims)}",
         f"- Hypotheses ranked: {len(hypotheses)}",
         "",
@@ -1082,7 +1089,7 @@ def _build_report(
         citation_text = citations or "No retained source citation"
         lines.append(f"- {claim['text']} Confidence: {claim['confidence']} ({claim['support_level']}). Sources: {citation_text}")
     lines.extend(["", "## Evidence Basis"])
-    for source in sources:
+    for source in external_sources:
         sections = source.get("evidence_sections") if isinstance(source.get("evidence_sections"), dict) else {}
         available = [name for name in ["abstract", "introduction", "conclusion"] if sections.get(name)]
         if available:
@@ -1090,6 +1097,11 @@ def _build_report(
             lines.append(f"- {_citation(source)} supplied {', '.join(available)} evidence. {available[0].title()}: {preview}")
         else:
             lines.append(f"- {_citation(source)} supplied summary-only evidence; claims from this source should remain low-confidence.")
+    if fixture_sources:
+        lines.append(
+            f"- {len(fixture_sources)} local corpus fixture(s) contributed deterministic demo evidence. "
+            "They are not external literature and are listed separately below without source links."
+        )
     lines.extend(["", "## Hypothesis Evidence Matrix"])
     for hypothesis in hypotheses:
         supporting = [
@@ -1125,8 +1137,16 @@ def _build_report(
     else:
         lines.append("- No open questions were created.")
     lines.extend(["", "## Sources"])
-    for source in sources:
-        lines.append(f"- [{source['title']}]({source['url']}) by {source['author']} ({source['date']})")
+    if external_sources:
+        for source in external_sources:
+            lines.append(f"- [{source['title']}]({source['url']}) by {source['author']} ({source['date']})")
+    else:
+        lines.append("- No externally verifiable sources were retained for this report.")
+    if fixture_sources:
+        lines.extend(["", "## Local Corpus Fixtures"])
+        lines.append("- The following records are bundled offline fixtures for deterministic demos/tests, not external sources:")
+        for source in fixture_sources:
+            lines.append(f"- {source['title']} by {source['author']} ({source['date']}); source_type={source.get('source_type', 'unknown')}")
     return "\n".join(lines) + "\n"
 
 
@@ -1218,7 +1238,7 @@ def _fabricated_source_urls(report: str, sources: list[dict[str, object]]) -> li
     report_urls = re.findall(r"\]\((https?://[^)]+)\)", report)
     report_urls.extend(re.findall(r"\\url\{([^}]+)\}", report))
     for url in report_urls:
-        if "example.org" in url or "example.com" in url:
+        if any(domain in url for domain in ["example.org", "example.com", "example.net", "example.edu", "example.invalid"]):
             fabricated.append(url)
         elif url not in known_urls:
             fabricated.append(url)
@@ -1235,6 +1255,8 @@ def _build_latex_report(
 ) -> str:
     source_lookup = {source["id"]: source for source in sources}
     claims_by_id = {claim["id"]: claim for claim in claims}
+    external_sources = _external_report_sources(sources)
+    fixture_sources = [source for source in sources if _is_placeholder_source(source)]
     title = _latex_escape(run.user_goal)
     lines = [
         r"\documentclass[11pt]{article}",
@@ -1259,7 +1281,9 @@ def _build_latex_report(
     lines.extend([
         r"\end{itemize}",
         r"\section{Evidence Base}",
-        f"Reviewed {_latex_escape(str(len(sources)))} sources and extracted {_latex_escape(str(len(claims)))} grounded claims.",
+        f"Reviewed {_latex_escape(str(len(external_sources)))} externally verifiable sources"
+        + (f" and {_latex_escape(str(len(fixture_sources)))} local corpus fixtures" if fixture_sources else "")
+        + f"; extracted {_latex_escape(str(len(claims)))} grounded claims.",
         r"\section{Key Claims}",
         r"\begin{enumerate}[leftmargin=*]",
     ])
@@ -1271,7 +1295,7 @@ def _build_latex_report(
             + f" \\textit{{Confidence: {_latex_escape(str(claim.get('confidence', '')))}; sources: {_latex_escape(citations or 'none retained')}}}."
         )
     lines.extend([r"\end{enumerate}", r"\section{Paper Context Read By The Agent}", r"\begin{itemize}[leftmargin=*]"])
-    for source in sources[:12]:
+    for source in external_sources[:12]:
         sections = source.get("evidence_sections") if isinstance(source.get("evidence_sections"), dict) else {}
         available = [name for name in ["abstract", "introduction", "conclusion"] if sections.get(name)]
         preview = str(sections.get(available[0], ""))[:500] if available else str(source.get("summary", ""))[:300]
@@ -1282,6 +1306,13 @@ def _build_latex_report(
             + _latex_escape(", ".join(available) if available else "summary-only")
             + ". "
             + _latex_escape(preview)
+        )
+    if fixture_sources:
+        lines.append(
+            r"\item "
+            + _latex_escape(
+                f"{len(fixture_sources)} local corpus fixture(s) contributed deterministic demo evidence; these are not external literature."
+            )
         )
     lines.extend([r"\end{itemize}", r"\section{Hypothesis Evidence Matrix}", r"\begin{itemize}[leftmargin=*]"])
     for hypothesis in hypotheses[:12]:
@@ -1317,8 +1348,10 @@ def _build_latex_report(
             lines.append(r"\item " + _latex_escape(str(question.get("question", ""))))
         lines.append(r"\end{itemize}")
     lines.extend([r"\section{References}", r"\begin{enumerate}[leftmargin=*]"])
-    for source in sources:
+    for source in external_sources:
         lines.append(r"\item " + _latex_escape(_plain_citation(source)) + r" \url{" + _latex_url(str(source.get("url", ""))) + r"}")
+    if fixture_sources:
+        lines.append(r"\item " + _latex_escape("Local corpus fixtures were omitted from References because they are not external sources."))
     lines.extend([r"\end{enumerate}", r"\end{document}", ""])
     return "\n".join(lines)
 
@@ -1488,7 +1521,12 @@ def _report_preview_png(
 
 
 def _plain_citation(source: dict[str, object]) -> str:
-    return f"{source.get('title', '')} ({source.get('date', '')})"
+    suffix = " local corpus fixture, not external literature" if _is_placeholder_source(source) else ""
+    return f"{source.get('title', '')} ({source.get('date', '')}{suffix})"
+
+
+def _external_report_sources(sources: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [source for source in sources if not _is_placeholder_source(source)]
 
 
 def _latex_escape(text: str) -> str:

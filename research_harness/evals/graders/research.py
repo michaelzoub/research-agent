@@ -7,6 +7,7 @@ import re
 from ...store import ArtifactStore
 from ..types import EvalTask, GraderResult
 from .common import _result
+from .dag import dag_grader_result, dag_node, right_wrong, verdict_from_score
 
 
 TOOL_SOURCE_FAMILIES = {
@@ -316,16 +317,36 @@ def _grade_report_rubric(task: EvalTask, store: ArtifactStore) -> GraderResult:
     has_research_rubric_metrics = bool(research_metrics) and all(
         dimension in research_metrics[0] for dimension in rubric_dimensions
     )
-    rubric_checks = [
-        ("has_summary", "summary" in report.lower() or "findings" in report.lower()),
-        ("mentions_sources", "source" in report.lower()),
-        ("mentions_uncertainty", any(term in report.lower() for term in ["uncertain", "caveat", "contradiction", "limitation"])),
-        ("has_research_rubric_metrics", has_research_rubric_metrics),
-        ("substantial_length", len(report.split()) >= 80),
+    lower = report.lower()
+    has_summary = "summary" in lower or "findings" in lower
+    mentions_sources = "source" in lower
+    mentions_uncertainty = any(term in lower for term in ["uncertain", "caveat", "contradiction", "limitation"])
+    has_synthesis = any(term in lower for term in ["synthesis", "recommendation", "takeaway", "findings"])
+    length_score = min(1.0, len(report.split()) / 80.0)
+    nodes = [
+        _binary_node("report_summary", "Does the report expose summary/findings?", has_summary, "Report contains summary/findings.", "Report lacks a clear summary/findings section."),
+        _binary_node("evidence_mentions", "Does the report discuss sources/evidence?", mentions_sources, "Report names source/evidence basis.", "Report does not discuss source/evidence basis."),
+        _binary_node("uncertainty_handling", "Does the report handle uncertainty or limitations?", mentions_uncertainty, "Report includes uncertainty, caveats, contradictions, or limitations.", "Report omits uncertainty/limitation handling."),
+        _binary_node("research_metrics", "Did the research loop emit rubric dimensions?", has_research_rubric_metrics, "Research metrics include expected rubric dimensions.", "Research metrics are absent or incomplete."),
+        dag_node(
+            "substance",
+            "Is the report substantial enough to judge?",
+            verdict_from_score(length_score),
+            length_score,
+            right=["Report has enough substance for review."] if length_score >= 0.7 else [],
+            wrong=["Report is too short for reliable model-style judgment."] if length_score < 0.7 else [],
+            evidence={"word_count": len(report.split()), "has_synthesis": has_synthesis},
+        ),
     ]
-    score = sum(1 for _, passed in rubric_checks if passed) / len(rubric_checks)
-    passed = score >= 0.7
-    return _result("model_report_rubric", "model", "deterministic rubric scoring", score, passed, 0.8, "Local model-style rubric scored the report.", [{"check": name, "passed": passed} for name, passed in rubric_checks])
+    return dag_grader_result(
+        "model_report_rubric",
+        "model",
+        "DAG model-style report rubric",
+        nodes=nodes,
+        weight=0.8,
+        threshold=0.7,
+        summary="DAG judge scored report structure, evidence, uncertainty, research metrics, and substance.",
+    )
 
 
 def _grade_llm_research_quality_challenger(task: EvalTask, store: ArtifactStore) -> GraderResult:
@@ -346,25 +367,41 @@ def _grade_llm_research_quality_challenger(task: EvalTask, store: ArtifactStore)
         "completeness": max(float(first_metrics.get("completeness", 0.0)), min(1.0, len(report.split()) / 180.0)),
         "source_quality": max(float(first_metrics.get("source_quality", 0.0)), min(1.0, len(sources) / 4.0)),
     }
-    score = sum(dimensions.values()) / len(dimensions)
-    passed = score >= 0.7
-    return _result(
+    nodes = []
+    labels = {
+        "factual_accuracy": ("Are claims grounded in retained artifacts?", "Claims are grounded in source artifacts.", "Claims are weakly grounded or unsupported."),
+        "citation_accuracy": ("Are citations/source links attached to claims?", "Claims retain citation/source IDs.", "Claims lack citation/source IDs."),
+        "completeness": ("Does the report cover the task with enough depth?", "Report has enough depth for the prompt.", "Report is shallow or incomplete."),
+        "source_quality": ("Did the run retain enough credible source material?", "Run retained multiple source artifacts.", "Run retained too little source material."),
+    }
+    for name, value in dimensions.items():
+        criteria, right, wrong = labels[name]
+        nodes.append(
+            dag_node(
+                name,
+                criteria,
+                verdict_from_score(value),
+                value,
+                right=[right] if value >= 0.7 else [],
+                wrong=[wrong] if value < 0.7 else [],
+                evidence={"metric": round(value, 3)},
+            )
+        )
+    return dag_grader_result(
         "llm_research_quality_challenger",
         "model",
-        "LLM challenger research-quality rubric",
-        score,
-        passed,
-        0.8,
-        "Model-style challenger rated research quality across factual accuracy, citation accuracy, completeness, and source quality.",
-        [{"dimension": name, "score": round(value, 3), "passed": value >= 0.7} for name, value in dimensions.items()],
+        "DAG LLM challenger research-quality rubric",
+        nodes=nodes,
+        weight=0.8,
+        threshold=0.7,
+        summary="DAG judge rated research quality across factual grounding, citation accuracy, completeness, and source quality.",
     )
 
 
 def _grade_llm_hypothesis_novelty_challenger(task: EvalTask, store: ArtifactStore) -> GraderResult:
     hypotheses = store.list("hypotheses")
     claims = {str(claim.get("text", "")).strip().lower() for claim in store.list("claims")}
-    assertions: list[dict[str, Any]] = []
-    scores: list[float] = []
+    nodes: list[dict[str, Any]] = []
     for hypothesis in hypotheses:
         text = str(hypothesis.get("text", "")).strip()
         novelty_score = float(hypothesis.get("novelty_score", 0.0) or 0.0)
@@ -372,28 +409,41 @@ def _grade_llm_hypothesis_novelty_challenger(task: EvalTask, store: ArtifactStor
         has_test = bool(hypothesis.get("next_experiment"))
         length_ok = len(text.split()) >= 6
         score = (novelty_score * 0.5) + (0.2 if not_copy else 0.0) + (0.2 if has_test else 0.0) + (0.1 if length_ok else 0.0)
-        scores.append(min(1.0, score))
-        assertions.append(
-            {
-                "hypothesis_id": hypothesis.get("id"),
-                "question": "Is this hypothesis novel?",
-                "novelty_score": novelty_score,
-                "not_claim_copy": not_copy,
-                "has_next_experiment": has_test,
-                "passed": score >= 0.7,
-            }
+        right = []
+        wrong = []
+        if not_copy:
+            right.append("Hypothesis is not a direct copy of a claim.")
+        else:
+            wrong.append("Hypothesis copies an existing claim.")
+        if has_test:
+            right.append("Hypothesis includes a next experiment.")
+        else:
+            wrong.append("Hypothesis lacks a next experiment.")
+        if length_ok:
+            right.append("Hypothesis is specific enough to inspect.")
+        else:
+            wrong.append("Hypothesis is too short/generic.")
+        nodes.append(
+            dag_node(
+                str(hypothesis.get("id") or f"hypothesis_{len(nodes) + 1}"),
+                "Is this hypothesis novel, specific, and testable?",
+                verdict_from_score(score),
+                min(1.0, score),
+                right=right,
+                wrong=wrong,
+                evidence={"novelty_score": novelty_score, "text": text[:160]},
+            )
         )
-    score = sum(scores) / max(len(scores), 1)
-    passed = bool(hypotheses) and score >= 0.7
-    return _result(
+    if not nodes:
+        nodes.append(dag_node("has_hypotheses", "Did the run create hypotheses?", "missing", 0.0, wrong=["No hypotheses were created."]))
+    return dag_grader_result(
         "llm_hypothesis_novelty_challenger",
         "model",
-        "LLM challenger hypothesis novelty rubric",
-        score,
-        passed,
-        0.6,
-        f"Model-style challenger judged novelty for {len(hypotheses)} hypothesis/hypotheses.",
-        assertions or [{"check": "has_hypotheses", "passed": False}],
+        "DAG LLM challenger hypothesis novelty rubric",
+        nodes=nodes,
+        weight=0.6,
+        threshold=0.7,
+        summary=f"DAG judge rated novelty and testability for {len(hypotheses)} hypothesis/hypotheses.",
     )
 
 
@@ -402,23 +452,33 @@ def _grade_llm_open_ended_judgment_challenger(task: EvalTask, store: ArtifactSto
     progress = store.progress_path.read_text(encoding="utf-8") if store.progress_path.exists() else ""
     lower_report = report.lower()
     checks = [
-        ("answers_user_prompt", any(term in lower_report for term in _keywords(task.prompt, limit=8))),
-        ("uses_evidence_language", any(term in lower_report for term in ["source", "claim", "evidence", "citation"])),
-        ("handles_uncertainty", any(term in lower_report for term in ["uncertain", "limitation", "caveat", "contradiction", "confidence"])),
-        ("has_synthesis", any(term in lower_report for term in ["summary", "synthesis", "findings", "recommendation"])),
-        ("run_reached_terminal_marker", "<promise>complete</promise>" in progress.lower() or "stopped with" in progress.lower()),
+        ("answers_user_prompt", "Does the report answer the user prompt?", any(term in lower_report for term in _keywords(task.prompt, limit=8)), "Report uses prompt-relevant terms.", "Report appears off-topic."),
+        ("uses_evidence_language", "Does the report use evidence language?", any(term in lower_report for term in ["source", "claim", "evidence", "citation"]), "Report discusses source/claim/evidence/citation.", "Report does not show evidence use."),
+        ("handles_uncertainty", "Does the report handle uncertainty?", any(term in lower_report for term in ["uncertain", "limitation", "caveat", "contradiction", "confidence"]), "Report handles uncertainty or limits.", "Report does not handle uncertainty or limits."),
+        ("has_synthesis", "Does the report synthesize?", any(term in lower_report for term in ["summary", "synthesis", "findings", "recommendation"]), "Report includes synthesis/findings.", "Report lacks synthesis/findings."),
+        ("run_reached_terminal_marker", "Did the run reach a terminal marker?", "<promise>complete</promise>" in progress.lower() or "stopped with" in progress.lower(), "Progress records completion or explicit stop.", "Progress lacks completion/stop marker."),
     ]
-    score = sum(1 for _, passed in checks if passed) / len(checks)
-    passed = score >= 0.7
-    return _result(
+    nodes = [_binary_node(node_id, criteria, passed, right, wrong) for node_id, criteria, passed, right, wrong in checks]
+    return dag_grader_result(
         "llm_open_ended_judgment_challenger",
         "model",
-        "LLM challenger open-ended judgment",
-        score,
-        passed,
-        0.6,
-        "Model-style challenger made an open-ended judgment on relevance, evidence use, uncertainty, synthesis, and terminal progress.",
-        [{"check": name, "passed": passed} for name, passed in checks],
+        "DAG LLM challenger open-ended judgment",
+        nodes=nodes,
+        weight=0.6,
+        threshold=0.7,
+        summary="DAG judge made an open-ended judgment on relevance, evidence use, uncertainty, synthesis, and terminal progress.",
+    )
+
+
+def _binary_node(node_id: str, criteria: str, passed: bool, right: str, wrong: str) -> dict[str, Any]:
+    right_items, wrong_items = right_wrong(passed, right, wrong)
+    return dag_node(
+        node_id,
+        criteria,
+        "yes" if passed else "no",
+        1.0 if passed else 0.0,
+        right=right_items,
+        wrong=wrong_items,
     )
 
 

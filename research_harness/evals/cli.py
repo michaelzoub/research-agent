@@ -42,6 +42,25 @@ def main() -> None:
     print(f"Eval suite: {summary.suite_name}")
     print(f"Trials: {summary.passed_trials}/{summary.trial_count} passed")
     print(f"Aggregate score: {summary.aggregate_score:.3f}")
+    for trial in summary.trials:
+        status = "PASS" if trial.get("passed") else "FAIL"
+        print(
+            f"- {trial.get('task_id')} trial {trial.get('trial_index')}: "
+            f"{float(trial.get('aggregate_score') or 0.0):.3f} {status}"
+        )
+        for grader in trial.get("grader_results", []):
+            if grader.get("grader_type") != "model":
+                continue
+            print(f"  - {grader.get('grader_id')}: {float(grader.get('score') or 0.0):.3f}")
+            for assertion in grader.get("assertions", []):
+                if assertion.get("type") != "deep_acyclic_graph":
+                    continue
+                right = assertion.get("right_behaviors") or []
+                wrong = assertion.get("wrong_behaviors") or []
+                if right:
+                    print(f"    right: {'; '.join(str(item) for item in right[:3])}")
+                if wrong:
+                    print(f"    wrong: {'; '.join(str(item) for item in wrong[:3])}")
     print(f"Summary: {args.output / (suite.id + '_summary.json')}")
 
 

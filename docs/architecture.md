@@ -1,220 +1,279 @@
-# Project Architecture
+# Research Harness Architecture
 
-This project treats each product option as an agent in the conventional sense:
+`research-harness` is a local agent harness for research, optimization, and
+challenge-solving runs. The core design rule is:
 
 ```text
 agent = model + harness
 ```
 
-The model is the inference component. The harness is the loop, tools,
-evaluators, artifact store, budgets, traces, stopping rules, and orchestration
-policy that make the model act on a task.
+The model is `LLMClient` or a compatible client. The harness is everything that
+makes the model act reliably: routing, loops, tools, evaluators, artifact store,
+budgets, traces, PRD state, stopping rules, and benchmark/eval reporting.
+
+## Repository Map
+
+| Path | Role |
+| --- | --- |
+| `autore`, `autore-bench` | Thin shell entrypoints for the CLI and benchmark runner. |
+| `research_harness/cli.py` | Interactive and flag-driven CLI; creates `HarnessConfig` and starts the orchestrator. |
+| `research_harness/orchestrator.py` | Top-level run coordinator: planning, product-agent routing, PRD tasks, source strategy, sessions, finalization. |
+| `research_harness/loops.py` | Runtime loop core: routing, research/query loops, optimization loops, prediction-market challenge logic, plateau/entropy policies, output rendering. |
+| `research_harness/loop_routing.py` | Evaluator registry and task/product-agent routing. |
+| `research_harness/loop_evaluators.py` | Evaluator result dataclass and normalization/JSON failure helpers. |
+| `research_harness/loop_objectives.py` | Objective parsing and optimization-result objective metadata. |
+| `research_harness/loop_utils.py` | Shared loop utilities for tracing, score history, context terms, summaries, and support labels. |
+| `research_harness/agents.py` | Role-agent workers: literature, hypothesis, critic, synthesis, and harness debugger. |
+| `research_harness/search.py` | Retriever abstraction and backends for local corpus, academic APIs, web/docs/social/code, memory, and Alchemy. |
+| `research_harness/store.py` | File-backed artifact store plus SQLite world-model mirror and provenance edges. |
+| `research_harness/schemas.py` | Dataclasses for runs, PRD tasks, variants, evaluations, claims, traces, costs, and research plans. |
+| `research_harness/llm.py` | Live OpenAI/Anthropic/local fallback model client, token/cost accounting, JSON completion wrapper. |
+| `research_harness/run_benchmarks.py` | Per-run benchmark summaries, Mermaid/SVG/PNG/HTML/Notebook artifacts, optimizer and champion visualizations. |
+| `research_harness/benchmark.py` | Cross-run benchmark dashboard generation. |
+| `research_harness/evals/` | Black-box eval harness, suites, trajectory matching, and graders. |
+| `challenges/prediction_market/` | Lightweight local prediction-market evaluator adapter. |
+| `challenges/prediction-market-challenge/` | Vendored/upstream-style orderbook prediction-market challenge runner. |
+| `prompts/` | Prompt templates for role agents. |
+| `skills/` | Local Codex skills that encode project invariants and workflows. |
+| `services/` | Notes for external service directions. |
+| `docs/` | Architecture, schema docs, and diagram generation scripts/assets. |
 
 ## Product Agents
 
-There are three product agents:
+The product agent is first-class and separate from the runtime loop mode.
 
-| Product agent | Runtime loop mode | Primary objective |
+| Product agent | Main modes | Purpose |
 | --- | --- | --- |
-| `research` | `research` | Find papers/data, extract claims, synthesize grounded reports. |
-| `optimize` | `optimize` or `optimize_query` | Improve a candidate against deterministic tests/evaluators. |
-| `challenge` | `optimize_query` plus `optimize` | Solve benchmark/challenge tasks with proxy and official graders. |
+| `research` | `research` | Retrieve evidence, extract claims, generate hypotheses, critique, and synthesize reports. |
+| `optimize` | `optimize`, `optimize_query` | Improve candidates against deterministic evaluators/tests. |
+| `challenge` | `optimize_query` then `optimize` | Use the optimization core with challenge specs, proxy/official scoring, and solution rendering. |
 
-`optimize` and `challenge` intentionally share the same optimization core. A
-challenge is an optimization task with extra contract requirements: challenge
-specs, solution rendering, optional official runner integration, and challenge
-specific graders.
+`optimize` and `challenge` share the optimization core. A challenge run is an
+optimization run with extra contracts: challenge-specific evaluator, candidate
+containment, `solution.py` mirroring when needed, official-run metadata, and
+challenge graders.
 
-Every run writes a `prd.json`. The PRD records the selected product agent,
-runtime mode, agent-harness definition, ordered tasks, acceptance criteria, and
-artifact paths.
-
-## Three-Loop Architecture
-
-The harness runs three nested loops:
-
-```text
-Outer loop  — Session (sessions.py)
-              Manages context isolation and parallel agent runs.
-              Resets state between runs so each agent starts clean.
-
-Middle loop — EvolutionaryOuterLoop (loops.py)
-              Proposes and evaluates variants across N outer iterations.
-              Drives research (query variants → retrieve → score) or
-              optimize (code variants → evaluator → score).
-
-Inner loop  — Ralph loop (orchestrator._run_loop + agent harness)
-              The agent harness: model + loop policy + tools + store.
-              Picks next story (passes: false) from prd.json.
-              Executes it via research or optimization agent.
-              Updates prd.json (passes: true) and appends progress.txt.
-              Repeats until all stories pass or iteration budget exhausted.
-```
+## Runtime Flow
 
 ```mermaid
 flowchart TD
-  prd["prd.json\nUS-001..US-N\npasses: false"] --> pick["Pick next story\npasses: false"]
-  pick --> exec["Execute story\nresearch / optimize agent"]
-  exec --> commit["EvolutionaryOuterLoop\npropose variants → evaluate → rank"]
-  commit --> update["Update prd.json\npasses: true"]
-  update --> log["Append progress.txt\nsave learnings"]
-  log --> more{"More stories?"}
-  more -->|yes| pick
-  more -->|no| done["Done\nAll stories complete"]
-```
+  user["User goal / CLI flags"] --> cli["research_harness.cli"]
+  cli --> config["HarnessConfig"]
+  config --> orch["Orchestrator"]
 
-## System Diagram
+  orch --> prior["Prior run memory"]
+  orch --> plan["ResearchPlan"]
+  orch --> strategy["SourceStrategy"]
+  orch --> store["ArtifactStore"]
+  orch --> prd["prd.json"]
+  orch --> router["TaskRouter"]
 
-The visual architecture/roadmap diagram is available at
-[`docs/assets/research_harness_architecture_phases_3_7.svg`](assets/research_harness_architecture_phases_3_7.svg).
+  router --> research["Research product agent"]
+  router --> optimize["Optimize product agent"]
+  router --> challenge["Challenge product agent"]
 
-```mermaid
-flowchart LR
-  user["User goal / CLI flags"] --> cli["CLI\nresearch_harness.cli"]
-  cli --> config["HarnessConfig\nmode, retriever, evaluator, LLM, budgets"]
-  config --> orchestrator["Agent Orchestrator\nresearch_harness.orchestrator"]
+  research --> evo["EvolutionaryOuterLoop"]
+  optimize --> evo
+  challenge --> evo
 
-  orchestrator --> plan["ResearchPlan + SourceStrategy\nclassify goal, choose sources"]
-  orchestrator --> run["RunRecord\nstatus, task_mode, product_agent"]
-  orchestrator --> store["ArtifactStore\nJSON tables + traces + PRD"]
-  orchestrator --> router["TaskRouter\nselect product agent + loop mode"]
+  evo --> inner_research["ResearchLoop"]
+  evo --> inner_query["OptimizationQueryLoop"]
+  evo --> inner_opt["OptimizeLoop / challenge evaluator"]
 
-  router -->|research| research_agent["Research Agent\nmodel + research loop harness"]
-  router -->|optimize| optimize_agent["Optimize Agent\nmodel + optimization loop harness"]
-  router -->|challenge| challenge_agent["Challenge Agent\noptimization harness + challenge contracts"]
+  inner_research --> store
+  inner_query --> store
+  inner_opt --> store
 
-  research_agent --> loop_research["ResearchLoop\nquery variants -> retrieve -> claims -> score"]
-  optimize_agent --> loop_optimize["OptimizeLoop\ncandidate variants -> evaluator -> score"]
-  challenge_agent --> loop_challenge["OptimizationQueryLoop -> OptimizeLoop\nstrategy research -> seed context -> candidate score"]
-
-  loop_research --> store
-  loop_optimize --> store
-  loop_challenge --> store
-
-  orchestrator --> roles["Role agents\nLiterature, Hypothesis, Critic, Synthesis, Debugger"]
+  orch --> roles["Role agents"]
   roles --> store
-  store --> artifacts["Artifacts\nprd.json, progress.txt, trace.jsonl,\nvariants, evaluations, report, solution"]
+
+  store --> outputs["Report, PRD, traces, variants, scores, optimized code, benchmarks"]
 ```
 
-## Agent Harness Internals
+The orchestrator owns run lifecycle. It creates the plan and store, writes the
+initial PRD, dispatches to the selected runtime mode, catches interrupts into a
+partial synthesis flow, records cost, generates run benchmarks, and updates the
+final PRD.
+
+## Three Loop Model
+
+The current code has three nested control concepts:
+
+| Loop | Implementation | Responsibility |
+| --- | --- | --- |
+| Session loop | `sessions.py`, `Orchestrator._start_session_store` | Context isolation and optional cross-run session memory. |
+| PRD/Ralph loop | `Orchestrator._run_loop` and loop-task helpers | Pick incomplete PRD tasks, execute them, update `prd.json`, append `progress.txt`, stop on task completion or budget. |
+| Evolutionary loop | `EvolutionaryOuterLoop` in `loops.py` | Propose query/code variants, evaluate, rank, select parents, detect plateau, introduce entropy, and persist best artifacts. |
 
 ```mermaid
 flowchart TD
-  agent["Product Agent"] --> model["Model\nLLMClient live or local fallback"]
-  agent --> harness["Harness Loop"]
-  agent --> tools["Tools\nretrievers, evaluators, challenge runners"]
-  agent --> state["State\nArtifactStore"]
-  agent --> policy["Policy\nbudget, stopping rules, plateau detection"]
-  agent --> trace["Trajectory\nAgentTrace, progress, loop iterations"]
-
-  harness --> propose["Propose variants or tasks"]
-  propose --> parallel{"Can run in parallel?"}
-  parallel -->|yes| fanout["asyncio.gather\nparallel agents or evaluations"]
-  parallel -->|no| sequential["dependency-ordered execution"]
-  fanout --> evaluate["Evaluate / score / extract evidence"]
-  sequential --> evaluate
-  evaluate --> rank["Rank, select, or synthesize"]
-  rank --> stop{"Threshold, plateau, or task complete?"}
-  stop -->|continue| propose
-  stop -->|stop| output["Persist outcome artifacts"]
-
-  model <--> harness
-  tools <--> harness
-  state <--> harness
-  trace --> state
-  output --> state
+  session["Session / output root"] --> prdloop["PRD loop"]
+  prdloop --> pick["Pick next LoopTask"]
+  pick --> evo["EvolutionaryOuterLoop"]
+  evo --> propose["Propose variants"]
+  propose --> evaluate["Evaluate in inner loop"]
+  evaluate --> rank["Rank and select parents"]
+  rank --> entropy{"Continue?"}
+  entropy -->|yes| refresh["LLM-selected literature entropy / steering"]
+  refresh --> propose
+  entropy -->|no| artifacts["Persist outputs"]
+  artifacts --> prdloop
+  prdloop --> done["All PRD stories pass or budget ends"]
 ```
 
-## Evaluation Harness
+## Orchestrator
 
-The evaluation harness runs the product agents as black-box systems and grades
-their trajectories and outcomes.
+`HarnessConfig` contains the run policy: mode, retriever, iteration budget,
+product-agent knobs, evaluator name, challenge preset, optimizer population,
+parent count, evaluator parallelism, plateau patience, LLM provider/model,
+sessions, and steering.
 
-```mermaid
-flowchart TD
-  eval_harness["EvaluationHarness"] --> suite["EvalSuite"]
-  suite --> task["EvalTask\nprompt, product expectation, mode,\nevaluator, success criteria, graders"]
-  task --> trial1["EvalTrial 1"]
-  task --> trial2["EvalTrial N"]
+`Orchestrator.run()` performs the main lifecycle:
 
-  trial1 --> isolated["Isolated output root + TMPDIR"]
-  isolated --> orchestrator["Production Orchestrator"]
-  orchestrator --> agent_harness["Selected Product Agent Harness"]
-  agent_harness --> trajectory["Trajectory\nprogress, trace, agent_traces, artifacts"]
-  trajectory --> outcome["Outcome\nstatus, product_agent, best score,\nreport/solution existence"]
+1. Load prior run memory from completed output directories.
+2. Build a `ResearchPlan` with goal interpretation, task type, topics, and
+   source strategy hints.
+3. Choose source backends from the plan and retriever config.
+4. Create `RunRecord`, session state, and `ArtifactStore`.
+5. Write initial `prd.json`.
+6. Run deterministic, standard/fanout, or evolutionary/loop mode.
+7. On interrupt, synthesize partial artifacts instead of losing the run.
+8. Finalize status, cost, PRD, benchmark visuals, and run metadata.
 
-  outcome --> graders["Graders"]
-  trajectory --> graders
-  graders --> aggregate["Aggregate score + pass/fail"]
+The challenge preset adjusts defaults: at least 20 iterations unless the user
+explicitly capped them, optimizer population at least 48, query research fan-out
+default 16, parent count at least 4, wider evaluator parallelism, and continued
+optimization on plateau.
+
+## Loops
+
+`loops.py` remains the public compatibility surface for loop-related symbols and
+the home of the large runtime loop classes. Several helper concerns have been
+split out already:
+
+| Module | Responsibility |
+| --- | --- |
+| `loop_routing.py` | `EvaluatorRegistry`, `TaskRouter`, optimization-query routing hints, product-agent routing. |
+| `loop_evaluators.py` | `EvaluatorResult`, evaluator payload normalization, exception-to-result conversion, JSON result shaping. |
+| `loop_objectives.py` | Profit/score objective extraction and objective metadata for run outputs. |
+| `loop_utils.py` | Timing traces, trace component mapping, score history, JSON evaluator response extraction, context terms, support levels, shortening. |
+
+The remaining `loops.py` concerns are:
+
+| Concern | Current symbols |
+| --- | --- |
+| Inner loops | `ResearchLoop`, `OptimizationQueryLoop`, `OptimizeLoop`, `InnerLoopResult`. |
+| Outer loop | `EvolutionaryOuterLoop`, parent selection, continuation decisions, PRD-facing output. |
+| Plateau/entropy | `PlateauDetector`, `DirectionSpec`, forced directions, LLM entropy-axis selection, recovery metadata. |
+| Optimization artifacts | best candidate selection, `optimized_candidate.txt`, `optimal_code.py`, `optimization_result.json`. |
+| Prediction-market challenge | upstream path discovery, sandbox/local/official scoring, candidate rendering, solution mirroring. |
+
+The loop policy is not a predefined trajectory. For optimizer/challenge runs,
+the harness grounds before optimization, evaluates a round, and if the run
+continues it asks the LLM to choose a fresh literature-search axis from the
+goal, score history, recent literature, and user steering. That literature
+context is then included in the next code-generation prompt.
+
+## Should `loops.py` Be Split?
+
+Yes. The first compatibility-preserving extraction has moved routing, evaluator
+normalization, objective parsing, and shared utilities into dedicated modules.
+`loops.py` is still large because it holds inner loops, the evolutionary outer
+loop, entropy policy, optimization output rendering, and prediction-market
+adapter code. A good next target shape:
+
+| New module | Move from `loops.py` |
+| --- | --- |
+| `inner_loops.py` | `InnerLoop`, `ResearchLoop`, `OptimizationQueryLoop`, `OptimizeLoop`, `InnerLoopResult`. |
+| `evolution.py` | `EvolutionaryOuterLoop` orchestration, parent selection, continuation decisions, output dispatch. |
+| `entropy.py` | `PlateauDetector`, `DirectionSpec`, forced directions, LLM entropy-axis policy, recovery helpers. |
+| `optimization_outputs.py` | best-candidate rendering and universal optimization artifact contract. |
+| `prediction_market_adapter.py` | challenge-specific solution rendering and official/local/sandbox scoring. |
+
+Recommended sequence:
+
+1. Keep `research_harness.loops` re-exporting public names so existing imports
+   and tests keep working.
+2. Move prediction-market adapter next; it has the clearest remaining boundary.
+3. Move inner loops, then entropy, then the outer loop last.
+4. Only after extraction, consider renaming public imports in callers.
+
+## Role Agents
+
+`agents.py` defines worker agents used by the orchestrator and synthesis flow:
+
+| Agent | Writes |
+| --- | --- |
+| `LiteratureAgent` | Sources and claims from planned search work. |
+| `HypothesisAgent` | Hypotheses, experiments, and open questions. |
+| `CriticAgent` | Contradictions, challenged claims, and failed paths. |
+| `SynthesisAgent` | `final_report.md`, LaTeX/PDF/preview artifacts where possible. |
+| `HarnessDebuggerAgent` | Failure diagnoses and proposed harness changes. |
+
+These are role workers inside the harness, not standalone product agents. The
+product agent is still the model plus the loop/tool/store policy around them.
+
+## Retrieval Layer
+
+`search.py` exposes a `SearchBackend` interface and concrete retrievers:
+
+- `LocalCorpusSearch` for offline deterministic tests and demos.
+- `ArxivSearch`, `OpenAlexSearch`, and `SemanticScholarSearch` for papers.
+- `GitHubSearch`, `WebSearch`, `DocsBlogsSearch`, and `SocialWebSearch` for
+  implementation, web, docs/blog, and social evidence.
+- `AlchemySearch` for blockchain data.
+- `WikipediaSearch` for broad background.
+- `PriorArtifactMemorySearch` for previous run outputs.
+
+Backends return `CorpusDocument` records. The store converts them into `Source`
+and `Claim` artifacts, with provenance edges and dedupe.
+
+## Artifact Store And World Model
+
+Each run writes append-friendly JSON collections inside `outputs/<run_id>/`.
+`ArtifactStore` also mirrors records into `world_model.sqlite` under the output
+root. The SQLite mirror supports cross-run dedupe, provenance queries, and
+observability.
+
+Important artifacts:
+
+| Artifact | Meaning |
+| --- | --- |
+| `prd.json` | Product agent, task mode, agent-harness definition, tasks, status, acceptance criteria, artifact paths. |
+| `progress.txt` | Human-readable step log. |
+| `trace.jsonl`, `agent_traces.json` | Timing, prompts, model labels, tool calls, errors, and failure localization. |
+| `sources.json`, `claims.json`, `hypotheses.json` | Research world model for a run. |
+| `variants.json`, `variant_evaluations.json`, `evolution_rounds.json` | Optimization/research loop trajectory. |
+| `loop_continuation_decisions.json` | Explicit continue/exit decisions and reasons. |
+| `optimizer_seed_context.json` | Research findings used to steer optimizer code generation. |
+| `optimized_candidate.txt`, `optimal_code.py`, `optimization_result.json` | Universal optimization output contract. |
+| `solution.py` | Optional challenge-specific runnable mirror. |
+| `champion_tree.*` | Parent-child lineage and current champion visualization. |
+| `run_benchmark.*`, `agent_timeline.*`, `decision_dag.*` | Run inspection and visualization artifacts. |
+| `cost.json`, `cost_events.json` | Token/cost accounting. |
+| `harness_diagnosis.json`, `harness_changes.json` | Failure taxonomy and proposed harness improvements. |
+
+## PRD Contract
+
+Every product-agent run writes `prd.json`. The run tasks are normalized into
+user-story-shaped records:
+
+```json
+{
+  "id": "US-001",
+  "title": "Concrete task title",
+  "acceptanceCriteria": ["Observable criterion"],
+  "passes": false
+}
 ```
 
-## Product Agent Details
+The PRD also records selected `product_agent`, selected runtime `task_mode`,
+agent-harness definition, artifact paths, source strategy, stopping rules, and
+progress. The PRD is updated after task execution and again during finalization.
 
-### Research Agent
+## Optimization And Challenge Outputs
 
-```text
-input goal
-  -> route product_agent=research, loop_mode=research
-  -> propose query variants
-  -> run retrievers, possibly in parallel
-  -> write sources and claims
-  -> score evidence coverage/corroboration/credibility
-  -> generate hypotheses
-  -> critique contradictions
-  -> synthesize final_report.md
-```
-
-### Optimize Agent
-
-```text
-input goal + evaluator
-  -> route product_agent=optimize
-  -> choose optimize or optimize_query loop
-  -> propose candidate variants
-  -> evaluate with deterministic evaluator/tests
-  -> rank by score
-  -> write optimized_candidate.txt, optimal_code.py, and optimization_result.json
-```
-
-### Challenge Agent
-
-```text
-input challenge goal + challenge evaluator
-  -> route product_agent=challenge, loop_mode=optimize_query
-  -> research challenge strategies
-  -> write optimizer_seed_context.json
-  -> propose candidate strategies
-  -> evaluate local proxy
-  -> render optimal_code.py for the selected strategy
-  -> mirror to solution.py when a challenge adapter supports that upstream filename
-  -> record official_result.measured=false until official runner executes
-```
-
-## Optimize And Challenge Relationship
-
-`optimize` and `challenge` should stay fused at the loop/evaluator layer:
-
-```text
-Optimization core = propose candidates + evaluate + rank + stop + persist best
-```
-
-Challenge mode should remain a product-agent specialization:
-
-```text
-Challenge specialization = optimization core
-  + challenge spec
-  + proxy evaluator
-  + optional official evaluator
-  + solution renderer
-  + challenge-specific graders
-```
-
-That keeps the implementation simple without erasing the product distinction
-that matters to users and eval reporting.
-
-## Optimization Output Contract
-
-Every optimization or challenge run that executes an evaluator must write:
+Any run that executes an optimization evaluator must emit:
 
 ```text
 optimized_candidate.txt
@@ -222,6 +281,105 @@ optimal_code.py
 optimization_result.json
 ```
 
-`optimization_result.json` must include `optimal_code_path`. Challenge-specific
-artifacts such as `solution.py` are allowed, but they are additional artifacts,
-not replacements for `optimal_code.py`.
+`optimization_result.json` includes score details, `candidate_path`, and
+`optimal_code_path`. Challenge adapters may additionally write `solution.py`,
+but `solution.py` is never a substitute for `optimal_code.py`.
+
+Prediction-market challenge scoring has three paths:
+
+1. Official upstream runner when `PREDICTION_MARKET_USE_UPSTREAM=1`.
+2. Local sandbox strategy execution.
+3. Local semantic fallback if execution is unavailable.
+
+The cheap default prediction-market protocol uses paired common-random-number
+style metadata: the same seed range across variants, 24 simulations by default,
+and metrics that state whether the score is official, sandboxed, eligible, or
+unmeasured.
+
+## Evaluation Harness
+
+`research_harness/evals/` treats the production harness as a black box.
+
+```mermaid
+flowchart TD
+  suite["EvalSuite"] --> task["EvalTask"]
+  task --> harness["EvaluationHarness"]
+  harness --> trial["Isolated EvalTrial"]
+  trial --> orch["Production Orchestrator"]
+  orch --> artifacts["Run artifacts"]
+  artifacts --> graders["Graders"]
+  graders --> summary["EvalRunSummary"]
+```
+
+The suites cover core flows, edge cases, and preflight gates. Graders check
+outcomes, PRD completion, trajectory shape, loop behavior, optimizer artifacts,
+prediction-market containment/status, research groundedness, source diversity,
+and LLM-style quality judgments.
+
+`trajectory.py` produces normalized trajectory events and graphs. Its optimizer
+flow helper checks that continued rounds have post-round entropy evidence, not
+just a label.
+
+## Benchmark And Visualization Layer
+
+`run_benchmarks.py` generates per-run inspection artifacts:
+
+- timeline/Gantt views from agent traces,
+- decision DAGs,
+- optimizer flow diagrams,
+- score spread/stddev summaries,
+- champion lineage graphs,
+- run benchmark HTML/Markdown/Notebook outputs.
+
+`benchmark.py` aggregates many run directories into CSV, JSON, and HTML
+dashboards under `benchmarks/`.
+
+## Sessions, Steering, And Memory
+
+`sessions.py` stores project/session records under a session projects directory.
+The orchestrator can resume or fork session context.
+
+`steering.py` starts a background terminal input loop. During a run, `/article`,
+`/steer`, and `/note` are appended to an inbox. `ArtifactStore` ingests pending
+steering into sources/claims before proposal rounds so user input can affect the
+next iteration.
+
+Prior run memory is loaded from previous outputs and summarized into directions
+to avoid, unresolved directions, open questions, and prior report hints.
+
+## LLM And Model Selection
+
+`LLMClient` supports:
+
+- OpenAI,
+- Anthropic,
+- `auto`,
+- `all-configured` round-robin across available configured models,
+- local deterministic fallback.
+
+All model calls record prompt/completion token estimates or provider usage,
+estimated cost, model label, provider, status, and errors. JSON completions use
+`complete_json()`, which raises `LLMError` if the response is not valid JSON.
+
+## Diagnostics And Harness Evolution
+
+`diagnostics.py` classifies failures by component and category, compares trace
+patterns to prior runs, and scores proposed harness changes.
+`HarnessDebuggerAgent` writes `harness_changes.json` records. Evals and tests
+guard against reward-hacking patterns such as fabricated sources, missing best
+code artifacts, hyperparameter-only plateau recovery, and candidate leakage into
+the repository root.
+
+## Tests
+
+Primary local verification:
+
+```bash
+python3 -m unittest tests.test_smoke
+python3 -m unittest tests.test_terminal_bench
+python3 -m research_harness.evals --suite core --trials 1
+```
+
+`tests/test_smoke.py` is the broad contract suite. `tests/test_terminal_bench.py`
+checks terminal-bench adapter contracts, with live Harbor/Docker checks gated by
+environment variables.

@@ -78,7 +78,11 @@ Prediction-market challenge:
 ```
 
 Set `PREDICTION_MARKET_USE_UPSTREAM=1` to score through the real upstream CLI
-instead of the local proxy.
+instead of the local proxy. Prediction-market optimization defaults to a cheap
+paired-CRN protocol: 24 simulations, the same seed range for every variant, and
+JSON metrics explaining the result. Use `PREDICTION_MARKET_SIMULATIONS` and
+`PREDICTION_MARKET_SEED_START` when you intentionally want a larger or shifted
+batch.
 
 ## First Run
 

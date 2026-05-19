@@ -793,6 +793,7 @@ class SmokeTest(unittest.TestCase):
             self.assertTrue(store.run_benchmark_path.exists())
             self.assertTrue(store.decision_dag_path.exists())
             self.assertTrue(store.agent_timeline_path.exists())
+            self.assertTrue(store.agent_timeline_svg_path.exists())
             self.assertTrue((store.root / "run_benchmark_summary.json").exists())
             self.assertIn("<promise>COMPLETE</promise>", store.progress_path.read_text(encoding="utf-8"))
 
@@ -2286,7 +2287,9 @@ class ArxivRetrieverTest(unittest.TestCase):
             traces = store.list("agent_traces")
 
         self.assertTrue(llm.prompts)
-        self.assertIn("LLM selected fresh mechanism for prediction_market_entropy_after_round_1", query)
+        self.assertLessEqual(len(query), 180)
+        self.assertIn("llm selected fresh", query)
+        self.assertIn("prediction_market_entropy_after_round_1", query)
         self.assertIn("causal failure mode", query)
         self.assertTrue(any(trace.get("agent_name") == "llm_entropy_literature_axis:prediction_market_entropy_after_round_1" for trace in traces))
 

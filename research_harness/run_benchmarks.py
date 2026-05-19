@@ -295,7 +295,7 @@ def _timeline_chart_lane(role: str, human_label: str) -> Optional[str]:
     if role == "llm_thinking":
         return "Main LLM calls"
     if role == "optimize_evaluator":
-        return "Optimizer evaluation"
+        return human_label
     if role == "search_literature":
         return "Role agent: literature"
     if role == "hypothesis_generation":
@@ -407,7 +407,7 @@ def _build_timeline_spans(
     return spans, num_rows, total_ms
 
 
-def _gantt_svg(spans: list[dict[str, Any]], num_rows: int, total_ms: int) -> str:
+def _gantt_svg(spans: list[dict[str, Any]], num_rows: int, total_ms: int, *, max_rows: Optional[int] = 40) -> str:
     if not spans or total_ms <= 0:
         return (
             '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 80" width="100%" '
@@ -424,7 +424,7 @@ def _gantt_svg(spans: list[dict[str, Any]], num_rows: int, total_ms: int) -> str
     BAR_H     = 18
     ROW_H     = 26
     AXIS_H    = 34
-    MAX_ROWS  = 40
+    MAX_ROWS  = num_rows if max_rows is None else max_rows
     BOT_PAD   = 38 if num_rows > MAX_ROWS else 28  # caption (+ optional overflow line)
 
     display_rows  = min(num_rows, MAX_ROWS)
@@ -734,6 +734,7 @@ def write_run_benchmarks(store: ArtifactStore) -> None:
     spans, num_rows, total_ms = _build_timeline_spans(summary, for_agent_chart=True)
     dag_svg = decision_dag_svg(summary)
     timeline_svg = _gantt_svg(spans, num_rows, total_ms)
+    timeline_svg_full = _gantt_svg(spans, num_rows, total_ms, max_rows=None)
     optimizer_trace = summary.get("optimizer_trace") or []
     optimizer_flow = optimizer_flow_mermaid(summary)
     optimizer_flow_svg_text = optimizer_flow_svg(summary)
@@ -742,6 +743,7 @@ def write_run_benchmarks(store: ArtifactStore) -> None:
     champion_tree_svg_text = champion_tree_svg(champion_tree)
     (store.root / "decision_dag.mmd").write_text(dag, encoding="utf-8")
     (store.root / "optimizer_trace.json").write_text(json.dumps(optimizer_trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    store.agent_timeline_svg_path.write_text(timeline_svg_full, encoding="utf-8")
     (store.root / "optimizer_flow.mmd").write_text(optimizer_flow, encoding="utf-8")
     (store.root / "optimizer_flow.svg").write_text(optimizer_flow_svg_text, encoding="utf-8")
     store.champion_tree_mermaid_path.write_text(champion_tree_graph, encoding="utf-8")
@@ -1864,6 +1866,7 @@ def run_benchmark_html(summary: dict[str, Any]) -> str:
   <h2>Agent Timeline</h2>
   <div class="gantt-card">
     <div class="legend">{legend}</div>
+    <p class="muted"><a href="agent_timeline.svg">Open full SVG timeline</a></p>
     <img src="agent_timeline.png" alt="Agent timeline" style="width:100%;display:block;">
   </div>
 

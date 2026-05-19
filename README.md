@@ -114,7 +114,7 @@ The most useful files are:
 | `cost.json` | Model usage and estimated cost. |
 | `failed_paths.json` | Failed attempts, causes, and retryability. |
 | `progress.txt` | Step-by-step log of what happened. |
-| `agent_timeline.png` | Visual timing trace of agents/evaluators. |
+| `agent_timeline.png`, `agent_timeline.svg` | Visual timing trace of agents/evaluators; SVG keeps every row for full-size inspection. |
 | `harness_changes.json` | Proposed harness improvements for future evolutionary-agent work. |
 
 ## Selection-Based Setup
@@ -188,7 +188,7 @@ Each run creates `outputs/<NNN>_run_<slug>/`.
 | `cost.json` | Per-run model usage totals and estimated cost. |
 | `failed_paths.json` | Failed paths, causes, severity, and retryability. |
 | `progress.txt` | Human-readable progress log. |
-| `agent_timeline.png` | Agent/evaluator timing visual. |
+| `agent_timeline.png`, `agent_timeline.svg` | Agent/evaluator timing visual; SVG keeps every row for full-size inspection. |
 | `harness_changes.json` | Candidate harness improvements for future evolutionary-agent iterations. |
 | `optimization_result.json` | Best score, candidate path, evaluator metadata, and official-result status. |
 | `champion_tree.json` / `champion_tree.png` | Champion lineage data and graph for optimization runs. |

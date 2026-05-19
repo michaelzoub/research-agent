@@ -1425,7 +1425,8 @@ class EvolutionaryOuterLoop:
             return
         started = time.perf_counter()
         started_at = now_iso()
-        query = self._literature_grounding_query(reason, store)
+        queries = self._literature_grounding_queries(reason, store)
+        query = queries[0] if queries else self.goal
         strategy_index = 0
         if any(token in reason for token in ["plateau", "entropy_after_round"]) and self.source_strategy:
             strategy_index = min(len(self.source_strategy) - 1, self._recovery_retriever_index % len(self.source_strategy))
@@ -1434,15 +1435,39 @@ class EvolutionaryOuterLoop:
         retriever_name = item.retriever if item else "local"
         limit = min(3, item.limit if item else 3)
         notes: list[str] = []
-        store.append_progress(f"Literature grounding ({reason}): searching {retriever_name} for existing evidence")
-        try:
-            backend = self.search_factory(retriever_name)
-            results = await asyncio.to_thread(backend.search, query, limit)
-        except Exception as exc:
-            notes.append(f"{retriever_name} failed ({type(exc).__name__}: {exc})")
-            store.append_progress(f"Retriever fallback: {retriever_name} failed during literature grounding: {type(exc).__name__}: {exc}")
+        retrievers = [retriever_name]
+        for fallback in _retriever_fallbacks(retriever_name):
+            if fallback not in retrievers:
+                retrievers.append(fallback)
+        results: list[tuple[object, float]] = []
+        backend: Optional[SearchBackend] = None
+        selected_query = query
+        selected_retriever = retriever_name
+        store.append_progress(
+            f"Literature grounding ({reason}): searching {retriever_name} for existing evidence; query='{query}'"
+        )
+        for candidate_query in queries:
+            if results:
+                break
+            for candidate_retriever in retrievers:
+                try:
+                    candidate_backend = self.search_factory(candidate_retriever)
+                    candidate_results = await _search_backend_with_retry(candidate_backend, candidate_query, limit)
+                except Exception as exc:
+                    notes.append(f"{candidate_retriever} failed ({type(exc).__name__}: {exc})")
+                    store.append_progress(
+                        f"Retriever fallback: {candidate_retriever} failed during literature grounding: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if candidate_results:
+                    backend = candidate_backend
+                    results = candidate_results
+                    selected_query = candidate_query
+                    selected_retriever = candidate_retriever
+                    break
+                notes.append(f"{candidate_retriever} returned 0 for '{candidate_query}'")
+        if backend is None:
             backend = self.search_factory("local")
-            results = await asyncio.to_thread(backend.search, query, limit)
         sources = []
         for document, relevance in results[:limit]:
             source = store.add_source(backend.to_source(document, relevance))
@@ -1460,27 +1485,39 @@ class EvolutionaryOuterLoop:
                 )
             )
         store.append_progress(
-            f"Literature grounding ({reason}): query='{query}' retrieved {len(sources)} source(s)"
+            f"Literature grounding ({reason}): retriever={selected_retriever} query='{selected_query}' retrieved {len(sources)} source(s)"
             + (f"; notes={' ; '.join(notes)}" if notes else "")
         )
         _record_timing_trace(
             store,
             self.run_id,
-            agent_name=f"memory:literature_grounding:{reason}",
-            role="memory",
-            prompt=query,
+            agent_name=f"literature_grounding:{reason}",
+            role="literature_grounding_policy",
+            prompt=selected_query,
             model="deterministic-memory-policy",
             started_at=started_at,
             started=started,
-            status="completed",
+            status="completed" if sources else "failed",
             output_summary=f"Grounded optimization context with {len(sources)} source(s).",
+            errors=[] if sources else notes[:6],
         )
 
     def _literature_grounding_query(self, reason: str, store: Optional[ArtifactStore] = None) -> str:
+        queries = self._literature_grounding_queries(reason, store)
+        return queries[0] if queries else self.goal
+
+    def _literature_grounding_queries(self, reason: str, store: Optional[ArtifactStore] = None) -> list[str]:
         if self.evaluator_name == "prediction_market" and any(token in reason for token in ["plateau", "stall", "entropy_after_round"]):
             base_query = _prediction_market_plateau_literature_query(store)
             entropy_axis = self._llm_literature_entropy_axis(reason, store)
-            return f"{base_query} {entropy_axis}".strip()
+            return _dedupe_literature_queries(
+                [
+                    _compact_literature_query(f"literature mechanism {entropy_axis} {base_query}", max_terms=12),
+                    _compact_literature_query(f"literature mechanism {entropy_axis}", max_terms=10),
+                    _compact_literature_query(base_query, max_terms=10),
+                    _compact_literature_query(self.goal, max_terms=8),
+                ]
+            )
         context_parts = [self.goal, reason.replace("_", " ")]
         if store:
             for item in _score_history(store, mode="optimize", limit=3):
@@ -1489,8 +1526,10 @@ class EvolutionaryOuterLoop:
             context_parts.extend(_recent_literature_grounding_notes(store, limit=3))
             context_parts.extend(_recent_user_steering_notes(store, limit=3))
         context_parts.append(self._llm_literature_entropy_axis(reason, store))
-        terms = _context_terms(" ".join(context_parts), limit=28)
-        return " ".join(terms) if terms else self.goal
+        compact = _compact_literature_query(" ".join(context_parts), max_terms=12)
+        axis = _compact_literature_query(context_parts[-1], max_terms=8)
+        goal = _compact_literature_query(self.goal, max_terms=8)
+        return _dedupe_literature_queries([compact, axis, goal])
 
     def _llm_literature_entropy_axis(self, reason: str, store: Optional[ArtifactStore]) -> str:
         if "entropy_after_round" not in reason and "plateau" not in reason and "stall" not in reason:
@@ -1651,11 +1690,29 @@ class EvolutionaryOuterLoop:
         store: ArtifactStore,
         round_index: int,
     ) -> VariantEvaluation:
-        code = self._render_optimal_code(variant.payload)
+        started = time.perf_counter()
+        started_at = now_iso()
         candidate_path = store.candidates_dir / f"round_{round_index:02d}_{variant.id}.py"
-        candidate_path.write_text(code, encoding="utf-8")
-        store.append_progress(f"  Candidate eval start {variant.id}: {candidate_path}")
-        result = await asyncio.to_thread(_run_prediction_market_official, candidate_path)
+        try:
+            code = self._render_optimal_code(variant.payload)
+            candidate_path.write_text(code, encoding="utf-8")
+            store.append_progress(f"  Candidate eval start {variant.id}: {candidate_path}")
+            result = await asyncio.to_thread(_run_prediction_market_official, candidate_path)
+        except Exception as exc:
+            _record_timing_trace(
+                store,
+                self.run_id,
+                agent_name=f"prediction_market_evaluator:round_{round_index}:{variant.id}",
+                role="optimize_evaluator",
+                prompt=variant.payload,
+                model="prediction-market-official-evaluator",
+                started_at=started_at,
+                started=started,
+                status="failed",
+                output_summary=f"Prediction-market candidate {variant.id} failed before producing a score.",
+                errors=[f"{type(exc).__name__}: {exc}"],
+            )
+            raise
         edge = float(result.get("mean_edge", 0.0))
         score_eligible = bool(result.get("score_eligible", result.get("official_measured", False)))
         score = _normalize_prediction_market_edge(edge) if score_eligible else 0.0
@@ -1665,6 +1722,21 @@ class EvolutionaryOuterLoop:
         store.append_progress(f"  Candidate eval done {variant.id}: mean_edge={edge:.3f} score={score:.3f} eligible={score_eligible}")
         score_source = str(result.get("score_source", "unknown"))
         measured_label = "upstream orderbook-pm" if result.get("official_measured") else "local challenge fallback"
+        _record_timing_trace(
+            store,
+            self.run_id,
+            agent_name=f"prediction_market_evaluator:round_{round_index}:{variant.id}",
+            role="optimize_evaluator",
+            prompt=variant.payload,
+            model="prediction-market-official-evaluator",
+            started_at=started_at,
+            started=started,
+            status="completed" if score_eligible else "failed",
+            output_summary=(
+                f"{measured_label} mean_edge={edge:.3f}; score={score:.3f}; "
+                f"score_source={score_source}; eligible={score_eligible}."
+            ),
+        )
         return VariantEvaluation(
             run_id=self.run_id,
             variant_id=variant.id,
@@ -3154,6 +3226,36 @@ def _retriever_fallbacks(retriever_name: str) -> list[str]:
     return ["local"]
 
 
+def _compact_literature_query(text: str, *, max_terms: int = 12, max_chars: int = 180) -> str:
+    terms = _context_terms(text, limit=max_terms)
+    query = " ".join(terms).strip()
+    if not query:
+        query = _shorten(" ".join(str(text).split()), max_chars)
+    if len(query) <= max_chars:
+        return query
+    compact_terms: list[str] = []
+    current = ""
+    for term in query.split():
+        candidate = f"{current} {term}".strip()
+        if len(candidate) > max_chars:
+            break
+        compact_terms.append(term)
+        current = candidate
+    return " ".join(compact_terms) if compact_terms else _shorten(query, max_chars)
+
+
+def _dedupe_literature_queries(queries: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        normalized = " ".join(query.split()).strip()
+        key = normalized.lower()
+        if normalized and key not in seen:
+            deduped.append(normalized)
+            seen.add(key)
+    return deduped
+
+
 async def _search_backend_with_retry(backend: SearchBackend, query: str, limit: int) -> list[tuple[object, float]]:
     attempts = 2 if _is_live_retriever(backend.tool_name) else 1
     for attempt in range(attempts):
@@ -3819,4 +3921,3 @@ def _params_from_strategy_text(strategy_text: str) -> dict[str, object]:
         "skew_divisor": max(1.0, float(values.get("skew_divisor", 8.0))),
         "quote_mode": mode_match.group(1) if mode_match else "contextual",
     }
-

@@ -289,6 +289,7 @@ def _print_run_summary(run, store, *, output_func: Callable[[str], None] = print
         ("world db", store.sqlite_path),
         ("decision dag", store.decision_dag_path),
         ("timeline", store.agent_timeline_path),
+        ("timeline svg", store.agent_timeline_svg_path),
     ]
     output_func("")
     output_func(_paint("Open first", "teal", enabled=use_color))

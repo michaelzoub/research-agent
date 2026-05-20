@@ -114,6 +114,7 @@ def default_eval_suite() -> EvalSuite:
                     "optimization_code_artifact",
                     "prediction_market_solution",
                     "prediction_market_proxy_score",
+                    "prediction_market_agentic_optimizer",
                     "plateau_entropy_exploration",
                     "transcript_progress",
                     "isolation_clean_trial",

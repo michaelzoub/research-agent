@@ -10,6 +10,7 @@ import tempfile
 import textwrap
 import unittest
 import unittest.mock
+import urllib.error
 from pathlib import Path
 
 from challenges.prediction_market import prediction_market_score
@@ -73,9 +74,12 @@ class SmokeTest(unittest.TestCase):
             self.assertIn("anthropic/claude-opus-4-6", choices)
             self.assertIn("anthropic/claude-sonnet-4-6", choices)
             self.assertIn("openai/gpt-5.2", choices)
+            self.assertIn("kimi/kimi-k2.6", choices)
             self.assertIn("anthropic/claude-sonnet-4-5", choices)
             self.assertEqual(resolve_model_selection("auto", "anthropic/claude-sonnet-4-5"), ("anthropic", "claude-sonnet-4-5"))
             self.assertEqual(resolve_model_selection("auto", "openai/gpt-5.2"), ("openai", "gpt-5.2"))
+            self.assertEqual(resolve_model_selection("auto", "kimi/kimi-k2.6"), ("kimi", "kimi-k2.6"))
+            self.assertEqual(resolve_model_selection("openai", "kimi/kimi-k2.6"), ("kimi", "kimi-k2.6"))
             self.assertEqual(resolve_model_selection("auto", "all-configured"), ("multi", "all-configured"))
 
         with unittest.mock.patch.dict(os.environ, {"RESEARCH_HARNESS_LLM_MODELS": "openai/custom-a,local/local-deterministic-fallback"}, clear=False):
@@ -92,6 +96,86 @@ class SmokeTest(unittest.TestCase):
 
         self.assertEqual(client.provider, "anthropic")
         self.assertEqual(client.model, "claude-sonnet-4-5")
+        self.assertTrue(client.is_live)
+
+    def test_llm_client_uses_moonshot_key_for_kimi_model(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"MOONSHOT_API_KEY": "moonshot-test", "OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": ""}, clear=False):
+            client = LLMClient(provider="auto", model="kimi/kimi-k2.6")
+
+        self.assertEqual(client.provider, "kimi")
+        self.assertEqual(client.model, "kimi-k2.6")
+        self.assertTrue(client.is_live)
+
+    def test_kimi_requests_force_temperature_one(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": "ok"}}], "usage": {}}).encode("utf-8")
+
+        def fake_urlopen(request, timeout=0):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with unittest.mock.patch.dict(os.environ, {"MOONSHOT_API_KEY": "moonshot-test"}, clear=False):
+            client = LLMClient(provider="kimi", model="kimi-k2.6")
+            with unittest.mock.patch("urllib.request.urlopen", fake_urlopen):
+                client.complete("system", "user", temperature=0.2)
+
+        self.assertEqual(captured["payload"]["temperature"], 1)
+
+    def test_kimi_retries_rate_limit(self) -> None:
+        calls = {"count": 0}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": "ok"}}], "usage": {}}).encode("utf-8")
+
+        def fake_urlopen(_request, timeout=0):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise urllib.error.HTTPError(
+                    url="https://api.moonshot.ai/v1/chat/completions",
+                    code=429,
+                    msg="rate limited",
+                    hdrs={"Retry-After": "0"},
+                    fp=io.BytesIO(b'{"error":{"message":"rate limit"}}'),
+                )
+            return FakeResponse()
+
+        with unittest.mock.patch.dict(os.environ, {"MOONSHOT_API_KEY": "moonshot-test"}, clear=False):
+            client = LLMClient(provider="kimi", model="kimi-k2.6")
+            with unittest.mock.patch("urllib.request.urlopen", fake_urlopen), unittest.mock.patch("time.sleep", lambda _seconds: None):
+                response = client.complete("system", "user")
+
+        self.assertEqual(response.text, "ok")
+        self.assertEqual(calls["count"], 3)
+
+    def test_llm_client_loads_kimi_key_from_env_local_defaults(self) -> None:
+        from research_harness import llm as llm_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_local = Path(directory) / ".env.local"
+            env_local.write_text("MOONSHOT_API_KEY=moonshot-from-file\n", encoding="utf-8")
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(unittest.mock.patch.object(llm_module, "_ENV_DEFAULTS_LOADED", False))
+                    stack.enter_context(unittest.mock.patch.object(llm_module, "Path", lambda value="": env_local if value == ".env.local" else Path(directory) / str(value)))
+                    client = LLMClient(provider="kimi", model="kimi-k2.6")
+
+        self.assertEqual(client.kimi_api_key, "moonshot-from-file")
         self.assertTrue(client.is_live)
 
     def test_llm_client_all_configured_round_robins_available_models(self) -> None:
@@ -794,6 +878,8 @@ class SmokeTest(unittest.TestCase):
             self.assertTrue(store.decision_dag_path.exists())
             self.assertTrue(store.agent_timeline_path.exists())
             self.assertTrue(store.agent_timeline_svg_path.exists())
+            self.assertTrue(store.score_improvement_path.exists())
+            self.assertTrue(store.score_improvement_svg_path.exists())
             self.assertTrue((store.root / "run_benchmark_summary.json").exists())
             self.assertIn("<promise>COMPLETE</promise>", store.progress_path.read_text(encoding="utf-8"))
 
@@ -1495,6 +1581,8 @@ class EvaluationHarnessTest(unittest.TestCase):
         self.assertTrue(any("literature_grounding_present" in task.grader_ids for task in suite.tasks))
         self.assertTrue(any("trajectory_match_modes" in task.grader_ids for task in suite.tasks))
         self.assertTrue(any("graph_trajectory_match" in task.grader_ids for task in suite.tasks))
+        challenge_task = next(task for task in default_eval_suite().tasks if task.id == "challenge_prediction_market")
+        self.assertIn("prediction_market_agentic_optimizer", challenge_task.grader_ids)
 
     def test_preflight_eval_suite_defines_source_diversity_gate(self) -> None:
         suite = preflight_eval_suite()
@@ -1741,6 +1829,133 @@ class EvaluationHarnessTest(unittest.TestCase):
             self.assertFalse(graders["prediction_market_solution"]["passed"])
             self.assertIn("isolation_clean_trial", graders)
             self.assertTrue(graders["isolation_clean_trial"]["passed"])
+
+    def test_prediction_market_agentic_optimizer_grader_uses_real_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            task = EvalTask(
+                id="pm_agentic",
+                name="PM agentic optimizer",
+                prompt="Optimize prediction market strategy",
+                task_mode="optimize_query",
+                evaluator_name="prediction_market",
+                success_criteria=[],
+            )
+            step_payload = [
+                {
+                    "round_index": 2,
+                    "reflection": "negative mean_edge stayed flat, so change the strategy mechanism instead of nudging parameters",
+                    "literature_required": True,
+                    "actions": [
+                        {"tool": "read_champion", "status": "completed"},
+                        {"tool": "read_failures", "status": "completed"},
+                        {"tool": "read_evaluator_summary", "status": "completed"},
+                        {"tool": "compare_variants", "status": "completed"},
+                        {"tool": "fetch_literature", "status": "completed"},
+                        {"tool": "propose_strategy", "status": "completed"},
+                    ],
+                }
+            ]
+            (store.root / "optimization_agent_steps.json").write_text(json.dumps(step_payload), encoding="utf-8")
+            round_one = Variant(
+                run_id="run_pm_agentic",
+                outer_iteration=1,
+                kind="code",
+                payload="pm_strategy=wide_passive spread=12 size=0.2",
+                parent_ids=[],
+                metadata={},
+            )
+            round_two = Variant(
+                run_id="run_pm_agentic",
+                outer_iteration=2,
+                kind="code",
+                payload="pm_strategy=flow_gate optimizer_agent_next_mechanism='new flow toxicity gate' PlaceOrder filled_quantity",
+                parent_ids=[round_one.id],
+                metadata={},
+            )
+            store.add_variant(round_one)
+            store.add_variant(round_two)
+            store.add_variant_evaluation(
+                VariantEvaluation(
+                    run_id="run_pm_agentic",
+                    variant_id=round_one.id,
+                    inner_loop="optimize",
+                    score=0.49,
+                    metrics={"mean_edge": -0.2, "score_eligible": True},
+                    judge_scores=[0.49],
+                    summary="negative mean_edge",
+                    passed=False,
+                )
+            )
+            store.add_trace(
+                AgentTrace(
+                    run_id="run_pm_agentic",
+                    agent_name="llm_propose_prediction_market_code:round_2",
+                    role="llm_thinking",
+                    prompt='{"optimizer_agent_context": {}, "literature_refresh_notes": ["paper claim"]}',
+                    model="local",
+                    tools_used=[],
+                    tool_calls=[],
+                    token_usage=0,
+                    runtime_ms=1,
+                    status="completed",
+                    errors=[],
+                    output_summary="proposed",
+                )
+            )
+
+            result = default_graders()["prediction_market_agentic_optimizer"].grade(task, store)
+
+        self.assertTrue(result.passed)
+
+    def test_prediction_market_agentic_optimizer_grader_rejects_loop_only_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            task = EvalTask(
+                id="pm_agentic_negative",
+                name="PM agentic optimizer negative",
+                prompt="Optimize prediction market strategy",
+                task_mode="optimize_query",
+                evaluator_name="prediction_market",
+                success_criteria=[],
+            )
+            round_one = Variant(
+                run_id="run_pm_loop_only",
+                outer_iteration=1,
+                kind="code",
+                payload="pm_strategy=same spread=10 size=0.5 PlaceOrder",
+                parent_ids=[],
+                metadata={},
+            )
+            round_two = Variant(
+                run_id="run_pm_loop_only",
+                outer_iteration=2,
+                kind="code",
+                payload="pm_strategy=same spread=10 size=0.5 PlaceOrder",
+                parent_ids=[round_one.id],
+                metadata={},
+            )
+            store.add_variant(round_one)
+            store.add_variant(round_two)
+            store.add_variant_evaluation(
+                VariantEvaluation(
+                    run_id="run_pm_loop_only",
+                    variant_id=round_one.id,
+                    inner_loop="optimize",
+                    score=0.49,
+                    metrics={"mean_edge": -0.2, "score_eligible": True},
+                    judge_scores=[0.49],
+                    summary="negative mean_edge",
+                    passed=False,
+                )
+            )
+
+            result = default_graders()["prediction_market_agentic_optimizer"].grade(task, store)
+
+        self.assertFalse(result.passed)
+        failed = {assertion["check"] for assertion in result.assertions if not assertion["passed"]}
+        self.assertIn("controller_steps_exist", failed)
+        self.assertIn("consecutive_rounds_not_same_signature", failed)
 
     def test_eval_aggregation_modes(self) -> None:
         suite = default_eval_suite()
@@ -2206,6 +2421,245 @@ class ArxivRetrieverTest(unittest.TestCase):
         self.assertIn("Risk-aware quoting can reduce loss-making fills.", json.dumps(prompt_payload))
         self.assertIn("Prediction Market Scoring Rules", json.dumps(prompt_payload))
 
+    def test_prediction_market_code_prompt_sees_recent_failures(self) -> None:
+        class CapturingLLM:
+            is_live = True
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            model_label = "capturing"
+
+            def __init__(self) -> None:
+                self.user = ""
+
+            def complete_json(self, _system: str, user: str, **_kwargs: object) -> dict[str, object]:
+                self.user = user
+                return {
+                    "variants": [
+                        {
+                            "description": "responds to negative mean_edge by changing quote gating",
+                            "payload": textwrap.dedent("""\
+                                from orderbook_pm_challenge.strategy import BaseStrategy
+                                from orderbook_pm_challenge.types import CancelAll, PlaceOrder, Side, StepState
+
+                                class Strategy(BaseStrategy):
+                                    def on_step(self, state: StepState):
+                                        return [CancelAll()]
+                            """),
+                        }
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            variant = Variant(run_id="run_pm_prompt", outer_iteration=2, kind="code", payload="bad stale quoting logic", parent_ids=[], metadata={})
+            store.add_variant(variant)
+            store.add_variant_evaluation(
+                VariantEvaluation(
+                    run_id="run_pm_prompt",
+                    variant_id=variant.id,
+                    inner_loop="optimize",
+                    score=0.5,
+                    metrics={"mean_edge": -0.027, "score_source": "upstream_orderbook_pm_challenge", "score_eligible": True},
+                    judge_scores=[0.5],
+                    summary="upstream orderbook-pm mean_edge=-0.027",
+                    passed=False,
+                )
+            )
+            llm = CapturingLLM()
+            outer = EvolutionaryOuterLoop(
+                run_id="run_pm_prompt",
+                goal="find positive mean edge prediction market strategy",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="prediction_market",
+                llm=llm,
+            )
+
+            variants = outer._llm_prediction_market_code_variants(3, [variant], store=store)
+            prompt_payload = json.loads(llm.user)
+
+        self.assertTrue(variants)
+        self.assertIn("recent_failure_context", prompt_payload)
+        self.assertIn("negative_mean_edge", json.dumps(prompt_payload))
+        self.assertIn("-0.027", json.dumps(prompt_payload))
+        self.assertIn("challenge_contract", prompt_payload)
+        self.assertIn("starter_code", prompt_payload)
+        self.assertIn("baseline_rendered_code", prompt_payload)
+
+    def test_prediction_market_code_prompt_receives_entropy_intent_at_generation_site(self) -> None:
+        class CapturingLLM:
+            is_live = True
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            model_label = "capturing"
+
+            def __init__(self) -> None:
+                self.user = ""
+
+            def complete_json(self, _system: str, user: str, **_kwargs: object) -> dict[str, object]:
+                self.user = user
+                return {
+                    "variants": [
+                        {
+                            "description": "uses entropy intent to test a new flow-toxicity gate",
+                            "payload": textwrap.dedent("""\
+                                from orderbook_pm_challenge.strategy import BaseStrategy
+                                from orderbook_pm_challenge.types import CancelAll, StepState
+
+                                class Strategy(BaseStrategy):
+                                    def on_step(self, state: StepState):
+                                        return [CancelAll()]
+                            """),
+                        }
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            llm = CapturingLLM()
+            outer = EvolutionaryOuterLoop(
+                run_id="run_pm_entropy_prompt",
+                goal="find positive mean edge prediction market strategy",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="prediction_market",
+                llm=llm,
+            )
+            entropy_intent = {
+                "action": "fresh_search_context",
+                "exploration_path": "flow toxicity gate from new literature",
+                "expected_generalization": "avoid fills after adverse order flow",
+            }
+
+            variants = outer._llm_prediction_market_code_variants(4, [], store=store, entropy_intent=entropy_intent)
+            prompt_payload = json.loads(llm.user)
+
+        self.assertTrue(variants)
+        self.assertEqual(prompt_payload["post_round_entropy_intent"]["exploration_path"], "flow toxicity gate from new literature")
+        self.assertIn("starter_code", prompt_payload)
+
+    def test_prediction_market_llm_failure_gets_structural_not_parameter_only_fallbacks(self) -> None:
+        class FailingLLM:
+            is_live = True
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            model_label = "failing"
+
+            def complete_json(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                raise LLMError("model unavailable")
+
+        outer = EvolutionaryOuterLoop(
+            run_id="run_pm_structural_fallback",
+            goal="find positive mean edge prediction market strategy",
+            task_mode="optimize_query",
+            source_strategy=[],
+            search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+            evaluator_name="prediction_market",
+            llm=FailingLLM(),
+            population_size=6,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            variants = outer._propose_prediction_market_variants(1, [], store)
+
+        structural = [variant for variant in variants if variant.metadata.get("proposal_source") == "deterministic_structural"]
+        self.assertGreaterEqual(len(structural), 2)
+        self.assertTrue(all("class Strategy" in variant.payload for variant in structural))
+        self.assertGreater(len({variant.metadata.get("structural_archetype") for variant in structural}), 1)
+
+    def test_prediction_market_rank_key_prefers_less_negative_edge_over_same_score(self) -> None:
+        from research_harness.loops import _prediction_market_rank_key
+
+        worse = VariantEvaluation(
+            run_id="rank",
+            variant_id="worse",
+            inner_loop="optimize",
+            score=0.5,
+            metrics={"mean_edge": -0.03},
+            judge_scores=[0.5],
+            summary="worse",
+            passed=False,
+        )
+        better = VariantEvaluation(
+            run_id="rank",
+            variant_id="better",
+            inner_loop="optimize",
+            score=0.5,
+            metrics={"mean_edge": -0.008},
+            judge_scores=[0.5],
+            summary="better",
+            passed=False,
+        )
+
+        self.assertGreater(_prediction_market_rank_key(better), _prediction_market_rank_key(worse))
+
+    def test_prediction_market_cancel_only_is_not_score_eligible(self) -> None:
+        from research_harness.loops import _prediction_market_no_trade_baseline
+
+        code = """from orderbook_pm_challenge.strategy import BaseStrategy
+from orderbook_pm_challenge.types import CancelAll
+
+class Strategy(BaseStrategy):
+    def on_step(self, state):
+        return [CancelAll()]
+"""
+        variant = Variant(
+            run_id="run_no_trade",
+            outer_iteration=1,
+            kind="code",
+            payload=code,
+            parent_ids=[],
+            metadata={"structural_archetype": "cancel_only"},
+        )
+        result = {"mean_edge": 0.0, "mean_arb_edge": 0.0, "mean_retail_edge": 0.0}
+
+        self.assertTrue(_prediction_market_no_trade_baseline(code, result, variant))
+
+    def test_prediction_market_non_positive_edge_does_not_write_optimal_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            outer = EvolutionaryOuterLoop(
+                run_id="run_non_positive_edge",
+                goal="optimize prediction market strategy",
+                task_mode="optimize",
+                source_strategy=[],
+                search_factory=lambda _item: LocalCorpusSearch([]),
+                evaluator_name="prediction_market",
+            )
+            evaluation = VariantEvaluation(
+                run_id="run_non_positive_edge",
+                variant_id="variant_flat",
+                inner_loop="optimize",
+                score=0.5,
+                metrics={
+                    "mean_edge": 0.0,
+                    "official_measured": True,
+                    "score_eligible": True,
+                    "score_source": "upstream_orderbook_pm_challenge",
+                    "candidate_path": "candidate.py",
+                },
+                judge_scores=[0.5],
+                summary="flat no-profit result",
+                passed=False,
+            )
+            variant = Variant(
+                run_id="run_non_positive_edge",
+                outer_iteration=1,
+                kind="code",
+                payload="from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n",
+                parent_ids=[],
+                metadata={},
+            )
+
+            outer._write_optimization_outputs(store, [variant], evaluation)
+            result = json.loads(store.optimization_result_path.read_text(encoding="utf-8"))
+
+            self.assertFalse(store.optimal_code_path.exists())
+            self.assertFalse(result["official_result"]["score_eligible"])
+            self.assertEqual(result["official_result"]["promotion_rejected_reason"], "no_positive_mean_edge")
+
     def test_optimizer_rounds_refresh_literature_before_next_code_round(self) -> None:
         class FakeOptimizeLoop:
             async def evaluate(self, variants, store):
@@ -2395,7 +2849,10 @@ class ArxivRetrieverTest(unittest.TestCase):
 
         self.assertEqual(len(hashes), len(set(hashes)))
         self.assertTrue(all(hashes))
-        self.assertTrue(any("contextual_parent_mutation" in variant.payload for variant in round_two))
+        self.assertTrue(
+            any("contextual_parent_mutation" in variant.payload for variant in round_two)
+            or any(variant.metadata.get("proposal_source") == "deterministic_structural" for variant in round_two)
+        )
         self.assertFalse(any("lmsr" in variant.payload.lower() for variant in round_two))
         self.assertFalse(any("adverse" in variant.payload.lower() for variant in round_two))
 
@@ -2485,6 +2942,64 @@ class ArxivRetrieverTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(grounding_claims), 2)
         self.assertTrue(any("prediction_market_plateau_round_2" in claim["text"] for claim in grounding_claims))
+
+    def test_prediction_market_entropy_grounding_fans_out_across_strategy_retrievers(self) -> None:
+        calls: list[str] = []
+
+        class FanoutSearch:
+            def __init__(self, name: str) -> None:
+                self.tool_name = name
+                self.name = name
+
+            def search(self, query: str, limit: int = 4):
+                calls.append(self.name)
+                if self.name not in {"openalex", "arxiv"}:
+                    return []
+                document = CorpusDocument(
+                    url=f"https://example.com/{self.name}/{len(calls)}",
+                    title=f"{self.name} paper",
+                    author="Researcher",
+                    date="2026",
+                    source_type="paper",
+                    summary=f"{self.name} evidence for {query}",
+                    claims=[f"{self.name} evidence claim"],
+                    tags=[self.name],
+                    credibility_score=0.8,
+                )
+                return [(document, 0.8)][:limit]
+
+            def to_source(self, document, relevance_score):
+                return Source(
+                    url=document.url,
+                    title=document.title,
+                    author=document.author,
+                    date=document.date,
+                    source_type=document.source_type,
+                    summary=document.summary,
+                    relevance_score=relevance_score,
+                    credibility_score=document.credibility_score,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            outer = EvolutionaryOuterLoop(
+                run_id="run_pm_fanout",
+                goal="prediction market market making",
+                task_mode="optimize_query",
+                source_strategy=[
+                    SourceStrategyItem(name="a", retriever="openalex", purpose="papers", queries=["prediction market"], limit=3),
+                    SourceStrategyItem(name="b", retriever="arxiv", purpose="papers", queries=["market making"], limit=3),
+                ],
+                search_factory=lambda name: FanoutSearch(name),
+                evaluator_name="prediction_market",
+            )
+
+            asyncio.run(outer._record_literature_grounding(store, "prediction_market_entropy_after_round_3"))
+            claims = [claim for claim in store.list("claims") if claim.get("created_by_agent") == "literature_grounding_policy"]
+
+        self.assertIn("openalex", calls)
+        self.assertIn("arxiv", calls)
+        self.assertGreaterEqual(len(claims), 2)
 
     def test_prediction_market_first_stall_fetches_fresh_literature(self) -> None:
         strategy_code = textwrap.dedent("""\

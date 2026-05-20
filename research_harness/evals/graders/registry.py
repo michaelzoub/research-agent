@@ -33,6 +33,7 @@ from .optimize import (
 )
 from .prediction_market import (
     _grade_no_repo_root_strategy_files,
+    _grade_prediction_market_agentic_optimizer,
     _grade_prediction_market_artifact_containment,
     _grade_prediction_market_candidate_files_only_in_outputs,
     _grade_prediction_market_official_status,
@@ -79,6 +80,7 @@ def default_graders() -> dict[str, Grader]:
         "prediction_market_official_status": Grader("prediction_market_official_status", "code", "official-status verification", 1.0, 1.0, _grade_prediction_market_official_status),
         "prediction_market_artifact_containment": Grader("prediction_market_artifact_containment", "code", "artifact containment", 1.0, 1.0, _grade_prediction_market_artifact_containment),
         "prediction_market_candidate_files_only_in_outputs": Grader("prediction_market_candidate_files_only_in_outputs", "code", "artifact containment", 1.0, 1.0, _grade_prediction_market_candidate_files_only_in_outputs),
+        "prediction_market_agentic_optimizer": Grader("prediction_market_agentic_optimizer", "code", "agentic optimizer trajectory verification", 1.0, 1.0, _grade_prediction_market_agentic_optimizer),
         "no_repo_root_strategy_files": Grader("no_repo_root_strategy_files", "code", "artifact containment", 1.0, 1.0, _grade_no_repo_root_strategy_files),
         "optimizer_skipped_without_evaluator": Grader("optimizer_skipped_without_evaluator", "code", "negative-path outcome verification", 1.0, 1.0, _grade_optimizer_skipped_without_evaluator),
         "plateau_entropy_exploration": Grader("plateau_entropy_exploration", "code", "anti-reward-hack plateau exploration", 1.0, 1.0, _grade_plateau_entropy_exploration),

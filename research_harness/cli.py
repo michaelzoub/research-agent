@@ -16,7 +16,7 @@ from .orchestrator import HarnessConfig, Orchestrator
 
 TASK_MODE_CHOICES = ("auto", "research", "optimize", "optimize_query")
 RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "twitter", "memory", "alchemy")
-LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "local", "multi")
+LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "kimi", "local", "multi")
 
 ANSI = {
     "reset": "\033[0m",
@@ -290,6 +290,7 @@ def _print_run_summary(run, store, *, output_func: Callable[[str], None] = print
         ("decision dag", store.decision_dag_path),
         ("timeline", store.agent_timeline_path),
         ("timeline svg", store.agent_timeline_svg_path),
+        ("score graph", store.score_improvement_path),
     ]
     output_func("")
     output_func(_paint("Open first", "teal", enabled=use_color))

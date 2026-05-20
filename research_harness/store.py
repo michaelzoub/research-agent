@@ -109,6 +109,8 @@ class ArtifactStore:
         self.decision_dag_path = self.root / "decision_dag.png"
         self.agent_timeline_path = self.root / "agent_timeline.png"
         self.agent_timeline_svg_path = self.root / "agent_timeline.svg"
+        self.score_improvement_path = self.root / "score_improvement.png"
+        self.score_improvement_svg_path = self.root / "score_improvement.svg"
         self.run_notebook_path = self.root / "run_notebook.ipynb"
         self.harness_diagnosis_path = self.root / "harness_diagnosis.json"
         self.loop_continuation_path = self.root / "loop_continuation_decisions.json"

@@ -587,6 +587,160 @@ def _gantt_png(spans: list[dict[str, Any]], num_rows: int, total_ms: int) -> byt
     return canvas.png()
 
 
+def _score_improvement_points(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    variants = {str(variant.get("id")): variant for variant in summary.get("variants") or []}
+    points: list[dict[str, Any]] = []
+    frontier = float("-inf")
+    for index, evaluation in enumerate(summary.get("evaluations") or [], start=1):
+        variant = variants.get(str(evaluation.get("variant_id")), {})
+        score = float(evaluation.get("score") or 0.0)
+        passed = bool(evaluation.get("passed"))
+        new_best = score > frontier
+        frontier = max(frontier, score)
+        metrics = evaluation.get("metrics") if isinstance(evaluation.get("metrics"), dict) else {}
+        points.append(
+            {
+                "index": index,
+                "score": score,
+                "frontier": frontier,
+                "new_best": new_best,
+                "passed": passed,
+                "round": int(variant.get("outer_iteration") or 0),
+                "variant_id": str(evaluation.get("variant_id") or ""),
+                "inner_loop": str(evaluation.get("inner_loop") or ""),
+                "score_source": str(metrics.get("score_source") or ""),
+                "summary": str(evaluation.get("summary") or "")[:140],
+            }
+        )
+    return points
+
+
+def score_improvement_svg(summary: dict[str, Any]) -> str:
+    points = _score_improvement_points(summary)
+    width, height = 1280, 720
+    left, right, top, bottom = 86, 36, 64, 86
+    plot_w, plot_h = width - left - right, height - top - bottom
+    if not points:
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="100%" '
+            'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;display:block;">'
+            f'<rect width="{width}" height="{height}" rx="18" fill="#fff" stroke="#dbe5f1"/>'
+            '<text x="48" y="72" font-size="22" font-weight="700" fill="#1e293b">Score Improvement Frontier</text>'
+            '<text x="48" y="112" font-size="14" fill="#94a3b8">No variant evaluations recorded.</text></svg>'
+        )
+    max_score = max(1.0, max(point["score"] for point in points), max(point["frontier"] for point in points))
+    count = max(1, len(points) - 1)
+
+    def sx(i: int) -> float:
+        return left + ((i - 1) / count) * plot_w
+
+    def sy(score: float) -> float:
+        return top + plot_h - (score / max_score) * plot_h
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="100%" '
+        'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;display:block;">',
+        f'<rect x="12" y="12" width="{width - 24}" height="{height - 24}" rx="18" fill="#fff" stroke="#dbe5f1"/>',
+        '<text x="48" y="48" font-size="22" font-weight="750" fill="#1e293b">Score Improvement Frontier</text>',
+        '<text x="48" y="70" font-size="12" fill="#64748b">All variant evaluations, with the running best score shown as a frontier.</text>',
+    ]
+    for tick in range(6):
+        score = max_score * tick / 5
+        y = sy(score)
+        parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{width - right}" y2="{y:.1f}" stroke="#e8eef6"/>')
+        parts.append(f'<text x="{left - 12}" y="{y + 4:.1f}" text-anchor="end" font-size="11" fill="#8190a8">{score:.2f}</text>')
+    x_ticks = min(8, len(points))
+    for tick in range(x_ticks):
+        index = 1 + round(tick * (len(points) - 1) / max(1, x_ticks - 1))
+        x = sx(index)
+        parts.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_h}" stroke="#f1f5f9"/>')
+        parts.append(f'<text x="{x:.1f}" y="{height - 42}" text-anchor="middle" font-size="11" fill="#8190a8">{index}</text>')
+    frontier_path = " ".join(
+        ("M" if idx == 0 else "L") + f'{sx(point["index"]):.1f},{sy(point["frontier"]):.1f}'
+        for idx, point in enumerate(points)
+    )
+    parts.append(f'<path d="{frontier_path}" fill="none" stroke="#2f6fe4" stroke-width="3"/>')
+    for point in points:
+        x, y = sx(point["index"]), sy(point["score"])
+        if point["new_best"]:
+            color, radius = "#35c486", 4.8
+        elif point["passed"]:
+            color, radius = "#f7b84b", 4.2
+        else:
+            color, radius = "#cbd5e1", 3.8
+        parts.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius}" fill="{color}" stroke="#fff" stroke-width="1.5">'
+            f'<title>eval {point["index"]} · round {point["round"]} · score {point["score"]:.3f} · {html.escape(point["variant_id"])} · {html.escape(point["summary"])}</title>'
+            '</circle>'
+        )
+    round_marks: dict[int, dict[str, Any]] = {}
+    for point in points:
+        if point["new_best"] and point["round"] and point["round"] not in round_marks:
+            round_marks[point["round"]] = point
+    for round_index, point in list(round_marks.items())[:8]:
+        x, y = sx(point["index"]), sy(point["score"])
+        label_y = max(top + 22, y - 28)
+        parts.append(f'<line x1="{x:.1f}" y1="{y - 4:.1f}" x2="{x + 18:.1f}" y2="{label_y + 8:.1f}" stroke="#94a3b8"/>')
+        parts.append(
+            f'<rect x="{x + 20:.1f}" y="{label_y - 12:.1f}" width="118" height="26" rx="6" fill="#eef6ff" stroke="#d8e6fb"/>'
+            f'<text x="{x + 30:.1f}" y="{label_y + 5:.1f}" font-size="11" font-weight="700" fill="#24364f">Round {round_index}: {point["score"]:.3f}</text>'
+        )
+    parts.extend(
+        [
+            f'<line x1="{left}" y1="{top + plot_h}" x2="{width - right}" y2="{top + plot_h}" stroke="#cbd5e1"/>',
+            f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}" stroke="#cbd5e1"/>',
+            f'<text x="{width / 2:.1f}" y="{height - 18}" text-anchor="middle" font-size="14" fill="#475569">Evaluation number</text>',
+            f'<text x="24" y="{top + plot_h / 2:.1f}" transform="rotate(-90 24 {top + plot_h / 2:.1f})" text-anchor="middle" font-size="14" fill="#475569">Score</text>',
+            '<circle cx="970" cy="46" r="5" fill="#cbd5e1"/><text x="984" y="50" font-size="12" fill="#475569">No new best</text>',
+            '<circle cx="1070" cy="46" r="5" fill="#f7b84b"/><text x="1084" y="50" font-size="12" fill="#475569">Passed</text>',
+            '<circle cx="1145" cy="46" r="5" fill="#35c486"/><text x="1159" y="50" font-size="12" fill="#475569">New best</text>',
+            "</svg>",
+        ]
+    )
+    return "\n".join(parts)
+
+
+def score_improvement_png(summary: dict[str, Any]) -> bytes:
+    svg = score_improvement_svg(summary)
+    with tempfile.TemporaryDirectory() as directory:
+        svg_path = Path(directory) / "score.svg"
+        png_path = Path(directory) / "score.png"
+        svg_path.write_text(svg, encoding="utf-8")
+        if _try_convert_svg(svg_path, png_path):
+            return png_path.read_bytes()
+    return _score_improvement_png_fallback(summary)
+
+
+def _score_improvement_png_fallback(summary: dict[str, Any]) -> bytes:
+    points = _score_improvement_points(summary)
+    width, height = 1280, 720
+    canvas = _PngCanvas(width, height, "#ffffff")
+    canvas.text(48, 38, "Score Improvement Frontier", "#1e293b", 2)
+    if not points:
+        canvas.text(48, 80, "No variant evaluations recorded.", "#94a3b8", 1)
+        return canvas.png()
+    left, right, top, bottom = 86, 36, 64, 86
+    plot_w, plot_h = width - left - right, height - top - bottom
+    max_score = max(1.0, max(point["score"] for point in points))
+    for tick in range(6):
+        y = top + plot_h - int((tick / 5) * plot_h)
+        canvas.rect(left, y, plot_w, 1, "#e8eef6")
+        canvas.text(24, y - 6, f"{max_score * tick / 5:.2f}", "#8190a8", 1)
+    last_x = last_y = None
+    frontier = 0.0
+    for idx, point in enumerate(points):
+        x = left + int((idx / max(1, len(points) - 1)) * plot_w)
+        y = top + plot_h - int((point["score"] / max_score) * plot_h)
+        frontier = max(frontier, point["score"])
+        fy = top + plot_h - int((frontier / max_score) * plot_h)
+        if last_x is not None and last_y is not None:
+            canvas.line(last_x, last_y, x, fy, "#2f6fe4")
+        color = "#35c486" if point["new_best"] else "#f7b84b" if point["passed"] else "#cbd5e1"
+        canvas.circle(x, y, 4, color, "#ffffff")
+        last_x, last_y = x, fy
+    return canvas.png()
+
+
 def _event_rows_html(spans: list[dict[str, Any]]) -> str:
     if not spans:
         return (
@@ -735,6 +889,7 @@ def write_run_benchmarks(store: ArtifactStore) -> None:
     dag_svg = decision_dag_svg(summary)
     timeline_svg = _gantt_svg(spans, num_rows, total_ms)
     timeline_svg_full = _gantt_svg(spans, num_rows, total_ms, max_rows=None)
+    score_svg = score_improvement_svg(summary)
     optimizer_trace = summary.get("optimizer_trace") or []
     optimizer_flow = optimizer_flow_mermaid(summary)
     optimizer_flow_svg_text = optimizer_flow_svg(summary)
@@ -744,12 +899,14 @@ def write_run_benchmarks(store: ArtifactStore) -> None:
     (store.root / "decision_dag.mmd").write_text(dag, encoding="utf-8")
     (store.root / "optimizer_trace.json").write_text(json.dumps(optimizer_trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     store.agent_timeline_svg_path.write_text(timeline_svg_full, encoding="utf-8")
+    store.score_improvement_svg_path.write_text(score_svg, encoding="utf-8")
     (store.root / "optimizer_flow.mmd").write_text(optimizer_flow, encoding="utf-8")
     (store.root / "optimizer_flow.svg").write_text(optimizer_flow_svg_text, encoding="utf-8")
     store.champion_tree_mermaid_path.write_text(champion_tree_graph, encoding="utf-8")
     store.champion_tree_svg_path.write_text(champion_tree_svg_text, encoding="utf-8")
     _write_png_from_svg_or_fallback(store.decision_dag_path, dag_svg, lambda: decision_dag_png(summary))
     _write_png_from_svg_or_fallback(store.agent_timeline_path, timeline_svg, lambda: _gantt_png(spans, num_rows, total_ms))
+    _write_png_from_svg_or_fallback(store.score_improvement_path, score_svg, lambda: _score_improvement_png_fallback(summary))
     _write_png_from_svg_or_fallback(store.root / "optimizer_flow.png", optimizer_flow_svg_text, lambda: optimizer_flow_png(summary))
     _write_png_from_svg_or_fallback(store.champion_tree_graph_path, champion_tree_svg_text, lambda: champion_tree_png(champion_tree))
     (store.root / "run_benchmark.md").write_text(run_benchmark_markdown(summary, dag, optimizer_flow), encoding="utf-8")
@@ -1873,6 +2030,12 @@ def run_benchmark_html(summary: dict[str, Any]) -> str:
   <h2>Decision DAG</h2>
   <div class="gantt-card">
     <img src="decision_dag.png" alt="Decision DAG" style="width:100%;display:block;">
+  </div>
+
+  <h2>Score Improvement</h2>
+  <div class="gantt-card">
+    <p class="muted"><a href="score_improvement.svg">Open full SVG score graph</a></p>
+    <img src="score_improvement.png" alt="Score improvement frontier" style="width:100%;display:block;">
   </div>
 
   <h2>Optimizer Flow</h2>

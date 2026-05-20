@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from pathlib import Path
 
 from ...store import ArtifactStore
@@ -165,6 +167,77 @@ def _grade_prediction_market_candidate_files_only_in_outputs(task: EvalTask, sto
     )
 
 
+def _grade_prediction_market_agentic_optimizer(task: EvalTask, store: ArtifactStore) -> GraderResult:
+    steps = _read_json_list(store.root / "optimization_agent_steps.json")
+    variants = [row for row in store.list("variants") if row.get("kind") == "code"]
+    evaluations = [row for row in store.list("variant_evaluations") if row.get("inner_loop") == "optimize"]
+    traces = store.list("agent_traces")
+    rounds: dict[int, list[dict[str, object]]] = {}
+    for variant in variants:
+        try:
+            rounds.setdefault(int(variant.get("outer_iteration", 0)), []).append(variant)
+        except (TypeError, ValueError):
+            continue
+    signatures_by_round = {
+        round_index: {_pm_strategy_signature(str(variant.get("payload", ""))) for variant in rows}
+        for round_index, rows in rounds.items()
+        if round_index > 0
+    }
+    negative_rounds = _negative_prediction_market_rounds(evaluations, variants)
+    adjacent_repeated = [
+        round_index
+        for round_index in sorted(signatures_by_round)
+        if round_index + 1 in signatures_by_round and signatures_by_round[round_index] == signatures_by_round[round_index + 1]
+    ]
+    controller_tools = {
+        str(action.get("tool"))
+        for step in steps
+        for action in (step.get("actions") if isinstance(step.get("actions"), list) else [])
+        if isinstance(action, dict)
+    }
+    reflections = [str(step.get("reflection", "")) for step in steps if isinstance(step, dict)]
+    proposal_prompts = [
+        str(trace.get("prompt", ""))
+        for trace in traces
+        if str(trace.get("agent_name", "")).startswith("llm_propose_prediction_market_code")
+    ]
+    prompt_blob = "\n".join(proposal_prompts)
+    changed_after_negative = True
+    for round_index in negative_rounds:
+        if round_index + 1 not in signatures_by_round:
+            continue
+        previous = signatures_by_round.get(round_index, set())
+        current = signatures_by_round.get(round_index + 1, set())
+        if current and current.issubset(previous):
+            changed_after_negative = False
+            break
+    checks = [
+        ("controller_steps_exist", bool(steps)),
+        ("tool_menu_used", {"read_champion", "read_failures", "read_evaluator_summary", "propose_strategy"}.issubset(controller_tools)),
+        ("failure_reflection_recorded", not negative_rounds or any(_looks_like_failure_reflection(text) for text in reflections)),
+        ("literature_tool_used_when_required", _literature_requirement_satisfied(steps)),
+        ("generation_prompt_has_controller_context", not proposal_prompts or "optimizer_agent_context" in prompt_blob),
+        ("generation_prompt_has_literature_context", not proposal_prompts or "literature_refresh_notes" in prompt_blob),
+        ("consecutive_rounds_not_same_signature", not adjacent_repeated),
+        ("changed_mechanism_after_negative_edge", changed_after_negative),
+    ]
+    score = sum(1 for _, passed in checks if passed) / len(checks)
+    passed = score == 1.0
+    return _result(
+        "prediction_market_agentic_optimizer",
+        "code",
+        "agentic optimizer trajectory verification",
+        score,
+        passed,
+        1.0,
+        (
+            f"controller_steps={len(steps)}, tools={sorted(controller_tools)}, "
+            f"negative_rounds={sorted(negative_rounds)}, repeated_adjacent_rounds={adjacent_repeated}."
+        ),
+        [{"check": name, "passed": passed} for name, passed in checks],
+    )
+
+
 def _grade_no_repo_root_strategy_files(task: EvalTask, store: ArtifactStore) -> GraderResult:
     leaked_files = _repo_root_strategy_leaks(Path.cwd())
     passed = not leaked_files
@@ -179,3 +252,62 @@ def _grade_no_repo_root_strategy_files(task: EvalTask, store: ArtifactStore) -> 
         [{"check": "no_repo_root_strategy_files", "passed": passed}]
         + [{"check": "leaked_file", "path": str(path), "passed": False} for path in leaked_files],
     )
+
+
+def _read_json_list(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _pm_strategy_signature(payload: str) -> str:
+    text = payload.lower()
+    compact = re.sub(r"\s+", "", text)
+    features = [
+        "cancel_only" if "return[cancelall()]" in compact else "",
+        "place_order" if "placeorder" in text else "",
+        "inventory" if "inventory" in text or "yes_inventory" in text or "no_inventory" in text else "",
+        "cash" if "free_cash" in text or "cash" in text else "",
+        "competitor" if "competitor_best" in text else "",
+        "flow" if "filled_quantity" in text or "flow" in text else "",
+        "controller" if "optimizer_agent_next_mechanism" in text else "",
+    ]
+    mechanisms = " ".join(re.findall(r"pm_strategy=[^\s]+|strategy_family=[^\s]+|optimizer_agent_next_mechanism='[^']+'", payload)[:4])
+    basis = "|".join([feature for feature in features if feature] + [mechanisms[:200]])
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12]
+
+
+def _negative_prediction_market_rounds(
+    evaluations: list[dict[str, object]],
+    variants: list[dict[str, object]],
+) -> set[int]:
+    rounds_by_variant = {str(row.get("id")): int(row.get("outer_iteration", 0) or 0) for row in variants}
+    negative_rounds: set[int] = set()
+    for row in evaluations:
+        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+        edge = metrics.get("mean_edge")
+        if isinstance(edge, (int, float)) and float(edge) < 0:
+            round_index = rounds_by_variant.get(str(row.get("variant_id")), 0)
+            if round_index:
+                negative_rounds.add(round_index)
+    return negative_rounds
+
+
+def _looks_like_failure_reflection(text: str) -> bool:
+    normalized = text.lower()
+    return len(normalized.strip()) >= 20 and any(term in normalized for term in ["mean_edge", "failure", "negative", "flat", "score"])
+
+
+def _literature_requirement_satisfied(steps: list[dict[str, object]]) -> bool:
+    required_steps = [step for step in steps if bool(step.get("literature_required"))]
+    if not required_steps:
+        return True
+    for step in required_steps:
+        actions = step.get("actions") if isinstance(step.get("actions"), list) else []
+        if not any(isinstance(action, dict) and action.get("tool") == "fetch_literature" and action.get("status") == "completed" for action in actions):
+            return False
+    return True

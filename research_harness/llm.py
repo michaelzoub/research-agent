@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from .model_catalog import ALL_CONFIGURED_MODEL_ID, configured_model_pool, resolve_model_selection
@@ -39,6 +41,7 @@ _MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-sonnet-4-6": {"input": 3.00e-6, "output": 15.00e-6},  # estimate
     "claude-sonnet-4-5": {"input": 3.00e-6, "output": 15.00e-6},  # estimate
     "claude-haiku-4-5": {"input": 0.80e-6, "output": 4.00e-6},  # estimate
+    "kimi-k2.6": {"input": 0.95e-6, "output": 4.00e-6},
 }
 _DEFAULT_PRICING: dict[str, float] = {"input": 10.00e-6, "output": 30.00e-6}
 
@@ -69,6 +72,7 @@ class LLMClient:
         api_key: Optional[str] = None,
         timeout_seconds: float = 60.0,
     ):
+        _load_local_env_defaults()
         raw_provider = provider or os.environ.get("RESEARCH_HARNESS_LLM_PROVIDER") or "auto"
         raw_model = model or os.environ.get("RESEARCH_HARNESS_LLM_MODEL") or "openai/gpt-5.2"
         self.provider, self.model = resolve_model_selection(raw_provider, raw_model)
@@ -76,7 +80,11 @@ class LLMClient:
         self._model_pool_cursor = 0
         self.openai_api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.anthropic_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        self.api_key = self.openai_api_key if self.provider in {"auto", "openai"} else self.anthropic_api_key
+        self.kimi_api_key = api_key or os.environ.get("MOONSHOT_API_KEY") or os.environ.get("KIMI_API_KEY")
+        if self.provider == "kimi":
+            self.api_key = self.kimi_api_key
+        else:
+            self.api_key = self.openai_api_key if self.provider in {"auto", "openai"} else self.anthropic_api_key
         self.timeout_seconds = timeout_seconds
         # Accumulated real token counts across all calls on this client instance.
         self.total_prompt_tokens: int = 0
@@ -93,8 +101,14 @@ class LLMClient:
             return _looks_like_openai_key(self.openai_api_key)
         if self.provider == "anthropic":
             return _looks_like_anthropic_key(self.anthropic_api_key)
+        if self.provider == "kimi":
+            return _looks_like_kimi_key(self.kimi_api_key)
         if self.provider == "auto":
-            return _looks_like_openai_key(self.openai_api_key) or _looks_like_anthropic_key(self.anthropic_api_key)
+            return (
+                _looks_like_openai_key(self.openai_api_key)
+                or _looks_like_anthropic_key(self.anthropic_api_key)
+                or _looks_like_kimi_key(self.kimi_api_key)
+            )
         return False
 
     @property
@@ -274,9 +288,61 @@ class LLMClient:
             completion_tokens=int(usage.get("output_tokens") or 0),
         )
 
+    def _kimi_response(self, system: str, user: str, *, max_output_tokens: int, temperature: float = 0.7) -> LLMResponse:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_completion_tokens": max_output_tokens,
+            # Kimi K2.6 currently rejects other values with
+            # "invalid temperature: only 1 is allowed for this model".
+            "temperature": 1,
+        }
+        data = self._kimi_chat_completions(payload)
+        text = str(data["choices"][0]["message"]["content"] or "")
+        usage = data.get("usage") or {}
+        return LLMResponse(
+            text=text,
+            model=str(data.get("model") or self.model),
+            provider="kimi",
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+        )
+
+    def _kimi_chat_completions(self, payload: dict[str, object]) -> dict[str, object]:
+        last_error: Optional[urllib.error.HTTPError] = None
+        last_body = ""
+        for attempt in range(3):
+            request = urllib.request.Request(
+                "https://api.moonshot.ai/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.kimi_api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "research-harness/0.1.0",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code != 429 or attempt >= 2:
+                    raise LLMError(f"HTTP {exc.code} from Kimi Chat Completions: {body[:1000]}") from exc
+                last_error = exc
+                last_body = body
+                retry_after = _retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
+                time.sleep(retry_after if retry_after is not None else 1.0 + attempt)
+        raise LLMError(f"HTTP 429 from Kimi Chat Completions after retries: {last_body[:1000]}") from last_error
+
     def _live_response(self, system: str, user: str, *, max_output_tokens: int, temperature: float) -> LLMResponse:
         if self.provider == "anthropic":
             return self._anthropic_response(system, user, max_output_tokens=max_output_tokens, temperature=temperature)
+        if self.provider == "kimi":
+            return self._kimi_response(system, user, max_output_tokens=max_output_tokens, temperature=temperature)
         return self._openai_response(system, user, max_output_tokens=max_output_tokens, temperature=temperature)
 
     def _select_execution_model(self) -> tuple[str, str]:
@@ -303,6 +369,8 @@ class LLMClient:
             return _looks_like_openai_key(self.openai_api_key)
         if provider == "anthropic":
             return _looks_like_anthropic_key(self.anthropic_api_key)
+        if provider == "kimi":
+            return _looks_like_kimi_key(self.kimi_api_key)
         return False
 
     def validate(self) -> bool:
@@ -322,6 +390,29 @@ class LLMClient:
                 headers={
                     "x-api-key": str(self.anthropic_api_key),
                     "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                    "User-Agent": "research-harness/0.1.0",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=min(self.timeout_seconds, 15.0)):
+                    return True
+            except urllib.error.HTTPError as exc:
+                if exc.code in {401, 403}:
+                    return False
+                raise
+        if self.provider == "kimi":
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": "Return ok."}],
+                "max_completion_tokens": 8,
+            }
+            request = urllib.request.Request(
+                "https://api.moonshot.ai/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.kimi_api_key}",
                     "Content-Type": "application/json",
                     "User-Agent": "research-harness/0.1.0",
                 },
@@ -361,8 +452,8 @@ class LLMClient:
         if "json" in system.lower():
             return json.dumps({"score": 0.5, "rationale": "Local fallback score; configure OPENAI_API_KEY for live judging."})
         return (
-            "Local deterministic fallback response. Configure OPENAI_API_KEY or ANTHROPIC_API_KEY "
-            "and choose a live model such as openai/gpt-5.2 or anthropic/claude-sonnet-4-5.\n\n"
+            "Local deterministic fallback response. Configure OPENAI_API_KEY, ANTHROPIC_API_KEY, or MOONSHOT_API_KEY "
+            "and choose a live model such as openai/gpt-5.2, anthropic/claude-sonnet-4-5, or kimi/kimi-k2.6.\n\n"
             f"Prompt excerpt: {user[:500]}"
         )
 
@@ -398,3 +489,45 @@ def _looks_like_anthropic_key(api_key: Optional[str]) -> bool:
     if cleaned in {"", "...", "changeme", "your-key-here"}:
         return False
     return cleaned.startswith("sk-ant-")
+
+
+def _looks_like_kimi_key(api_key: Optional[str]) -> bool:
+    if not api_key:
+        return False
+    cleaned = api_key.strip()
+    return cleaned not in {"", "...", "changeme", "your-key-here"}
+
+
+def _retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return max(0.0, min(10.0, float(value)))
+    except ValueError:
+        return None
+
+
+_ENV_DEFAULTS_LOADED = False
+
+
+def _load_local_env_defaults() -> None:
+    global _ENV_DEFAULTS_LOADED
+    if _ENV_DEFAULTS_LOADED:
+        return
+    _ENV_DEFAULTS_LOADED = True
+    for path in (Path(".env"), Path(".env.local")):
+        _load_env_file(path)
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        clean_key = key.strip()
+        clean_value = value.strip().strip('"').strip("'")
+        if clean_key and clean_key not in os.environ:
+            os.environ[clean_key] = clean_value

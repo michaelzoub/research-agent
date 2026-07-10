@@ -73,5 +73,5 @@ emitted `optimal_code.py` or `solution.py` against the upstream
 ## Suggested Harness Command
 
 ```bash
-./autore "Research approaches for the prediction market challenge: adaptive passive market making against stale quote arbitrage and retail flow" --task-mode optimize_query --evaluator prediction_market --retriever local
+./autore "Research approaches for the prediction market challenge: adaptive passive market making against stale quote arbitrage and retail flow" --retriever local
 ```

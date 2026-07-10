@@ -142,7 +142,7 @@ class TerminalBenchCustomAgentContractTest(unittest.TestCase):
         environment = FakeTerminalBenchEnvironment(stdout="Run: run_terminal_bench_demo\nStatus: completed\n")
         context = FakeAgentContext()
         agent = ResearchHarnessTerminalBenchAgent(
-            TerminalBenchRunConfig(task_mode="research", llm_provider="local", llm_model="cheap-local", max_iterations=50, quiet=True)
+            TerminalBenchRunConfig(llm_provider="local", llm_model="cheap-local", max_iterations=50, quiet=True)
         )
 
         asyncio.run(agent.run("Solve the terminal task, then write the answer.", environment, context))
@@ -151,7 +151,7 @@ class TerminalBenchCustomAgentContractTest(unittest.TestCase):
         command = environment.commands[0]
         self.assertIn("python3 -m research_harness.cli", command)
         self.assertIn("'Solve the terminal task, then write the answer.'", command)
-        self.assertIn("--task-mode research", command)
+        self.assertNotIn("--task-mode", command)
         self.assertIn("--llm-provider local", command)
         self.assertIn("--llm-model cheap-local", command)
         self.assertIn("--max-iterations 50", command)

@@ -1,69 +1,40 @@
 ---
 name: research-agent-architecture
-description: Maintain the research-harness architecture where each product option is an agent defined as model plus harness. Use when changing orchestrator routing, product agents, loop modes, run-state artifacts, parallel execution, or docs that explain research, optimize, and challenge agents.
+description: Maintain the single model-directed research-harness execution architecture. Use when changing the orchestrator, ResearchAgent, tool registry, run-state artifacts, or their documentation.
 ---
 
 # Research Agent Architecture
 
-Use this skill when changing the project architecture, especially
-`research_harness/orchestrator.py`, `research_harness/loops.py`,
-`research_harness/schemas.py`, `research_harness/store.py`, or
-`docs/architecture.md`.
-
-## Core Convention
-
-The project follows:
+## Core convention
 
 ```text
 agent = model + harness
 ```
 
-The model is `LLMClient` or a compatible model client. The harness is the loop,
-tools, evaluators, artifact store, run state, budgets, traces, stopping
-rules, and orchestration policy.
+Production execution has one `ResearchAgent` loop. The model chooses direct answers, tool use, recovery, user input, and finalization. The harness enforces permissions, budgets, schemas, persistence, validation, and deterministic evaluator/promotion boundaries.
 
-## Product Agents
+Do not add runtime modes, task routers, fixed phases, mandatory search sequences, or renamed legacy workflows.
 
-Keep these product agents first-class:
+## Event contract
 
-- `research`: finds papers/data, extracts claims, critiques, synthesizes.
-- `optimize`: improves candidates against evaluators/tests.
-- `challenge`: uses the optimization core plus challenge specs, official/proxy
-  graders, and solution rendering.
+Every production run must persist actual events in this order as applicable:
 
-Do not collapse product-agent identity into loop mode. `task_mode` says how the
-run executes; `product_agent` says which product option the user invoked.
+- model turn;
+- tool request;
+- tool result or budget/safety rejection;
+- final validation;
+- termination.
 
-## Probabilistic Loop Contract
+Provider-native tool call IDs must have matching tool-result messages. Persist failures in `failed_paths.json`; preserve successful calls in `agent_events.jsonl` and `agent_messages.json`.
 
-Every product agent run writes `run_state.json` with:
+## Capability boundaries
 
-- selected `product_agent`
-- selected runtime `task_mode`
-- agent-harness definition
-- observed actions and their evidence
-- stopping rationale
-- artifact paths
+- Tools are async and schema-validated.
+- Concurrent execution is limited to independent read-only tools.
+- External retrieval must return relevant evidence or an explicit failure.
+- The model can propose an experiment, but deterministic evaluator and promotion policy own execution and promotion.
+- Public decision summaries are allowed; hidden chain-of-thought is not collected or stored.
 
-Do not add a fixed task sequence. The model chooses its next action from the
-goal, current state, retrieved evidence, evaluator feedback, failures, and
-remaining budget.
+## Documentation invariant
 
-## Parallelism Rule
-
-The orchestrator decides parallelism based on dependencies:
-
-- independent role agents may use `asyncio.gather`
-- independent variant evaluations may use `asyncio.gather`
-- critique and synthesis should run only when the available evidence warrants them
-
-Record the action basis and observed outcome in `LoopTask` records and run state.
-
-## Gotchas
-
-- Role classes such as `LiteratureAgent` and `CriticAgent` are workers inside
-  the agent harness; they are not the entire product agent.
-- `optimize` and `challenge` share an optimization core, but challenge remains a
-  separate product agent because it has external contracts and official graders.
-- Updating only docs is not enough when the invariant should be enforced by
-  tests or graders.
+Keep `README.md`, `docs/architecture.md`, `docs/long_running_tasks.md`, and `TODO.md` aligned with the production CLI. Do not document removed flags such as `--task-mode` or imply that a deterministic utility is available through `autore` until it is exposed as an agent tool.

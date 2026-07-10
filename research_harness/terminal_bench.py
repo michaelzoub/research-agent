@@ -14,7 +14,6 @@ except Exception:  # pragma: no cover - exercised only when Harbor is installed.
 
 @dataclass(frozen=True)
 class TerminalBenchRunConfig:
-    task_mode: str = "auto"
     llm_provider: str = "auto"
     llm_model: Optional[str] = None
     max_iterations: int = 50
@@ -58,8 +57,6 @@ class ResearchHarnessTerminalBenchAgent(_HarborBaseAgent):
             "-m",
             "research_harness.cli",
             shlex.quote(instruction),
-            "--task-mode",
-            shlex.quote(self.config.task_mode),
             "--llm-provider",
             shlex.quote(self.config.llm_provider),
             "--max-iterations",

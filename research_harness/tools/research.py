@@ -37,15 +37,15 @@ class WebFetchTool:
     name = "fetch_document"
     is_read_only = True
     description = "Fetch a known public HTTP(S) document after discovery. Rejects private, local, and unsafe redirect destinations."
-    input_schema = {"type": "object", "required": ["url"], "properties": {"url": {"type": "string", "minLength": 8}}, "additionalProperties": False}
+    input_schema = {"type": "object", "required": ["url"], "properties": {"url": {"type": "string", "minLength": 8}, "prefer_markdown": {"type": "boolean"}}, "additionalProperties": False}
 
     def __init__(self, timeout_seconds: float = 15.0, max_characters: int = 20000, max_redirects: int = 5):
         self.timeout_seconds, self.max_characters, self.max_redirects = timeout_seconds, max_characters, max_redirects
 
     async def execute(self, arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
-        return await asyncio.to_thread(self._fetch, str(arguments["url"]).strip())
+        return await asyncio.to_thread(self._fetch, str(arguments["url"]).strip(), bool(arguments.get("prefer_markdown", True)))
 
-    def _fetch(self, url: str) -> ToolResult:
+    def _fetch(self, url: str, prefer_markdown: bool) -> ToolResult:
         for _ in range(self.max_redirects + 1):
             error = _public_url_error(url)
             if error:
@@ -69,8 +69,23 @@ class WebFetchTool:
                     return ToolResult("error", error="URL did not return a supported document content type.")
                 raw = response.read(self.max_characters + 1)
             text = raw.decode("utf-8", errors="replace")
-            return ToolResult("ok", {"url": url, "content_type": content_type, "content": text[: self.max_characters], "truncated": len(raw) > self.max_characters})
+            if prefer_markdown and "html" in content_type.lower():
+                rendered = self._fetch_curl_markdown(url)
+                if rendered is not None:
+                    return ToolResult("ok", {"url": url, "content_type": "text/markdown", "content": rendered[: self.max_characters], "truncated": len(rendered) > self.max_characters, "renderer": "curl.md"})
+            return ToolResult("ok", {"url": url, "content_type": content_type, "content": text[: self.max_characters], "truncated": len(raw) > self.max_characters, "renderer": "direct"})
         return ToolResult("error", error="Too many redirects.")
+
+    def _fetch_curl_markdown(self, url: str) -> str | None:
+        """Optional curl.md renderer for compact agent-readable public HTML."""
+        try:
+            request = urllib.request.Request(f"https://curl.md/{url}", headers={"User-Agent": "research-harness/0.2.0"})
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                if response.status != 200:
+                    return None
+                return response.read(self.max_characters + 1).decode("utf-8", errors="replace")
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+            return None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

@@ -141,24 +141,21 @@ class ArxivSearch:
     def __init__(self, base_url: str = "https://export.arxiv.org/api/query", timeout_seconds: float = 20.0, llm: Optional[LLMClient] = None):
         self.base_url = base_url
         self.timeout_seconds = timeout_seconds
-        self._query_llm: Optional[LLMClient] = (
-            LLMClient(model="gpt-4o-mini", api_key=llm.api_key, timeout_seconds=15.0)
-            if llm and llm.is_live else None
-        )
+        # Query rewriting used to make unrecorded model calls and could turn an
+        # exact citation into a broad, low-relevance arXiv request. The agent
+        # itself already chose the query; preserve it faithfully here.
 
     def search(self, query: str, limit: int = 4) -> list[tuple[CorpusDocument, float]]:
-        cleaned_query = _arxiv_query(query, self._query_llm)
-        if not cleaned_query:
+        identifier = _arxiv_identifier(query)
+        cleaned_query = _arxiv_query(query)
+        if not cleaned_query and not identifier:
             return []
-        params = urllib.parse.urlencode(
-            {
-                "search_query": cleaned_query,
-                "start": 0,
-                "max_results": limit,
-                "sortBy": "submittedDate",
-                "sortOrder": "descending",
-            }
-        )
+        params_dict = {"start": 0, "max_results": limit, "sortBy": "relevance", "sortOrder": "descending"}
+        if identifier:
+            params_dict["id_list"] = identifier
+        else:
+            params_dict["search_query"] = cleaned_query
+        params = urllib.parse.urlencode(params_dict)
         request = urllib.request.Request(
             f"{self.base_url}?{params}",
             headers={"User-Agent": "research-harness/0.1.0 (mailto:research-harness@example.invalid)"},
@@ -166,14 +163,9 @@ class ArxivSearch:
         with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             payload = response.read()
         documents = _parse_arxiv_feed(payload)
-        scored = []
-        query_terms = _tokens(query)
-        for document in documents:
-            haystack = f"{document.title} {document.summary} {' '.join(document.tags)}"
-            overlap = len(query_terms & _tokens(haystack))
-            score = min(1.0, 0.55 + (overlap / max(len(query_terms), 1)) * 0.35)
-            scored.append((document, round(score, 3)))
-        return scored[:limit]
+        if identifier:
+            return [(document, 1.0) for document in documents if identifier in document.url][:limit]
+        return _score_documents(query, documents)[:limit]
 
     def to_source(self, document: CorpusDocument, relevance_score: float) -> Source:
         return Source(
@@ -341,7 +333,11 @@ class WebSearch:
         request = urllib.request.Request(url, headers={"User-Agent": "research-harness/0.1.0"})
         with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             html_payload = response.read().decode("utf-8", errors="replace")
+        if _duckduckgo_blocked(html_payload):
+            raise RuntimeError("DuckDuckGo presented a bot challenge; choose another registered search source or fetch a known public document.")
         documents = _parse_duckduckgo_html(html_payload, self.source_type)
+        if not documents:
+            raise RuntimeError("DuckDuckGo returned no parseable results; choose another registered search source or fetch a known public document.")
         return _score_documents(query, documents)[:limit]
 
     def to_source(self, document: CorpusDocument, relevance_score: float) -> Source:
@@ -755,27 +751,35 @@ def _is_run_dir(name: str) -> bool:
     return name.startswith("run_") or bool(re.match(r"^\d+_run_", name))
 
 
-def _arxiv_query(text: str, llm: Optional[LLMClient] = None) -> str:
-    if llm is not None and llm.is_live:
-        try:
-            payload = llm.complete_json(
-                'Convert this research query to 4-6 precise arXiv search terms. Return JSON only: {"terms": [str]}.',
-                text,
-                max_output_tokens=60,
-                temperature=0.1,
-            )
-            terms = [str(t).strip() for t in payload.get("terms", []) if str(t).strip()]
-            if terms:
-                operator = " OR " if len(terms) > 3 else " AND "
-                return operator.join(f"all:{urllib.parse.quote(term)}" for term in terms[:6])
-        except Exception:
-            pass
-    normalized = text.lower().replace("-", " ")
-    terms = list(_content_tokens(normalized))[:6]
+def _arxiv_query(text: str) -> str:
+    terms = _ordered_content_tokens(text)[:6]
     if not terms:
-        return f"all:{urllib.parse.quote(text[:200])}" if text else ""
-    operator = " OR " if len(terms) > 3 else " AND "
-    return operator.join(f"all:{urllib.parse.quote(term)}" for term in terms)
+        return ""
+    # urlencode() handles escaping exactly once. Quoting terms here produced
+    # literal percent escapes in arXiv's query parser and irrelevant newest work.
+    return " AND ".join(f"all:{term}" for term in terms)
+
+
+def _arxiv_identifier(text: str) -> str:
+    match = re.search(r"\b(\d{4}\.\d{4,5})(?:v\d+)?\b", text)
+    return match.group(1) if match else ""
+
+
+def _ordered_content_tokens(text: str) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for match in TOKEN_RE.finditer(text.lower()):
+        token = match.group(0)
+        if token in SEARCH_STOPWORDS or token.isdigit() or token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    return ordered
+
+
+def _duckduckgo_blocked(payload: str) -> bool:
+    lowered = payload.lower()
+    return "unfortunately, bots use duckduckgo too" in lowered or "anomaly-modal" in lowered
 
 
 def _parse_arxiv_feed(payload: bytes) -> list[CorpusDocument]:

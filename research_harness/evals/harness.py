@@ -82,10 +82,8 @@ class EvaluationHarness:
         trial_tmp.mkdir(parents=True, exist_ok=True)
         config = HarnessConfig(
             retriever=task.retriever,
-            max_loop_iterations=task.max_iterations,
-            task_mode=task.task_mode,
+            max_iterations=task.max_iterations,
             evaluator_name=task.evaluator_name,
-            include_debugger=False,
             echo_progress=False,
             llm_provider="local",
         )
@@ -134,5 +132,4 @@ class EvaluationHarness:
             shutil.rmtree(trial_root)
         trial_root.mkdir(parents=True, exist_ok=True)
         return trial_root
-
 

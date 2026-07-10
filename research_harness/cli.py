@@ -117,11 +117,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not stream run progress to the terminal; artifacts are still written.",
     )
     parser.add_argument(
-        "--no-steering",
-        action="store_true",
-        help="Disable live /article and /steer input while the agent is running.",
-    )
-    parser.add_argument(
         "--session-projects-dir",
         type=Path,
         default=Path(os.environ["AUTORE_PROJECTS_DIR"]) if os.environ.get("AUTORE_PROJECTS_DIR") else None,
@@ -577,7 +572,6 @@ def main() -> None:
         fork_session_id=args.fork_session,
         enable_sessions=not args.no_sessions,
         echo_progress=not args.quiet,
-        enable_steering=(not args.no_steering and not args.quiet and sys.stdin.isatty()),
     )
     orchestrator = Orchestrator(args.corpus, args.output, config)
     run, store = asyncio.run(orchestrator.run(args.goal))

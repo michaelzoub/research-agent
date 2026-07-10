@@ -118,6 +118,7 @@ class ArtifactStore:
         self.harness_diagnosis_path = self.root / "harness_diagnosis.json"
         self.loop_continuation_path = self.root / "loop_continuation_decisions.json"
         self.agent_transcript_path = self.root / "agent_messages.json"
+        self.agent_event_log_path = self.root / "agent_events.jsonl"
         self.user_steering_inbox_path = self.root / "user_steering_inbox.jsonl"
         self.user_steering_state_path = self.root / "user_steering_state.json"
         self.progress_path = self.root / "progress.txt"
@@ -127,6 +128,8 @@ class ArtifactStore:
             self.user_steering_inbox_path.write_text("", encoding="utf-8")
         if not self.user_steering_state_path.exists():
             self.user_steering_state_path.write_text('{"consumed": 0}\n', encoding="utf-8")
+        if not self.agent_event_log_path.exists():
+            self.agent_event_log_path.write_text("", encoding="utf-8")
         self._migrate_sqlite()
 
     def add_source(self, source: Source) -> Source:
@@ -449,6 +452,13 @@ class ArtifactStore:
         self.agent_transcript_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
         self._record_artifact_write(self.agent_transcript_path, "agent_messages")
         return self.agent_transcript_path
+
+    def append_agent_event(self, event: dict[str, Any]) -> None:
+        """Durably record each observed model turn and tool result as it occurs."""
+        with self.agent_event_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+        if self.session_store is not None:
+            self.session_store.append_event("agent_event", event)
 
     def write_solution(self, text: str) -> Path:
         self._snapshot_before_write(self.solution_path, "before writing solution code")

@@ -66,7 +66,7 @@ class Orchestrator:
         agent = ResearchAgent.with_research_tools(
             self.llm,
             [self._retriever_for(name) for name in self._registered_retrievers()],
-            AgentRunConfig(max_iterations=self.config.max_iterations, max_runtime_seconds=self.config.default_budget.max_runtime_seconds, max_cost_usd=self.config.max_cost_usd),
+            AgentRunConfig(max_iterations=self.config.max_iterations, max_tool_calls=self.config.default_budget.max_tool_calls, max_runtime_seconds=self.config.default_budget.max_runtime_seconds, max_cost_usd=self.config.max_cost_usd),
         )
         try:
             result = await agent.arun(goal, workspace=Path.cwd(), readable_roots=list(self.config.workspace_roots or (Path.cwd(),)), store=store, run_id=run.id)

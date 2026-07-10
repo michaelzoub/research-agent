@@ -28,7 +28,7 @@ def new_id(prefix: str) -> str:
 class AgentBudget:
     max_steps: int = 4
     max_tokens: int = 4000
-    max_tool_calls: int = 8
+    max_tool_calls: int = 16
     max_runtime_seconds: float = 30.0
     write_policy: WritePolicy = "append_only"
     reporting_schema: str = "structured_artifact_v1"

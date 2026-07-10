@@ -1,36 +1,45 @@
-# TODOs For Phases 3-7
+# Future Plans
 
-## Phase 3: Persistent World Model
+The production runtime is now one model-directed loop. These plans extend current capabilities without reintroducing a second execution architecture or a mandatory research sequence.
 
-- [x] Add SQLite or Postgres backend behind `ArtifactStore`.
-- [x] Add cross-run source, claim, and hypothesis deduplication.
-- [x] Add provenance edges between claims, hypotheses, contradictions, and reports.
-- [x] Add migration scripts for schema evolution.
+## Completed foundations
 
-## Phase 4: Observability
+- [x] One production `ResearchAgent` path with provider-native tool calls.
+- [x] Async tool registry with concurrent read-only execution.
+- [x] Append-only model/tool event log and durable failure records.
+- [x] Final-answer validation, partial-result termination, and output-limit continuation.
+- [x] Workspace/SSRF/sandbox boundaries and compact source context.
+- [x] Retrieval safeguards for DuckDuckGo blocking and arXiv relevance/exact IDs.
 
-- [x] Track prompt versions and harness config snapshots per run.
-- [x] Add cost accounting for real model/tool calls.
-- [x] Add structured failure taxonomies.
-- [x] Add a run viewer or notebook export for traces and artifacts.
+## Next: document and source quality
 
-## Phase 5: Harness Debugger
+- [ ] Persist fetched documents as hashed sectioned records, rather than only returning a bounded body.
+- [ ] Add `inspect_document_metadata`, `read_document_section`, and `search_within_document` tools.
+- [ ] Add source-quality and diversity checks to final validation without prescribing which sources the model must use.
+- [ ] Add tested fallbacks for search providers that require keys or block automated requests.
+- [ ] Record renderer provenance when curl.md is used and make the renderer selectable by policy.
 
-- [x] Expand failure localization from simple heuristics to component-level
-  diagnosis.
-- [x] Compare trace patterns across runs.
-- [x] Score harness-change proposals against risk and expected value.
+## Next: budgets and observability
 
-## Phase 6: Gated Adaptive Harness Evolution
+- [ ] Expose CLI cost/runtime/tool-call caps and show the remaining budget in compact tool observations.
+- [ ] Add a run viewer that reads `agent_events.jsonl`, `failed_paths.json`, and cost events directly.
+- [ ] Add redaction rules for sensitive tool arguments and observations before persistence.
+- [ ] Add retry policy metadata per tool and verify retryable failures can be recovered by the model.
 
-- Save proposed changes as pending config variants.
-- Run benchmark comparisons before accepting changes.
-- Add keep/reject/ask-human decision records.
-- Prevent code mutation; allow only reviewed config or branch variants.
+## Next: controlled experiments
 
-## Phase 7: Long-Running Autonomous Research
+- [ ] Expose `inspect_evaluator`, `propose_experiment`, `submit_experiment`, `inspect_experiment_result`, and `compare_candidates` as tools backed by `ExperimentSystem`.
+- [ ] Keep evaluation, worker leasing, reproducibility records, and compare-and-swap promotion deterministic and outside model control.
+- [ ] Add experiment-tool integration tests proving a model cannot self-promote a candidate.
 
-- Add multi-cycle research loops.
-- Implement entropy injection and periodic self-review.
-- Add plateau detection using source, claim, hypothesis, and critic deltas.
-- Add human checkpoints and continuation across sessions.
+## Next: cross-run learning
+
+- [ ] Persist compact trajectory summaries: task characteristics, tools, failures, costs, source quality, answer validation, and experiment outcomes.
+- [ ] Add a `search_prior_trajectories` tool so the model may consult relevant history without being forced into past sequences.
+- [ ] Add explicit user-feedback capture and link it to prior run summaries.
+
+## Long-running research
+
+- [ ] Add resumable runs with explicit user checkpoints and cancellation semantics.
+- [ ] Add periodic context compaction that preserves citations, evaluator outputs, exact experiment configurations, and unresolved questions.
+- [ ] Add independent replay tests for native tool-call transcripts and deterministic experiment artifacts.

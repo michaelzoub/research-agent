@@ -19,7 +19,17 @@ class ToolResult:
         return {
             "status": self.status,
             "data": self.data,
-            "source_metadata": list(self.source_metadata),
+            # Full source records remain durable in the artifact store. Sending
+            # full abstracts for every search result back each turn causes
+            # context blowups and does not improve tool selection.
+            "source_metadata": [
+                {
+                    key: (str(source.get(key) or "")[:400] if key == "summary" else source.get(key))
+                    for key in ("id", "title", "url", "source_type", "relevance_score", "summary")
+                    if source.get(key) is not None
+                }
+                for source in self.source_metadata
+            ],
             "error": self.error,
             "retryable": self.retryable,
         }

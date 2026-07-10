@@ -20,7 +20,7 @@ from .agents import (
 from .llm import LLMClient
 from .loops import EvaluatorRegistry, EvolutionaryOuterLoop, TaskRouter, _loop_objective_from_goal
 from .run_benchmarks import write_run_benchmarks
-from .schemas import AgentBudget, AgentTrace, CostEvent, LoopIteration, LoopTask, ResearchPlan, RunRecord, SourceStrategyItem, TaskType, now_iso, to_dict
+from .schemas import AgentBudget, AgentTrace, CostEvent, LoopIteration, LoopTask, LoopTaskAction, ResearchPlan, RunRecord, SourceStrategyItem, TaskType, new_id, now_iso, to_dict
 from .search import AlchemySearch, ArxivSearch, LocalCorpusSearch, SearchBackend
 from .search import DocsBlogsSearch
 from .search import GitHubSearch
@@ -35,27 +35,15 @@ from .steering import start_cli_steering
 from .store import ArtifactStore
 
 
-STOPPING_SIGNALS = [
-    "no meaningful new sources after N cycles",
-    "no new high-confidence claims",
-    "hypotheses converge",
-    "critic finds no new major objections",
-    "benchmark/evaluation score plateaus",
-    "cost budget reached",
-    "time budget reached",
-    "human approval needed",
-]
-
+#Takeaway: codex tends to be lazy and takes the most straightforward approach even though it's explictely mentioned not to in skills folder and in the prompt.
+#Seems like the agent got "overfit" and follows user queries too literally instead of following the exact approach.
+#Should also look into context rot, does it see existing code and start writing bad code as well?
 
 BOUNDED_MARKERS = {
-    "optimize",
     "debug",
     "fix",
     "implement",
-    "compare",
     "benchmark",
-    "choose",
-    "rank",
     "who founded",
 }
 
@@ -221,6 +209,7 @@ class Orchestrator:
             store.update_run(run)
             self._write_prd(store, run, plan, source_strategy, selected_mode, stage="completed")
             cost_payload["completed_at"] = run.completed_at
+            #todoz; check cosr func
             store.write_cost(cost_payload)
             write_run_benchmarks(store)
             store.append_progress(
@@ -349,7 +338,7 @@ class Orchestrator:
         if loop_tasks:
             tasks = [_prd_task_from_loop_task(task, index) for index, task in enumerate(loop_tasks, start=1)]
         else:
-            tasks = self._standard_prd_tasks(selected_mode, plan, source_strategy, store.list("agent_traces"))
+            tasks = []
         payload = {
             "schema_version": "research_harness_prd_v1",
             "stage": stage,
@@ -359,7 +348,7 @@ class Orchestrator:
             "product_agent": run.product_agent,
             "goal": run.user_goal,
             "agent_harness": {
-                "definition": "A product agent is model + harness: model client, loop policy, tools/evaluators, artifact store, budgets, traces, and stopping rules.",
+                "definition": "A product agent is model + harness: model client, loop policy, tools/evaluators, artifact store, budgets, and traces.",
                 "runtime_mode": run.task_mode,
                 "parallelism_policy": "The orchestrator may fan out role agents or variant evaluations with asyncio.gather when task dependencies allow it.",
             },
@@ -405,106 +394,10 @@ class Orchestrator:
             },
             "notes": [
                 "This file is the run-local PRD/task map.",
-                "Use organized_tasks for the ordered work plan, status, dependencies, and acceptance criteria.",
+                "organized_tasks is populated from runtime loop_tasks after the deterministic loop creates work.",
             ],
         }
         store.write_prd(payload)
-
-    def _standard_prd_tasks(
-        self,
-        selected_mode: str,
-        plan: ResearchPlan,
-        source_strategy: list[SourceStrategyItem],
-        traces: list[dict[str, object]],
-    ) -> list[dict[str, object]]:
-        tasks: list[dict[str, object]] = []
-        if selected_mode == "deterministic":
-            first = source_strategy[0]
-            tasks.append(
-                _prd_task(
-                    1,
-                    "Search initial evidence",
-                    "search",
-                    {"retriever": first.retriever, "purpose": first.purpose, "queries": first.queries},
-                    ["Retrieve sources", "Extract traceable claims"],
-                    [],
-                    traces,
-                    "search_literature",
-                )
-            )
-            tasks.append(
-                _prd_task(2, "Critique evidence", "critique", {}, ["Review claims", "Record contradictions or questions"], ["US-001"], traces, "critic_reviewer")
-            )
-            tasks.append(
-                _prd_task(3, "Synthesize report", "synthesize", {}, ["Write final_report.md"], ["US-002"], traces, "synthesis_agent")
-            )
-            return tasks
-
-        for index, item in enumerate(source_strategy[: self.config.search_agent_count], start=1):
-            tasks.append(
-                _prd_task(
-                    index,
-                    f"Search {item.purpose}",
-                    "search",
-                    {"retriever": item.retriever, "purpose": item.purpose, "queries": item.queries},
-                    ["Retrieve sources", "Extract claims", "Record failed paths if evidence is unavailable"],
-                    [],
-                    traces,
-                    "search_literature",
-                )
-            )
-        offset = len(tasks)
-        for index, angle in enumerate(plan.hypothesis_angles[: self.config.hypothesis_agent_count], start=offset + 1):
-            tasks.append(
-                _prd_task(
-                    index,
-                    f"Generate hypotheses for {angle}",
-                    "hypothesize",
-                    {"hypothesis_angle": angle},
-                    ["Inspect claims", "Create hypotheses or open questions"],
-                    [task["id"] for task in tasks if task["kind"] == "search"],
-                    traces,
-                    "hypothesis_generation",
-                )
-            )
-        tasks.append(
-            _prd_task(
-                len(tasks) + 1,
-                "Critique claims and hypotheses",
-                "critique",
-                {},
-                ["Review claims", "Record contradictions and open questions"],
-                [task["id"] for task in tasks],
-                traces,
-                "critic_reviewer",
-            )
-        )
-        tasks.append(
-            _prd_task(
-                len(tasks) + 1,
-                "Synthesize final report",
-                "synthesize",
-                {},
-                ["Write final_report.md", "Summarize sources, claims, hypotheses, and caveats"],
-                [tasks[-1]["id"]],
-                traces,
-                "synthesis_agent",
-            )
-        )
-        if self.config.include_debugger:
-            tasks.append(
-                _prd_task(
-                    len(tasks) + 1,
-                    "Inspect harness behavior",
-                    "debug_harness",
-                    {},
-                    ["Record constrained harness-change proposal"],
-                    [tasks[-1]["id"]],
-                    traces,
-                    "harness_debugger",
-                )
-            )
-        return tasks
 
     def classify_task(self, goal: str) -> TaskType:
         normalized = goal.lower()
@@ -516,22 +409,12 @@ class Orchestrator:
         interpretation = self.interpret_goal(goal)
         task_type = interpretation["task_type"] if interpretation["task_type"] in {"bounded", "open_ended"} else self.classify_task(goal)
         topics = set(str(topic) for topic in interpretation.get("topics", []) if topic)
-        if "prediction_market" in topics and _is_prediction_market_challenge_goal(goal, self.config.evaluator_name):
-            search_angles = [
-                "challenge-specific evidence requested by the prompt",
-                "candidate design constraints from retrieved sources",
-                "evaluation failures and alternative approaches",
-            ]
-            hypothesis_angles = ["evidence-backed strategy direction", "risk mitigation", "alternative approach"]
-            strategy = "Ground the challenge in prompt-derived and retrieved evidence before optimizing strategy code."
-        elif task_type == "bounded":
-            search_angles = _derive_search_angles(goal, interpretation, task_type, limit=3)
-            hypothesis_angles = _derive_hypothesis_angles(goal, interpretation, task_type, limit=2)
-            strategy = "Assign bounded roles and collect evidence against explicit success criteria."
-        else:
-            search_angles = _derive_search_angles(goal, interpretation, task_type, limit=4)
-            hypothesis_angles = _derive_hypothesis_angles(goal, interpretation, task_type, limit=2)
-            strategy = "Use a lead research agent to start wide across independent subagent searches, then narrow with critic-driven convergence."
+        search_limit = 3 if task_type == "bounded" else 4
+        search_angles = _derive_search_angles(goal, interpretation, task_type, limit=search_limit)
+        hypothesis_angles = _derive_hypothesis_angles(goal, interpretation, task_type, limit=2)
+        strategy = "Use deterministic prompt-derived directions; let retrieved evidence, evaluator feedback, and critic output decide subsequent work."
+        if self.config.evaluator_name == "prediction_market" or "prediction" in goal.lower().replace("-", " "):
+            strategy += " Treat prediction-market challenge success as measured only by the official evaluator."
         search_angles = _apply_prior_memory_to_angles(search_angles, prior_run_memory, limit=len(search_angles))
         hypothesis_angles = _apply_prior_memory_to_angles(hypothesis_angles, prior_run_memory, limit=len(hypothesis_angles))
         return ResearchPlan(
@@ -540,7 +423,7 @@ class Orchestrator:
             strategy=strategy,
             search_angles=search_angles,
             hypothesis_angles=hypothesis_angles,
-            stopping_signals=STOPPING_SIGNALS,
+            stopping_signals=[],
             topics=sorted(topics),
             topic_queries=[str(query) for query in interpretation.get("topic_queries", []) if query],
             planner=str(interpretation.get("planner", "deterministic-fallback")),
@@ -548,11 +431,14 @@ class Orchestrator:
 
     def interpret_goal(self, goal: str) -> dict[str, Any]:
         if self.llm.is_live:
+            #todo: ?
             system = (
                 "You interpret research-harness goals for planning and source selection. "
                 "Infer the user's domain and intent semantically, including typos and abbreviations. "
                 "Return JSON only with: task_type ('bounded' or 'open_ended'), topics (short snake_case strings), "
                 "topic_queries (4-8 specific paper-search keyword queries or exact phrases), and rationale.\n\n"
+                "Default to open_ended unless the prompt or evaluator supplies a concrete external success criterion. "
+                "Preserve ambiguity by emitting topic_queries that test competing framings, counterevidence, and unresolved mechanisms.\n\n"
                 "For topic_queries: write the actual search strings a literature retriever should send to "
                 "arXiv/OpenAlex/Semantic Scholar style tools. Prefer precise technical phrases, canonical method "
                 "names, benchmark/dataset names, and survey phrases. Avoid generic words like 'find papers', "
@@ -563,16 +449,11 @@ class Orchestrator:
                     "goal": goal,
                     "requested_task_mode": self.config.task_mode,
                     "selected_evaluator": self.config.evaluator_name,
-                    "known_evaluators": ["length_score", "prediction_market"],
-                    "note": (
-                        "If selected_evaluator is prediction_market, treat the task as prediction-market "
-                        "market-making even when the goal has typos such as 'predictionm arket' or shorthand like mm'ing."
-                    ),
                 },
                 sort_keys=True,
             )
             try:
-                payload = self.llm.complete_json(system, user, max_output_tokens=700, temperature=0.1)
+                payload = self.llm.complete_json(system, user, max_output_tokens=700, temperature=0.45)
                 return _normalize_goal_interpretation(payload, fallback_task_type=self.classify_task(goal), planner="llm")
             except Exception:
                 pass
@@ -587,8 +468,6 @@ class Orchestrator:
         retriever = self.config.retriever.lower()
         strategy_goal = goal
         strategy_goal = _goal_with_prior_memory_context(strategy_goal, prior_run_memory)
-        if "prediction_market" in set(plan.topics) and _is_prediction_market_challenge_goal(goal, self.config.evaluator_name):
-            strategy_goal = _goal_with_prior_memory_context(goal, prior_run_memory)
         if retriever == "local":
             return [
                 SourceStrategyItem(
@@ -868,145 +747,46 @@ class Orchestrator:
         if selected_mode == "optimize_query":
             return self._create_optimize_query_tasks(product_agent)
         tasks = [
-            LoopTask(
-                title="Ingest prompt and select task mode",
-                action="debug_harness",
-                priority=1,
-                params={"selected_mode": selected_mode, "product_agent": product_agent},
-                acceptance_criteria=[
-                    "Explicit flags, evaluator availability, and prompt heuristics were checked",
-                    "A task ingestion decision was persisted",
-                    f"The `{product_agent}` product agent was selected",
-                ],
-            ),
-            LoopTask(
-                title=f"Run {product_agent} agent loop",
-                action="debug_harness",
-                priority=2,
-                params={"selected_mode": selected_mode, "product_agent": product_agent},
-                acceptance_criteria=[
-                    "The agent harness ran model/tool/state loop steps for this product option",
-                    "Research mode used breadth-first parallel query variants before narrowing",
-                    "The outer loop proposed code or query variants",
-                    "The selected inner loop returned ranked variants with scalar scores",
-                    "Plateau or threshold stopping signals were evaluated",
-                ],
-            ),
+            self._runtime_checkpoint_task(1, "router", "debug_harness", selected_mode, product_agent),
+            self._runtime_checkpoint_task(2, "outer_loop", "debug_harness", selected_mode, product_agent),
         ]
         if selected_mode == "research":
-            tasks.append(
-                LoopTask(
-                    title="Generate hypotheses from winning evidence",
-                    action="hypothesize",
-                    priority=3,
-                    params={},
-                    acceptance_criteria=["Claims from research variants were inspected", "Hypotheses or open questions were created"],
-                )
-            )
-        tasks.extend(
-            [
-                LoopTask(
-                    title="Critique ranked variants and claims",
-                    action="critique",
-                    priority=4,
-                    params={},
-                    acceptance_criteria=["Artifacts were reviewed for contradictions, weak evidence, or missing checks"],
-                ),
-                LoopTask(
-                    title="Synthesize evolutionary run report",
-                    action="synthesize",
-                    priority=5,
-                    params={},
-                    acceptance_criteria=["Final report was written from run artifacts"],
-                ),
-            ]
-        )
+            tasks.append(self._runtime_checkpoint_task(len(tasks) + 1, "post_loop_hypothesis", "hypothesize", selected_mode, product_agent))
+        tasks.append(self._runtime_checkpoint_task(len(tasks) + 1, "critic", "critique", selected_mode, product_agent))
+        tasks.append(self._runtime_checkpoint_task(len(tasks) + 1, "synthesis", "synthesize", selected_mode, product_agent))
         if self.config.include_debugger:
-            tasks.append(
-                LoopTask(
-                    title="Inspect harness behavior and propose improvements",
-                    action="debug_harness",
-                    priority=6,
-                    params={},
-                    acceptance_criteria=["A constrained harness-change proposal was recorded"],
-                )
-            )
+            tasks.append(self._runtime_checkpoint_task(len(tasks) + 1, "debugger", "debug_harness", selected_mode, product_agent))
         return tasks
 
     def _create_optimize_query_tasks(self, product_agent: str = "optimize") -> list[LoopTask]:
-        optimizer_label = "challenge" if product_agent == "challenge" else "optimization"
         tasks = [
-            LoopTask(
-                title="Ingest prompt and select task mode",
-                action="debug_harness",
-                priority=1,
-                params={"selected_mode": "optimize_query", "product_agent": product_agent},
-                acceptance_criteria=[
-                    "Explicit mode or auto-router selected optimization-query exploration",
-                    "A task ingestion decision was persisted",
-                    f"The `{product_agent}` product agent was selected",
-                ],
-            ),
-            LoopTask(
-                title=f"Generate and evaluate {optimizer_label} strategy queries",
-                action="search",
-                priority=2,
-                params={"selected_mode": "optimize_query", "product_agent": product_agent},
-                acceptance_criteria=[
-                    "The agent harness ran a query-research loop before optimization",
-                    "Outer loop proposed query variants about the optimization target",
-                    "OptimizationQueryLoop scored query variants for evidence and implementability",
-                    "Ranked query evaluations were persisted",
-                ],
-            ),
-            LoopTask(
-                title="Compile optimizer seed context",
-                action="debug_harness",
-                priority=3,
-                params={},
-                acceptance_criteria=[
-                    "Top query findings were summarized",
-                    "optimizer_seed_context.json was written",
-                ],
-            ),
-            LoopTask(
-                title="Run optimizer variants from query seed context",
-                action="debug_harness",
-                priority=4,
-                params={"product_agent": product_agent},
-                acceptance_criteria=[
-                    "If evaluator exists, optimize/code variants were evaluated",
-                    "If evaluator is missing, optimizer phase was explicitly skipped",
-                    "Challenge agents may additionally emit a runnable solution artifact for official grading",
-                    "Explicit objective targets from the prompt must be met before this PRD item passes",
-                ],
-            ),
-            LoopTask(
-                title="Critique ranked query and optimizer results",
-                action="critique",
-                priority=5,
-                params={},
-                acceptance_criteria=["Artifacts were reviewed for contradictions, weak evidence, or missing checks"],
-            ),
-            LoopTask(
-                title="Synthesize optimize-query run report",
-                action="synthesize",
-                priority=6,
-                params={},
-                acceptance_criteria=["Final report included query findings and optimizer seed context"],
-            ),
+            self._runtime_checkpoint_task(1, "router", "debug_harness", "optimize_query", product_agent),
+            self._runtime_checkpoint_task(2, "query_outer_loop", "search", "optimize_query", product_agent),
+            self._runtime_checkpoint_task(3, "seed_context", "debug_harness", "optimize_query", product_agent),
+            self._runtime_checkpoint_task(4, "optimizer", "debug_harness", "optimize_query", product_agent),
+            self._runtime_checkpoint_task(5, "critic", "critique", "optimize_query", product_agent),
+            self._runtime_checkpoint_task(6, "synthesis", "synthesize", "optimize_query", product_agent),
         ]
         if self.config.include_debugger:
-            tasks.append(
-                LoopTask(
-                    title="Inspect harness behavior and propose improvements",
-                    action="debug_harness",
-                    priority=7,
-                    params={},
-                    acceptance_criteria=["A constrained harness-change proposal was recorded"],
-                )
-            )
+            tasks.append(self._runtime_checkpoint_task(7, "debugger", "debug_harness", "optimize_query", product_agent))
         return tasks
+
+    def _runtime_checkpoint_task(
+        self,
+        priority: int,
+        phase: str,
+        action: LoopTaskAction,
+        selected_mode: str,
+        product_agent: str,
+    ) -> LoopTask:
+        nonce = new_id("slot")
+        return LoopTask(
+            title=f"{product_agent}:{selected_mode}:{phase}:{nonce}",
+            action=action,
+            priority=priority,
+            params={"selected_mode": selected_mode, "product_agent": product_agent, "runtime_phase": phase, "nonce": nonce},
+            acceptance_criteria=[f"Persist runtime artifact for phase `{phase}` using current deterministic loop state."],
+        )
 
     async def _record_task_result(
         self, run: RunRecord, store: ArtifactStore, task: LoopTask, iteration: int, result: AgentResult
@@ -1246,6 +1026,7 @@ class Orchestrator:
             reporting_schema=self.config.default_budget.reporting_schema,
         )
 
+    #todo: parallelize this
     def _retriever_for(self, retriever: str) -> SearchBackend:
         retriever = retriever.lower()
         if retriever == "local":
@@ -1648,29 +1429,30 @@ def _derive_search_angles(goal: str, interpretation: dict[str, Any], task_type: 
     topic_queries = [str(query) for query in interpretation.get("topic_queries", []) if str(query).strip()]
     terms = _goal_terms(goal)
     anchors = _phrase_chunks_from_goal(goal, terms, limit=limit)
-    angles: list[str] = []
-    for query in topic_queries:
-        angles.append(f"prompt-derived query: {_short_query_label(query)}")
-    for anchor in anchors:
-        angles.append(f"evidence about {anchor}")
-    if task_type == "bounded":
-        angles.append(f"constraints in {anchors[0] if anchors else 'the requested objective'}")
-    else:
-        angles.append(f"counter-evidence about {anchors[0] if anchors else 'the requested claim'}")
-    return _dedupe_strings(angles)[:limit] or ["prompt-derived evidence"]
+    candidates = [f"query {_short_query_label(query)}" for query in topic_queries]
+    candidates.extend(f"axis {anchor}" for anchor in anchors)
+    if task_type == "bounded" and anchors:
+        candidates.append(f"constraints {anchors[0]}")
+    elif anchors:
+        candidates.append(f"counterevidence {anchors[0]}")
+    if not candidates:
+        candidates = [goal]
+    return _dedupe_strings(candidates)[:limit]
 
 
 def _derive_hypothesis_angles(goal: str, interpretation: dict[str, Any], task_type: TaskType, limit: int) -> list[str]:
     terms = _goal_terms(goal)
     anchors = _phrase_chunks_from_goal(goal, terms, limit=max(limit, 2))
     topic_queries = [str(query) for query in interpretation.get("topic_queries", []) if str(query).strip()]
-    angles = [f"claim about {anchor}" for anchor in anchors]
-    angles.extend(f"direction from {_short_query_label(query)}" for query in topic_queries[:limit])
-    if task_type == "bounded":
-        angles.append(f"way to satisfy {anchors[0] if anchors else 'the objective'}")
-    else:
-        angles.append(f"open question from {anchors[0] if anchors else 'the prompt'}")
-    return _dedupe_strings(angles)[:limit] or ["prompt-derived direction"]
+    angles = [f"angle {anchor}" for anchor in anchors]
+    angles.extend(f"query {_short_query_label(query)}" for query in topic_queries)
+    if task_type == "bounded" and anchors:
+        angles.append(f"success criterion {anchors[0]}")
+    elif anchors:
+        angles.append(f"open question {anchors[0]}")
+    if not angles:
+        angles = [goal]
+    return _dedupe_strings(angles)[:limit]
 
 
 def _phrase_chunks_from_goal(goal: str, terms: list[str], limit: int) -> list[str]:
@@ -1761,7 +1543,7 @@ def _mixed_source_strategy(goal: str, plan: ResearchPlan) -> list[SourceStrategy
             limit=8,
         ),
         SourceStrategyItem(
-            name="resource_signals",
+            name="resource_artifacts",
             retriever="github",
             purpose="prompt-related resources and artifacts",
             queries=[implementation_query, f"{core} resources artifacts"],
@@ -1782,9 +1564,9 @@ def _mixed_source_strategy(goal: str, plan: ResearchPlan) -> list[SourceStrategy
             limit=6,
         ),
         SourceStrategyItem(
-            name="social_trend_signals",
+            name="public_discussion_sources",
             retriever="twitter",
-            purpose="public social trend signals",
+            purpose="public social discussion",
             queries=[social_query, f"{core} public discussion"],
             limit=6,
         ),
@@ -1838,13 +1620,6 @@ def _looks_like_scholarly_request(goal: str, plan: ResearchPlan) -> bool:
     return False
 
 
-def _is_prediction_market_challenge_goal(goal: str, evaluator_name: Optional[str] = None) -> bool:
-    normalized = goal.lower()
-    if evaluator_name == "prediction_market":
-        return True
-    return any(term in normalized for term in ["challenge", "orderbook", "order book", "market-making", "market making", "mm'ing"])
-
-
 def _normalize_goal_interpretation(payload: dict[str, object], *, fallback_task_type: TaskType, planner: str) -> dict[str, Any]:
     raw_topics = payload.get("topics", [])
     topics = [str(topic).strip().lower().replace("-", "_").replace(" ", "_") for topic in raw_topics if str(topic).strip()] if isinstance(raw_topics, list) else []
@@ -1870,7 +1645,7 @@ def _fallback_goal_interpretation(goal: str, evaluator_name: Optional[str], fall
         "task_type": fallback_task_type,
         "topics": sorted(topics),
         "topic_queries": _topic_query_lenses(goal, topics),
-        "rationale": "Offline deterministic fallback used because live LLM interpretation was unavailable.",
+        "rationale": "Offline deterministic fallback used prompt terms in stable order because live LLM interpretation was unavailable.",
         "planner": "deterministic-fallback",
     }
 
@@ -1887,9 +1662,6 @@ def _dedupe_strings(values: list[str]) -> list[str]:
 
 
 def _broad_landscape_query(goal: str, plan: ResearchPlan) -> str:
-    topics = set(plan.topics)
-    if "prediction_market" in topics and _is_prediction_market_challenge_goal(goal):
-        return "prediction markets"
     terms = _goal_terms(goal)
     if not terms:
         return goal
@@ -1897,78 +1669,49 @@ def _broad_landscape_query(goal: str, plan: ResearchPlan) -> str:
 
 
 def _fallback_prompt_topics(goal: str) -> set[str]:
-    normalized = goal.lower()
-    topics: set[str] = set()
-    if "prediction market" in normalized or "prediction-market" in normalized:
-        topics.add("prediction_market" if _is_prediction_market_challenge_goal(goal) else "prediction_markets")
-    if any(term in normalized for term in ["machine learning", "deep learning", "ml "]) and any(
-        term in normalized for term in ["stock", "finance", "financial", "trading", "market", "markets"]
-    ):
-        topics.add("finance_ml")
-    if any(term in normalized for term in ["amm", "lmsr", "automated market maker", "constant product"]):
-        topics.add("amm")
-    if any(term in normalized for term in ["options", "option pricing", "black scholes", "volatility"]):
-        topics.add("options")
-    if any(term in normalized for term in ["entropy", "exploration", "regularization"]):
-        topics.add("entropy")
-    if any(term in normalized for term in ["agent", "llm", "multi-agent", "tool use", "react", "reflexion"]):
-        topics.add("agents")
-    if any(term in normalized for term in ["brain", "neuroscience", "cognitive"]):
-        topics.add("neuroscience")
-    return topics
+    terms = _goal_terms(goal)
+    if not terms:
+        return set()
+    return {term.replace("-", "_") for term in terms[: min(4, len(terms))]}
 
 
-def _topic_query_lenses(goal: str, topics: set[str]) -> list[str]:
-    queries: list[str] = []
+def _topic_query_lenses(goal: str, _topics: set[str]) -> list[str]:
     core_terms = _goal_terms(goal)
-    core = _prompt_phrase_core(goal, core_terms)
-    if "prediction_market" in topics:
-        queries.append("prediction market challenge evaluation strategy implementation")
-        queries.append("prediction market trading strategy empirical evaluation")
-        queries.append("prediction market simulator strategy benchmark")
-    if "prediction_markets" in topics:
-        queries.append(f"{core} forecasting calibration evidence")
-        queries.append(f"{core} market prices probability evidence")
-    if "finance_ml" in topics:
-        queries.append(f"{core} empirical evidence")
-        queries.append(f"{core} forecasting evaluation")
-    if "amm" in topics:
-        queries.append(f"{core} liquidity cost function evidence")
-        queries.append(f"{core} arbitrage inventory risk")
-    if "entropy" in topics:
-        queries.append(f"{core} entropy exploration evidence")
-    if "options" in topics:
-        queries.append(f"{core} volatility hedging risk evidence")
-    if "agents" in topics:
-        queries.append(f"{core} agent evidence evaluation")
-    if "neuroscience" in topics:
-        queries.append(f"{core} neuroscience cognitive evidence")
-    deduped: list[str] = []
-    for query in queries:
-        if query not in deduped:
-            deduped.append(query)
-    return deduped
+    if not core_terms:
+        return [goal]
+    queries: list[str] = []
+    if "prediction_market" in _topics:
+        queries.append("prediction market challenge official evaluator")
+    phrase_core = _prompt_phrase_core(goal, core_terms)
+    if phrase_core:
+        queries.append(phrase_core)
+    max_queries = min(6, max(1, len(core_terms)))
+    for start in range(max_queries):
+        window = min(5, len(core_terms))
+        chunk = core_terms[start : start + window]
+        if len(chunk) < min(2, len(core_terms)):
+            break
+        queries.append(" ".join(chunk))
+    return _dedupe_strings(queries)
 
 
 def _prompt_phrase_core(goal: str, core_terms: list[str]) -> str:
+    if not core_terms:
+        return goal
     normalized = goal.lower()
-    phrases = []
-    for phrase in [
+    phrases = [
         "machine learning",
-        "automated market maker",
         "prediction market",
-        "stock",
-        "artificial intelligence",
+        "automated market maker",
         "large language model",
-    ]:
-        if phrase in normalized:
-            phrases.append(phrase)
-    words = phrases + core_terms[:8]
-    deduped: list[str] = []
-    for word in words:
-        if word not in deduped:
-            deduped.append(word)
-    return " ".join(deduped) or goal
+        "self evolving",
+        "self improving",
+    ]
+    selected = [phrase for phrase in phrases if phrase in normalized]
+    if "stock" in normalized:
+        selected.append("stock")
+    selected.extend(core_terms[: min(8, len(core_terms))])
+    return " ".join(_dedupe_strings(selected))
 
 
 def _read_json_if_exists(path: Path) -> dict[str, object]:
@@ -2049,36 +1792,4 @@ def _prd_task_from_loop_task(task: dict[str, object], index: int) -> dict[str, o
         "acceptanceCriteria": task.get("acceptance_criteria", []),
         "result_summary": task.get("result_summary"),
         "last_error": task.get("last_error"),
-    }
-
-
-def _prd_task(
-    index: int,
-    title: str,
-    kind: str,
-    params: dict[str, object],
-    acceptance_criteria: list[str],
-    dependencies: list[str],
-    traces: list[dict[str, object]],
-    role: str,
-) -> dict[str, object]:
-    matching = [trace for trace in traces if trace.get("role") == role]
-    failed = [trace for trace in matching if trace.get("status") != "completed"]
-    status = "pending"
-    if matching:
-        status = "failed" if failed else "passed"
-    return {
-        "id": f"US-{index:03d}",
-        "title": title,
-        "kind": kind,
-        "priority": index,
-        "status": status,
-        "passes": bool(matching and not failed),
-        "attempts": len(matching),
-        "dependencies": dependencies,
-        "params": params,
-        "acceptanceCriteria": acceptance_criteria,
-        "result_summary": matching[-1].get("output_summary") if matching else None,
-        "last_error": "; ".join(str(error) for trace in failed for error in trace.get("errors", [])) or None,
-        "trace_ids": [trace.get("id") for trace in matching],
     }

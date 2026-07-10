@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,7 @@ from .schemas import (
     TaskMode,
     Variant,
     VariantEvaluation,
+    new_id,
     now_iso,
 )
 from .search import SearchBackend
@@ -62,6 +64,15 @@ PREDICTION_MARKET_DEFAULT_SIMULATION_COUNT = 24
 PREDICTION_MARKET_DEFAULT_SIMULATIONS = str(PREDICTION_MARKET_DEFAULT_SIMULATION_COUNT)
 PREDICTION_MARKET_DEFAULT_SEED_START = "0"
 PREDICTION_MARKET_EVAL_PROTOCOL = "paired_crn_fixed_seed_range"
+
+
+@dataclass(frozen=True)
+class PredictionMarketPreflightResult:
+    ok: bool
+    reason: str
+    upstream_path: Optional[str] = None
+    execution_mode: str = "unavailable"
+    docker_sandbox: bool = False
 
 
 def _find_pm_upstream_path() -> Optional[Path]:
@@ -103,6 +114,64 @@ def _is_pm_upstream_repo(path: Path) -> bool:
     except OSError:
         return False
     return 'orderbook-pm = "orderbook_pm_challenge.cli:main"' in text
+
+
+def _prediction_market_official_preflight() -> PredictionMarketPreflightResult:
+    """Check that the official prediction-market evaluator can run before optimization.
+
+    This is intentionally stricter than `_run_prediction_market_official`: direct
+    calls may still return an unmeasured debug payload, but optimizer runs need a
+    real upstream scorer available before candidates are generated.
+    """
+    upstream_path = _find_pm_upstream_path()
+    if upstream_path is None:
+        return PredictionMarketPreflightResult(
+            ok=False,
+            reason=(
+                "prediction-market upstream scorer not found; set "
+                "PREDICTION_MARKET_CHALLENGE_PATH or keep the vendored challenge present"
+            ),
+        )
+    if os.environ.get("PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM") == "1":
+        if shutil.which("uv") is None:
+            return PredictionMarketPreflightResult(
+                ok=False,
+                reason="PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM=1 but `uv` is not on PATH",
+                upstream_path=str(upstream_path),
+                execution_mode="host",
+                docker_sandbox=False,
+            )
+        return PredictionMarketPreflightResult(
+            ok=True,
+            reason="official upstream scorer available via host `uv run`",
+            upstream_path=str(upstream_path),
+            execution_mode="host",
+            docker_sandbox=False,
+        )
+    runner = DockerSandboxRunner()
+    if not runner.available:
+        return PredictionMarketPreflightResult(
+            ok=False,
+            reason="docker executable not found; start Docker or set PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM=1",
+            upstream_path=str(upstream_path),
+            execution_mode="docker",
+            docker_sandbox=True,
+        )
+    if not runner.daemon_available:
+        return PredictionMarketPreflightResult(
+            ok=False,
+            reason="docker daemon is not reachable; start Docker Desktop or set PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM=1",
+            upstream_path=str(upstream_path),
+            execution_mode="docker",
+            docker_sandbox=True,
+        )
+    return PredictionMarketPreflightResult(
+        ok=True,
+        reason="official upstream scorer available through Docker sandbox",
+        upstream_path=str(upstream_path),
+        execution_mode="docker",
+        docker_sandbox=True,
+    )
 
 
 @dataclass
@@ -230,7 +299,7 @@ class OptimizeLoop:
 class ResearchLoop:
     mode: TaskMode = "research"
 
-    def __init__(self, run_id: str, search_factory: SearchFactory, llm: Optional[LLMClient] = None, pass_threshold: float = 0.78):
+    def __init__(self, run_id: str, search_factory: SearchFactory, llm: Optional[LLMClient] = None, pass_threshold: float = 0.92):
         self.run_id = run_id
         self.search_factory = search_factory
         self.llm = llm or LLMClient()
@@ -258,7 +327,7 @@ class ResearchLoop:
                 source = store.add_source(backend.to_source(document, relevance))
                 sources.append(source)
                 for claim_text in document.claims[:3]:
-                    confidence = round((source.credibility_score * 0.7) + (relevance * 0.3), 2)
+                    confidence = min(0.74, round((source.credibility_score * 0.7) + (relevance * 0.3), 2))
                     store.add_claim(
                         Claim(
                             text=claim_text,
@@ -479,7 +548,7 @@ class OptimizationQueryLoop:
 
     mode: TaskMode = "optimize_query"
 
-    def __init__(self, run_id: str, search_factory: SearchFactory, llm: Optional[LLMClient] = None, pass_threshold: float = 0.78):
+    def __init__(self, run_id: str, search_factory: SearchFactory, llm: Optional[LLMClient] = None, pass_threshold: float = 0.92):
         self.run_id = run_id
         self.llm = llm or LLMClient()
         self.pass_threshold = pass_threshold
@@ -560,7 +629,7 @@ class OptimizationQueryLoop:
 
 
 class PlateauDetector:
-    _RECOVERY_ACTIONS = ("new_strategy_family", "literature_mechanism", "alternative_evaluator", "fresh_search_context")
+    _RECOVERY_ACTIONS = ("uncertainty_axis", "literature_mechanism", "alternative_evaluator", "fresh_search_context")
 
     def __init__(self, mode: TaskMode, patience: Optional[int] = None):
         self.mode = mode
@@ -934,8 +1003,38 @@ class EvolutionaryOuterLoop:
 
         store.append_progress("Optimizer phase: starting code/strategy variants from query seed context")
         seed_parents = self._seed_context_variants(seed_context)
-        self.population_size = optimizer_population_size
+        lane_count = (
+            min(len(seed_parents), self._optimizer_lane_count())
+            if self.evaluator_name == "prediction_market" and seed_parents
+            else 0
+        )
+        if lane_count > 0:
+            seed_parents = seed_parents[:lane_count]
+            self.population_size = lane_count
+            store.append_progress(
+                f"Optimizer phase: using {lane_count} stable strategy lane(s), one per configured LLM; "
+                "candidate files reuse the source query ids."
+            )
+        else:
+            self.population_size = optimizer_population_size
         if self.evaluator_name == "prediction_market":
+            preflight = _prediction_market_official_preflight()
+            store.append_progress(
+                f"Prediction-market official evaluator preflight: ok={preflight.ok} "
+                f"mode={preflight.execution_mode} reason={preflight.reason}"
+            )
+            if not preflight.ok:
+                store.add_failed_path(
+                    FailedPath(
+                        description="Prediction-market optimizer preflight failed before candidate generation",
+                        reason=preflight.reason,
+                        created_by_agent="prediction_market_preflight",
+                        run_id=self.run_id,
+                        retryable=True,
+                    )
+                )
+                self._write_prediction_market_preflight_failure(store, preflight)
+                raise RuntimeError(f"Prediction-market official evaluator preflight failed: {preflight.reason}")
             await self._run_prediction_market_optimizer(store, seed_parents, seed_context)
             return
         optimize_loop = OptimizeLoop(self.run_id, self.evaluator, parallel_evaluator_cap=self.parallel_evaluator_cap)
@@ -1095,6 +1194,7 @@ class EvolutionaryOuterLoop:
             for variant in code_variants:
                 variant.metadata["optimizer_seed_context_path"] = str(store.optimizer_seed_context_path)
                 variant.metadata["query_seed_summary"] = seed_context.get("summary", "")
+                variant.metadata.setdefault("stable_strategy_lane", True)
                 store.add_variant(variant)
             _record_timing_trace(
                 store,
@@ -1120,12 +1220,8 @@ class EvolutionaryOuterLoop:
             ranked = sorted(eligible_evaluations, key=_prediction_market_rank_key, reverse=True)
             round_best = ranked[0] if ranked else None
             observed_ranked = sorted(evaluations, key=_prediction_market_rank_key, reverse=True)
-            observed_best = round_best or (observed_ranked[0] if observed_ranked else None)
             if round_best and (best_eval is None or _prediction_market_rank_key(round_best) > _prediction_market_rank_key(best_eval)):
                 best_eval = round_best
-                best_round_variants = code_variants
-            elif best_eval is None and observed_best is not None:
-                best_eval = observed_best
                 best_round_variants = code_variants
             plateau_signal = plateau.update(_pm_edge_from_eval(round_best))
             objective_met = self._prediction_market_objective_met(round_best)
@@ -1139,24 +1235,22 @@ class EvolutionaryOuterLoop:
                     outer_iteration=(len(store.list("evolution_rounds")) + 1),
                     mode="optimize",
                     variant_ids=[variant.id for variant in code_variants],
-                    best_variant_id=observed_best.variant_id if observed_best else None,
+                    best_variant_id=round_best.variant_id if round_best else None,
                     best_score=round_best.score if round_best else 0.0,
                     termination_signal=termination_signal,
                     plateau_count=plateau.plateau_count,
                 )
             )
             store.append_progress(
-                f"Prediction-market optimizer round {round_index}: best_edge={_pm_edge_from_eval(observed_best):.3f} "
+                f"Prediction-market optimizer round {round_index}: best_edge={_pm_edge_from_eval(round_best):.3f} "
                 f"score={round_best.score if round_best else 0.0:.3f} signal={termination_signal}"
             )
             for evaluation in observed_ranked[:3]:
                 source = evaluation.metrics.get("score_source", "unknown")
                 eligible = "eligible" if evaluation.metrics.get("score_eligible", True) else "unmeasured"
                 store.append_progress(f"  Prediction-market score {evaluation.score:.3f} ({eligible}) via {source} for {evaluation.variant_id}: {_shorten(evaluation.summary)}")
-            self._promote_round_champion(store, round_index, code_variants, observed_ranked, loop_name="challenge_optimizer_loop")
-            parents = [variant for variant in code_variants if variant.id in {evaluation.variant_id for evaluation in ranked[: self.parent_count]}]
-            if not parents:
-                parents = code_variants[: self.parent_count]
+            self._promote_round_champion(store, round_index, code_variants, ranked, loop_name="challenge_optimizer_loop")
+            parents = _prediction_market_parent_variants(code_variants, ranked, self.parent_count)
             _record_timing_trace(
                 store,
                 self.run_id,
@@ -1232,7 +1326,7 @@ class EvolutionaryOuterLoop:
                         run_id=self.run_id,
                     )
                 )
-            await self._record_literature_grounding(store, reason)
+            await self._record_literature_grounding(store, reason, requested_queries=[query] if query else None)
             return {
                 "reason": reason,
                 "requested_query": query,
@@ -1240,20 +1334,15 @@ class EvolutionaryOuterLoop:
                 "new_claims": len(store.list("claims")) - before_claims,
                 "recent_literature": _recent_literature_grounding_notes(store, limit=4),
             }
-
         def propose_strategy(state: dict[str, object]) -> dict[str, object]:
             failures = state.get("recent_failures") if isinstance(state.get("recent_failures"), list) else []
             edge_values = [float(item.get("mean_edge", 0.0)) for item in failures if isinstance(item, dict)]
-            flat_or_negative = bool(edge_values) and max(edge_values) <= 0.0
             return {
                 "failure_reflection": str(state.get("failure_reflection") or ""),
-                "next_mechanism": (
-                    "generate concrete active strategies with changed quoting, inventory, and cancellation logic"
-                    if flat_or_negative
-                    else "generate concrete active strategies and compare them against the current champion"
-                ),
-                "requires_concrete_code": True,
-                "forbidden_shortcuts": ["cancel_only", "no_trade_baseline", "parameter-only retry after negative mean_edge"],
+                "observed_failure_count": len(failures),
+                "max_recent_mean_edge": max(edge_values) if edge_values else None,
+                "next_mechanism": None,
+                "instruction": "Sample the next mechanism from the current champion, failures, literature, and evaluator state; do not use a canned mechanism.",
             }
 
         toolbox = OptimizerToolbox(
@@ -1449,15 +1538,15 @@ class EvolutionaryOuterLoop:
             return outer_iteration >= self.max_outer_iterations
         if termination_signal == "score_threshold" and self.objective.has_explicit_target:
             return self._generic_objective_met(best_eval)
-        # Mirror _should_stop_query_loop: enforce at least 2 rounds for research
-        # so a single high-scoring-but-irrelevant retrieval can't exit early.
+        # Enforce several rounds for research so a single high-scoring retrieval
+        # cannot collapse exploration before uncertainty probes run.
         if self.task_mode == "research" and termination_signal == "claim_corroboration_threshold":
-            min_rounds = min(2, self.max_outer_iterations)
+            min_rounds = min(3, self.max_outer_iterations)
             return outer_iteration >= min_rounds
         return termination_signal in {"score_threshold", "claim_corroboration_threshold", "score_plateau", "coverage_plateau"}
 
     def _should_stop_query_loop(self, termination_signal: str, outer_iteration: int) -> bool:
-        minimum_query_rounds = 2 if self.objective.no_stop_until_target else 1
+        minimum_query_rounds = 3
         if outer_iteration < min(self.max_outer_iterations, minimum_query_rounds):
             return False
         if termination_signal == "coverage_plateau" and self.objective.no_stop_until_target:
@@ -1510,7 +1599,12 @@ class EvolutionaryOuterLoop:
         async with semaphore:
             return await self._evaluate_prediction_market_variant(variant, store, round_index)
 
-    async def _record_literature_grounding(self, store: ArtifactStore, reason: str) -> None:
+    async def _record_literature_grounding(
+        self,
+        store: ArtifactStore,
+        reason: str,
+        requested_queries: Optional[list[str]] = None,
+    ) -> None:
         if any(
             claim.get("created_by_agent") == "literature_grounding_policy"
             and str(claim.get("text", "")).startswith(f"Literature grounding ({reason})")
@@ -1519,7 +1613,13 @@ class EvolutionaryOuterLoop:
             return
         started = time.perf_counter()
         started_at = now_iso()
-        queries = self._literature_grounding_queries(reason, store)
+        generated_queries = self._literature_grounding_queries(reason, store)
+        requested = [
+            _compact_literature_query(str(query), max_terms=18)
+            for query in (requested_queries or [])
+            if str(query).strip()
+        ]
+        queries = _dedupe_literature_queries([*requested, *generated_queries])
         query = queries[0] if queries else self.goal
         is_recovery = any(token in reason for token in ["plateau", "stall", "entropy_after_round"])
         strategy_index = 0
@@ -1745,7 +1845,7 @@ class EvolutionaryOuterLoop:
             self._recovery_forced_retriever = retriever
             entropy_intent["search_context"] = retriever
             action_note = f"fresh search context via {retriever}"
-        elif action == "new_strategy_family":
+        elif action == "uncertainty_axis":
             self._recovery_inject_mutation = True
             action_note = str(entropy_intent["exploration_path"])
         else:
@@ -1803,7 +1903,10 @@ class EvolutionaryOuterLoop:
     ) -> VariantEvaluation:
         started = time.perf_counter()
         started_at = now_iso()
-        candidate_path = store.candidates_dir / f"round_{round_index:02d}_{variant.id}.py"
+        if variant.metadata.get("stable_strategy_lane"):
+            candidate_path = store.candidates_dir / f"{_safe_filename(variant.id)}.py"
+        else:
+            candidate_path = store.candidates_dir / f"round_{round_index:02d}_{_safe_filename(variant.id)}.py"
         try:
             code = self._render_optimal_code(variant.payload)
             candidate_path.write_text(code, encoding="utf-8")
@@ -1971,6 +2074,57 @@ class EvolutionaryOuterLoop:
             reason="official_sandbox_scorer_unavailable_or_failed",
         )
 
+    def _write_prediction_market_preflight_failure(
+        self,
+        store: ArtifactStore,
+        preflight: PredictionMarketPreflightResult,
+    ) -> None:
+        objective = _objective_metadata(self.evaluator_name)
+        payload = {
+            "run_id": self.run_id,
+            "evaluator_name": self.evaluator_name or "unknown",
+            "objective_name": objective["objective_name"],
+            "objective_direction": objective["objective_direction"],
+            "score_variable": "score",
+            "score": 0.0,
+            "metrics": {
+                "preflight_ok": False,
+                "preflight_reason": preflight.reason,
+                "preflight_execution_mode": preflight.execution_mode,
+                "upstream_path": preflight.upstream_path,
+                "docker_sandbox": preflight.docker_sandbox,
+            },
+            "evaluator_responses": _json_evaluator_responses(store, mode="optimize"),
+            "best_variant_id": None,
+            "best_candidate_path": None,
+            "optimal_code_path": None,
+            "official_result": {
+                "measured": False,
+                "score_eligible": False,
+                "profit_usd": None,
+                "target_profit_usd": self.objective.target,
+                "target_met": False,
+                "score_source": "preflight_failed",
+                "sandbox_executed": False,
+                "docker_sandbox": preflight.docker_sandbox,
+                "required_evaluator": "https://github.com/danrobinson/prediction-market-challenge",
+                "candidate_path": None,
+                "preflight_ok": False,
+                "preflight_reason": preflight.reason,
+                "preflight_execution_mode": preflight.execution_mode,
+                "upstream_path": preflight.upstream_path,
+            },
+            "objective_target": {
+                "kind": self.objective.kind,
+                "target": self.objective.target,
+                "no_stop_until_target": self.objective.no_stop_until_target,
+                "met": False,
+            },
+            "note": "Prediction-market optimization stopped before candidate generation because the official evaluator preflight failed.",
+        }
+        store.write_optimization_result(payload)
+        store.append_progress(f"Prediction-market optimization preflight failed: {store.optimization_result_path}")
+
     def _write_unpromoted_prediction_market_result(
         self,
         store: ArtifactStore,
@@ -2029,7 +2183,7 @@ class EvolutionaryOuterLoop:
         claim_rows = store.list("claims")
         source_lookup = {row["id"]: row for row in store.list("sources")}
         top_items = []
-        for evaluation in evaluations[:5]:
+        for evaluation in evaluations[: max(5, self._optimizer_lane_count())]:
             variant = variant_lookup.get(evaluation.variant_id, {})
             variant_claims = [
                 claim for claim in claim_rows if str(claim.get("created_by_agent", "")).endswith(f":{evaluation.variant_id}")
@@ -2109,6 +2263,7 @@ class EvolutionaryOuterLoop:
                     payload=str(item.get("query", "")),
                     parent_ids=[],
                     metadata={
+                        "query_variant_id": str(item.get("variant_id", "")),
                         "seed_score": item.get("score", 0.0),
                         "seed_summary": item.get("summary", ""),
                         "seed_literature": {
@@ -2116,9 +2271,24 @@ class EvolutionaryOuterLoop:
                             "sources": item.get("supporting_sources", []),
                         },
                     },
+                    id=str(item.get("variant_id") or new_id("variant")),
                 )
             )
         return parents
+
+    def _optimizer_lane_count(self) -> int:
+        if getattr(self.llm, "provider", "") != "multi":
+            return 1
+        pool = list(getattr(self.llm, "model_pool", []) or [])
+        available_fn = getattr(self.llm, "_available_model_pool", None)
+        if callable(available_fn):
+            try:
+                available = list(available_fn())
+                if available:
+                    pool = available
+            except Exception:
+                pass
+        return max(1, len(pool))
 
     def _propose_query_variants(
         self,
@@ -2400,7 +2570,7 @@ class EvolutionaryOuterLoop:
                 (6, 0.60, 0.70, 5),
             ]:
                 champion_templates.append(
-                    f"pm_strategy=champion_diff champion_variant={self._champion_variant_id} "
+                    f"pm_strategy=champion_uncertainty_probe champion_variant={self._champion_variant_id} "
                     f"champion_score={self._champion_score:.3f} "
                     f"spread={max(2, int(champion_params['spread']) + delta)} "
                     f"size={max(0.05, float(champion_params['size']) * size_factor):.2f} "
@@ -2453,15 +2623,26 @@ class EvolutionaryOuterLoop:
             deterministic_variants = [_randomly_mutate_variant(variant, outer_iteration) for variant in deterministic_variants]
         self._apply_direction_specs(deterministic_variants, directions, kind="code")
 
-        llm_variants = self._llm_prediction_market_code_variants(
-            outer_iteration,
-            parents,
-            temperature=temperature,
-            directions=directions,
-            store=store,
-            entropy_intent=entropy_intent,
-            controller_context=controller_context,
-        )
+        if parents and getattr(self.llm, "provider", "") == "multi":
+            llm_variants = self._llm_prediction_market_lane_code_variants(
+                outer_iteration,
+                parents,
+                temperature=temperature,
+                directions=directions,
+                store=store,
+                entropy_intent=entropy_intent,
+                controller_context=controller_context,
+            )
+        else:
+            llm_variants = self._llm_prediction_market_code_variants(
+                outer_iteration,
+                parents,
+                temperature=temperature,
+                directions=directions,
+                store=store,
+                entropy_intent=entropy_intent,
+                controller_context=controller_context,
+            )
         self._apply_direction_specs(llm_variants, directions, kind="code")
         structural_variants: list[Variant] = []
         if not llm_variants:
@@ -2479,12 +2660,121 @@ class EvolutionaryOuterLoop:
             for variant in llm_variants:
                 variant.payload = f"{variant.payload}\n# {suffix}"
                 variant.metadata["meaningful_entropy_intent"] = entropy_intent
-        return _dedupe_prediction_market_variants(
+        selected = _dedupe_prediction_market_variants(
             [*llm_variants, *structural_variants, *deterministic_variants],
             store=store,
             population_size=self.population_size,
             outer_iteration=outer_iteration,
         )
+        if parents:
+            return self._stable_prediction_market_lane_variants(selected, parents, outer_iteration)
+        return selected
+
+    def _stable_prediction_market_lane_variants(
+        self,
+        candidates: list[Variant],
+        parents: list[Variant],
+        outer_iteration: int,
+    ) -> list[Variant]:
+        lanes: list[Variant] = []
+        seen_lane_ids: set[str] = set()
+        model_lanes = self._optimizer_lane_models()
+        lane_parents = parents[: self.population_size] if self.population_size > 0 else parents
+        for index, parent in enumerate(lane_parents):
+            query_id = str(parent.metadata.get("query_variant_id") or parent.id)
+            if not query_id or query_id in seen_lane_ids:
+                continue
+            seen_lane_ids.add(query_id)
+            source = candidates[index % len(candidates)] if candidates else parent
+            metadata = dict(source.metadata)
+            metadata.update(
+                {
+                    "stable_strategy_lane": True,
+                    "query_variant_id": query_id,
+                    "optimizer_lane_index": index,
+                    "optimizer_model_lane": model_lanes[index % len(model_lanes)] if model_lanes else self.llm.model_label,
+                    "previous_strategy_variant_id": parent.id if parent.kind == "code" else None,
+                    "proposal_source": metadata.get("proposal_source", "stable_lane"),
+                }
+            )
+            parent_ids = [] if parent.id == query_id else [parent.id]
+            lanes.append(
+                Variant(
+                    run_id=self.run_id,
+                    outer_iteration=outer_iteration,
+                    kind="code",
+                    payload=source.payload,
+                    parent_ids=parent_ids,
+                    metadata=metadata,
+                    id=query_id,
+                )
+            )
+        return lanes
+
+    def _optimizer_lane_models(self) -> list[str]:
+        if getattr(self.llm, "provider", "") == "multi":
+            available_fn = getattr(self.llm, "_available_model_pool", None)
+            pool = []
+            if callable(available_fn):
+                try:
+                    pool = list(available_fn())
+                except Exception:
+                    pool = []
+            if not pool:
+                pool = list(getattr(self.llm, "model_pool", []) or [])
+            labels = [f"{provider}/{model}" for provider, model in pool]
+            if labels:
+                return labels
+        return [self.llm.model_label]
+
+    def _llm_prediction_market_lane_code_variants(
+        self,
+        outer_iteration: int,
+        parents: list[Variant],
+        *,
+        temperature: float,
+        directions: list[DirectionSpec],
+        store: Optional[ArtifactStore],
+        entropy_intent: Optional[dict[str, object]],
+        controller_context: Optional[dict[str, object]],
+    ) -> list[Variant]:
+        lane_models = []
+        available_fn = getattr(self.llm, "_available_model_pool", None)
+        if callable(available_fn):
+            try:
+                lane_models = list(available_fn())
+            except Exception:
+                lane_models = []
+        if not lane_models:
+            lane_models = list(getattr(self.llm, "model_pool", []) or [])
+        if not lane_models:
+            return []
+
+        variants: list[Variant] = []
+        stored_provider, stored_model = self.llm.provider, self.llm.model
+        stored_population = self.population_size
+        try:
+            self.population_size = 1
+            for index, parent in enumerate(parents[: len(lane_models)]):
+                provider, model = lane_models[index % len(lane_models)]
+                self.llm.provider, self.llm.model = provider, model
+                lane_direction = [directions[index % len(directions)]] if directions else []
+                lane_variants = self._llm_prediction_market_code_variants(
+                    outer_iteration,
+                    [parent],
+                    temperature=temperature,
+                    directions=lane_direction,
+                    store=store,
+                    entropy_intent=entropy_intent,
+                    controller_context=controller_context,
+                )
+                if lane_variants:
+                    lane_variants[0].metadata["optimizer_model_lane"] = f"{provider}/{model}"
+                    variants.append(lane_variants[0])
+        finally:
+            self.llm.provider, self.llm.model = stored_provider, stored_model
+            self.population_size = stored_population
+        return variants
 
     def _render_solution(self, payload: str) -> str:
         if self.evaluator_name != "prediction_market":
@@ -2549,7 +2839,7 @@ class EvolutionaryOuterLoop:
             "- Do NOT repeat prior_report_avoid_directions unless the user explicitly asked for replication.\n"
             "- Prefer prior_report_unresolved_directions when they are directly related to the current goal.\n"
             "- Iteration 1: start broad and wide. Later iterations: narrow based on parent findings.\n"
-            "- Obey forced_directions exactly: each returned variant must test its assigned strategy_family and mechanism_hypothesis.\n"
+            "- Treat forced_directions as uncertainty probes, not answers: each returned variant must explore its assigned unknown and name how it could be wrong.\n"
             + recovery_note + "\n\n"
             "Return JSON only: {\"variants\": [{\"query\": str, \"retriever\": str, \"purpose\": str}]}"
         )
@@ -2667,7 +2957,8 @@ class EvolutionaryOuterLoop:
         system = (
             "You are the outer orchestrator in an evolutionary optimization harness. "
             "Propose candidate code or strategy variants as JSON only: {\"variants\": [{\"payload\": str}]}. "
-            "Obey forced_directions exactly: every variant must test its assigned strategy_family and mechanism_hypothesis. "
+            "Treat forced_directions as uncertainty probes rather than confident answers: every variant must explore "
+            "its assigned unknown and include a falsifiable reason it may fail. "
             "When optimizer_seed_context or literature_refresh_notes are present, use their retrieved claims/source summaries "
             "as concrete design inputs and name the claim or source insight reflected in each payload."
         )
@@ -2770,6 +3061,7 @@ class EvolutionaryOuterLoop:
         literature_seed_context = [_parent_literature_context(parent) for parent in parents]
         literature_seed_context = [item for item in literature_seed_context if item]
         literature_refresh_notes = _recent_literature_grounding_notes(store, limit=6)
+        #todo: should this system prompt be this long/detailed, and should there even be a prediction market challenge section?
         system = (
             "You are an expert market-making strategy developer for prediction markets. "
             "Generate complete, executable Python Strategy classes for the upstream orderbook_pm_challenge evaluator.\n\n"
@@ -2789,7 +3081,8 @@ class EvolutionaryOuterLoop:
             "SCORING: mean_edge is computed by the evaluator from fills and market state. Higher is better. "
             "Infer strategy choices only from the user goal, parent strategies, retrieved evidence, and score history; "
             "do not assume a fixed named trading doctrine unless the prompt or retrieved evidence supports it. "
-            "Obey forced_directions exactly: every variant must test its assigned strategy_family and mechanism_hypothesis.\n"
+            "Treat forced_directions as uncertainty probes rather than confident answers: every variant must explore "
+            "its assigned unknown and include a falsifiable reason it may fail.\n"
             "ROUND-TO-ROUND LEARNING IS REQUIRED: inspect score_history and recent_failure_context before writing code. "
             "If recent mean_edge values are negative or flat, do not repeat the same quoting, sizing, cancellation, or inventory logic. "
             "OPTIMIZER CONTROLLER CONTEXT IS BINDING: use optimizer_agent_context to choose a concrete mechanism, "
@@ -2830,7 +3123,7 @@ class EvolutionaryOuterLoop:
                     "or source insight that inspired its quoting, cancellation, inventory, or sizing logic. "
                     "When post_round_entropy_intent is present, each strategy must use it as a concrete new design axis. "
                     "Try meaningfully different approaches, but derive the differences from the prompt, parents, "
-                    "retrieved evidence, and observed failure modes rather than a prewritten strategy list. "
+                    "retrieved evidence, and observed failure modes rather than a canned strategy list. "
                     "Each variant MUST compile as valid Python. Each variant MUST explicitly react to score_history "
                     "or recent_failure_context; if all recent edges are negative, prefer foundational logic changes "
                     "over parameter nudges."
@@ -2922,7 +3215,7 @@ def _continuation_reason(
     if iteration >= max_iterations and termination_signal not in {"score_threshold", "claim_corroboration_threshold", "profit_target"}:
         return f"Iteration budget reached ({iteration}/{max_iterations}); exiting with best score {score:.3f}."
     if termination_signal in {"score_threshold", "claim_corroboration_threshold"}:
-        return f"Quality threshold reached with best score {score:.3f}; exiting loop."
+        return f"Provisional quality threshold reached with best score {score:.3f}; exiting only after required uncertainty probes."
     if termination_signal == "profit_target":
         return f"Explicit profit target met with best score {score:.3f}; exiting loop."
     if termination_signal in {"score_plateau", "coverage_plateau"}:
@@ -2943,50 +3236,68 @@ def _forced_direction_specs(
 ) -> list[DirectionSpec]:
     if population_size <= 0:
         return []
-    terms = _context_terms(goal, limit=8)
+    terms = _context_terms(goal, limit=14)
     topic = " ".join(terms[:4]) or "objective"
     score_patterns = _score_history(store, mode="optimize" if task_mode in {"optimize", "optimize_query"} else "research", limit=4) if store else []
     observed_failure = " ".join(str(item.get("summary", "")) for item in score_patterns)[:240]
-    novelty_slots = max(1, int(round(population_size * novelty_fraction))) if population_size >= 4 else 1
-    base_families = [
-        ("control_baseline", f"establish a simple baseline for {topic}"),
-        ("champion_diff", "make one deliberate change to the current champion and keep everything else fixed"),
-        ("new_strategy_family", f"test a structurally different approach to {topic}"),
-        ("mechanism_transfer", "import a mechanism from retrieved evidence or prior findings"),
-        ("failure_mode_targeting", f"target the most visible failure mode: {observed_failure or 'unknown failure'}"),
-        ("regime_specific_probe", "specialize behavior for a distinct input/data/evaluation regime"),
-        ("constraint_relaxation", "relax or invert one assumption held by parent variants"),
-        ("risk_control", "add a conservative guardrail or kill-switch for brittle cases"),
-        ("ablation", "remove or disable one champion component to identify load-bearing features"),
-        ("multi_model_convergence", "solve independently from a different reasoning lane and compare mechanisms"),
+    parent_terms = _context_terms(" ".join(parent.payload for parent in parents), limit=10)
+    champion_terms = _context_terms(champion_payload, limit=10)
+    note_terms = _context_terms(
+        " ".join(_recent_literature_grounding_notes(store, limit=4) + _recent_user_steering_notes(store, limit=4))
+        if store
+        else "",
+        limit=10,
+    )
+    uncertainty_terms = _dedupe_direction_terms([*terms, *parent_terms, *champion_terms, *note_terms]) or [
+        "objective",
+        "evidence",
+        "failure",
     ]
+    novelty_slots = max(1, int(round(population_size * novelty_fraction))) if population_size >= 4 else 1
     specs: list[DirectionSpec] = []
     for slot in range(population_size):
-        family, mechanism = base_families[slot % len(base_families)]
-        entropy_role = family
+        term = uncertainty_terms[slot % len(uncertainty_terms)]
+        partner = uncertainty_terms[(slot + 1) % len(uncertainty_terms)]
+        family = _direction_family_label("uncertainty_axis", term, slot)
+        mechanism = (
+            f"probe what is still unknown about {term} in relation to {partner}; "
+            f"actively seek evidence that could overturn the current best path for {topic}"
+        )
+        entropy_role = "uncertainty_probe"
         parent_policy = "use_parents"
-        if slot >= population_size - novelty_slots or family == "new_strategy_family":
+        if slot == 0:
+            family = _direction_family_label("naive_frame", term, slot)
+            mechanism = f"start from the least-assumptive framing of {topic} and record what remains confusing"
+        if slot == 1 and champion_payload:
+            family = _direction_family_label("champion_doubt", term, slot)
+            mechanism = f"make the current champion defend itself against a plausible failure in {term}"
+            parent_policy = "use_champion"
+        if observed_failure and slot % 5 == 4:
+            family = _direction_family_label("failure_question", term, slot)
+            mechanism = f"ask whether this observed failure changes the direction: {observed_failure}"
+        if slot >= population_size - novelty_slots:
             entropy_role = "novelty"
             parent_policy = "ignore_parents"
-        if family == "champion_diff" and champion_payload:
-            parent_policy = "use_champion"
-        if family == "ablation":
+            mechanism = f"ignore parent momentum and explore an under-specified uncertainty around {term}"
+        if slot % 9 == 8:
             entropy_role = "ablation"
+            family = _direction_family_label("ablation", term, slot)
+            mechanism = f"remove or disable the most assumed piece related to {term} to see what evidence still holds"
             parent_policy = "use_champion" if champion_payload else "use_parents"
-        if family == "multi_model_convergence":
+        if slot % 10 == 9:
             entropy_role = "multi_model_convergence"
+            family = _direction_family_label("independent_lane", term, slot)
+            mechanism = f"reason independently about {term} and compare against parent-derived assumptions"
             parent_policy = "ignore_champion"
         if outer_iteration > 1 and slot % 7 == 0:
             entropy_role = "regime_probe"
-            family = "regime_specific_probe"
-        regime_focus = [
-            "common_random_seeds",
-            "edge_case_regime",
-            "high_variance_regime",
-            "small_input_regime",
-            "large_input_regime",
-            "post_failure_regime",
-        ][slot % 6]
+            family = _direction_family_label("regime_question", term, slot)
+            mechanism = f"ask whether the apparent answer only works in one hidden regime for {term}"
+        regime_focus = _direction_family_label(
+            ["common_case", "edge_case", "high_variance", "small_scope", "large_scope", "post_failure"][slot % 6],
+            partner,
+            slot,
+        )
         specs.append(
             DirectionSpec(
                 slot=slot,
@@ -2997,10 +3308,27 @@ def _forced_direction_specs(
                 eval_protocol="paired_crn_same_seeds_across_variants",
                 regime_focus=regime_focus,
                 convergence_lane=f"lane_{slot % 3}",
-                ablation_target=_ablation_target(champion_payload, parents, slot) if family == "ablation" else "",
+                ablation_target=_ablation_target(champion_payload, parents, slot) if entropy_role == "ablation" else "",
             )
         )
     return specs
+
+
+def _dedupe_direction_terms(terms: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique = []
+    for term in terms:
+        clean = re.sub(r"[^a-z0-9_]+", "_", term.lower()).strip("_")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        unique.append(clean)
+    return unique
+
+
+def _direction_family_label(prefix: str, term: str, slot: int) -> str:
+    clean = re.sub(r"[^a-z0-9_]+", "_", term.lower()).strip("_") or "unknown"
+    return f"{prefix}_{slot}_{clean}"[:64]
 
 
 def _ablation_target(champion_payload: str, parents: list[Variant], slot: int) -> str:
@@ -3024,7 +3352,8 @@ def _direction_metadata(direction: DirectionSpec, *, kind: str) -> dict[str, obj
         "regime_metrics_requested": [direction.regime_focus, "overall", "failure_cases"],
         "convergence_lane": direction.convergence_lane,
         "ablation_target": direction.ablation_target,
-        "variant_contract": f"{kind}_variant_must_test_named_mechanism",
+        "uncertainty_probe": True,
+        "variant_contract": f"{kind}_variant_must_explore_uncertainty_probe",
     }
 
 
@@ -3047,6 +3376,7 @@ def _directional_query_payload(payload: str, direction: DirectionSpec) -> str:
     return (
         f"{payload} strategy_family:{direction.strategy_family} "
         f"mechanism_hypothesis:{direction.mechanism_hypothesis} "
+        f"uncertainty_probe:true "
         f"regime_focus:{direction.regime_focus} entropy_role:{direction.entropy_role}"
     )
 
@@ -3056,6 +3386,7 @@ def _directional_code_seed(payload: str, direction: DirectionSpec) -> str:
     return (
         f"{payload} strategy_family={direction.strategy_family} "
         f"mechanism_hypothesis='{direction.mechanism_hypothesis}' "
+        f"uncertainty_probe=true "
         f"entropy_role={direction.entropy_role} parent_policy={direction.parent_policy} "
         f"eval_protocol={direction.eval_protocol} regime_focus={direction.regime_focus}{ablation}"
     )
@@ -3407,7 +3738,6 @@ def _prediction_market_structural_fallback_variants(
 ) -> list[Variant]:
     variants: list[Variant] = []
     archetypes = [
-        "cancel_only",
         "wide_passive",
         "join_competitor",
         "inventory_one_sided",
@@ -3546,6 +3876,11 @@ def _contextual_prediction_market_payload(context: str, outer_iteration: int, in
     )
 
 
+def _safe_filename(value: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return clean[:120] or "candidate"
+
+
 def _contextual_query_suffixes(goal: str, parents: list[Variant], limit: int) -> list[str]:
     context = " ".join([goal, *[parent.payload for parent in parents]])
     terms = _context_terms(context, limit=max(8, limit * 3))
@@ -3569,10 +3904,10 @@ def _plateau_entropy_intent(action: str, goal: str, score_context: str, evaluato
     topic = " ".join(context_terms[:5]) or "the objective"
     evaluator = evaluator_name or "deterministic evaluator"
     plans = {
-        "new_strategy_family": {
-            "exploration_path": f"try a new strategy family for {topic}",
-            "evidence_basis": "evolutionary search literature favors structural mutation when local refinements stall",
-            "expected_generalization": "a structurally different family tests assumptions outside the current local optimum instead of tuning the same knobs",
+        "uncertainty_axis": {
+            "exploration_path": f"probe an unresolved uncertainty axis for {topic}",
+            "evidence_basis": "exploratory agents should delay commitment and sample uncertain directions when local refinements stall",
+            "expected_generalization": "an uncertainty probe tests whether the current local optimum is an artifact of overconfident framing",
         },
         "literature_mechanism": {
             "exploration_path": f"derive a mechanism from freshly grounded literature for {topic}",
@@ -3590,13 +3925,13 @@ def _plateau_entropy_intent(action: str, goal: str, score_context: str, evaluato
             "expected_generalization": "fresh context can reveal untried constraints, failure modes, or mechanisms not represented in parent variants",
         },
     }
-    selected = plans.get(action, plans["new_strategy_family"])
+    selected = plans.get(action, plans["uncertainty_axis"])
     return {
         "action": action,
         "exploration_path": selected["exploration_path"],
         "expected_generalization": selected["expected_generalization"],
         "evidence_basis": selected["evidence_basis"],
-        "anti_reward_hack_rule": "Do not count temperature changes, random seeds, or scalar hyperparameter nudges unless tied to a new family, mechanism, evaluator, or search context.",
+        "anti_reward_hack_rule": "Do not count temperature changes, random seeds, or scalar hyperparameter nudges unless tied to a new uncertainty, mechanism, evaluator, or search context.",
     }
 
 
@@ -3963,6 +4298,17 @@ def _pm_edge_from_eval(evaluation: Optional[VariantEvaluation]) -> float:
 
 def _prediction_market_rank_key(evaluation: VariantEvaluation) -> tuple[float, float]:
     return (_pm_edge_from_eval(evaluation), float(evaluation.score))
+
+
+def _prediction_market_parent_variants(
+    variants: list[Variant],
+    ranked_eligible: list[VariantEvaluation],
+    parent_count: int,
+) -> list[Variant]:
+    if not ranked_eligible:
+        return []
+    eligible_parent_ids = {evaluation.variant_id for evaluation in ranked_eligible[:parent_count]}
+    return [variant for variant in variants if variant.id in eligible_parent_ids]
 
 
 def _prediction_market_no_trade_baseline(code: str, result: dict[str, object], variant: Variant) -> bool:

@@ -44,6 +44,22 @@ class DockerSandboxRunner:
     def available(self) -> bool:
         return shutil.which("docker") is not None
 
+    @property
+    def daemon_available(self) -> bool:
+        if not self.available:
+            return False
+        try:
+            completed = subprocess.run(
+                ["docker", "info", "--format", "{{.ServerVersion}}"],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            return False
+        return completed.returncode == 0
+
     def execute_prediction_market(
         self,
         *,
@@ -56,6 +72,12 @@ class DockerSandboxRunner:
     ) -> SandboxExecutionResult:
         if not self.available:
             return SandboxExecutionResult("", "docker executable not found on PATH", 127)
+        if not self.daemon_available:
+            return SandboxExecutionResult(
+                "",
+                "docker daemon is not reachable; start Docker Desktop or set PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM=1 for an explicit host run",
+                125,
+            )
         upstream_path = upstream_path.resolve()
         strategy_path = strategy_path.resolve()
         with tempfile.TemporaryDirectory(prefix="research_harness_pm_docker_") as directory:

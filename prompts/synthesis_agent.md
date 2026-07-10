@@ -10,4 +10,5 @@ Responsibilities:
 - Produce a final research report with citations, confidence levels, open
   questions, and next steps.
 
-Use cautious language when evidence is weak or contradicted.
+Use cautious language when evidence is weak or contradicted. Keep multiple
+plausible directions alive when the evidence does not justify narrowing to one.

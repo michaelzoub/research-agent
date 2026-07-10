@@ -29,19 +29,23 @@ def _grade_prediction_market_solution(task: EvalTask, store: ArtifactStore) -> G
 
 def _grade_prediction_market_proxy_score(task: EvalTask, store: ArtifactStore) -> GraderResult:
     optimize_evals = [row for row in store.list("variant_evaluations") if row.get("inner_loop") == "optimize"]
-    best = max((float(row.get("score", 0.0)) for row in optimize_evals), default=0.0)
-    # Threshold 0.45: normalized score maps 0-edge strategies to ~0.5; allow a
-    # small margin so near-zero-edge strategies (acceptable baseline) still pass.
-    passed = best >= 0.45
+    official_evals = [
+        row for row in optimize_evals
+        if isinstance(row.get("metrics"), dict)
+        and row["metrics"].get("score_source") == "upstream_orderbook_pm_challenge"
+        and row["metrics"].get("official_measured") is True
+    ]
+    best = max((float(row.get("score", 0.0)) for row in official_evals), default=0.0)
+    passed = bool(official_evals)
     return _result(
         "prediction_market_proxy_score",
         "code",
-        "local proxy outcome verification",
+        "official upstream outcome verification",
         best,
         passed,
         1.0,
-        f"Best local proxy score={best:.3f}. This is not the official upstream profit score.",
-        [{"best_proxy_score": best, "official_score_required": True, "passed": passed}],
+        f"Best official upstream score={best:.3f}; measured official evaluations={len(official_evals)}.",
+        [{"best_official_score": best, "official_evaluations": len(official_evals), "passed": passed}],
     )
 
 
@@ -51,27 +55,13 @@ def _grade_prediction_market_official_status(task: EvalTask, store: ArtifactStor
     source = official.get("score_source")
     measured = official.get("measured")
     candidate_path = official.get("candidate_path")
-    # Accept either truthful outcome: if the upstream runner was used the result
-    # must say so; if the fallback ran it must say it wasn't officially measured.
-    if source == "upstream_orderbook_pm_challenge":
-        expected_measured = measured is True
-    else:
-        expected_measured = measured is False
     checks = [
         ("optimization_result_exists", store.optimization_result_path.exists()),
         ("official_result_present", isinstance(official, dict) and bool(official)),
-        ("measured_status_truthful", bool(expected_measured)),
-        (
-            "score_source_recorded",
-            source in {
-                "upstream_orderbook_pm_challenge",
-                "upstream_repo_missing",
-                "official_sandbox_failed",
-                "official_scorer_json_error",
-                "official_scorer_no_successes",
-            },
-        ),
+        ("official_measured", measured is True),
+        ("score_source_is_upstream", source == "upstream_orderbook_pm_challenge"),
         ("candidate_path_recorded", bool(candidate_path)),
+        ("candidate_path_exists", bool(candidate_path) and Path(str(candidate_path)).exists()),
     ]
     score = sum(1 for _, passed in checks if passed) / len(checks)
     passed = score == 1.0

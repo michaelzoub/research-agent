@@ -216,6 +216,53 @@ def _grade_research_groundedness(task: EvalTask, store: ArtifactStore) -> Grader
     )
 
 
+def _grade_research_task_specific_acceptance(task: EvalTask, store: ArtifactStore) -> GraderResult:
+    prompt = task.prompt.lower()
+    metadata_kind = str(task.metadata.get("research_acceptance", "")).lower() if isinstance(task.metadata, dict) else ""
+    sources = store.list("sources")
+    report = store.report_path.read_text(encoding="utf-8") if store.report_path.exists() else ""
+    combined = "\n".join(
+        [
+            report,
+            *[str(source.get("url", "")) for source in sources],
+            *[str(source.get("title", "")) for source in sources],
+            *[str(source.get("source_type", "")) for source in sources],
+        ]
+    )
+    lower = combined.lower()
+
+    needs_paper_id = metadata_kind == "paper_id" or any(term in prompt for term in ["paper", "papers", "doi", "arxiv"])
+    needs_dataset = metadata_kind == "dataset_url" or any(term in prompt for term in ["dataset", "datasets", "data source", "data url"])
+    needs_benchmark_table = metadata_kind == "benchmark_table" or "benchmark table" in prompt or "leaderboard" in prompt
+
+    checks: list[tuple[str, bool]] = []
+    if needs_paper_id:
+        checks.append(("found_doi_or_arxiv_id", bool(re.search(r"\b10\.\d{4,9}/[-._;()/:a-z0-9]+\b", lower)) or bool(re.search(r"\barxiv(?:\.org/(?:abs|pdf)/)?[:/\s]?\d{4}\.\d{4,5}", lower))))
+    if needs_dataset:
+        dataset_domains = ["huggingface.co/datasets", "kaggle.com", "zenodo.org", "figshare.com", "data.gov", "github.com"]
+        checks.append(("found_dataset_url", any(domain in lower for domain in dataset_domains) or any("dataset" in str(source.get("source_type", "")).lower() for source in sources)))
+    if needs_benchmark_table:
+        markdown_table = bool(re.search(r"^\s*\|.+\|\s*$", report, flags=re.M)) and "---" in report
+        checks.append(("extracted_benchmark_table", markdown_table or "benchmark" in lower and "score" in lower and "model" in lower))
+
+    if not checks:
+        grounded_sources = len(sources) >= 1
+        checks.append(("no_specific_research_artifact_requested", grounded_sources))
+
+    score = sum(1 for _, passed in checks if passed) / max(len(checks), 1)
+    passed = score == 1.0
+    return _result(
+        "research_task_specific_acceptance",
+        "code",
+        "task-specific research artifact verification",
+        score,
+        passed,
+        1.0,
+        f"Checked {len(checks)} task-specific research acceptance condition(s).",
+        [{"check": name, "passed": passed} for name, passed in checks],
+    )
+
+
 def _grade_literature_section_evidence(task: EvalTask, store: ArtifactStore) -> GraderResult:
     sources = store.list("sources")
     paper_sources = [source for source in sources if "paper" in str(source.get("source_type", "")).lower() or "work" in str(source.get("source_type", "")).lower()]

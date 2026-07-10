@@ -52,6 +52,21 @@ class OptimizationAgent:
         "compare_variants",
         "stop",
     ]
+    ROLE_CONTRACT = {
+        "role": "optimization_controller",
+        "single_goal": "choose the next optimization direction and tool sequence needed to improve evaluator score",
+        "does_not_do": [
+            "write final candidate code",
+            "decide that work is correct",
+            "run final validation as its own judge",
+            "accumulate unrelated research context",
+        ],
+        "context_policy": [
+            "read only champion, recent failures, evaluator summary, variant comparison, targeted literature, and compact prior controller state",
+            "ignore context that does not change the next mechanism, failure reflection, or literature query",
+            "handoff implementation details to proposal/worker steps and correctness judgment to independent validators",
+        ],
+    }
 
     def __init__(self, *, run_id: str, goal: str, llm: Optional[LLMClient] = None):
         self.run_id = run_id
@@ -77,13 +92,14 @@ class OptimizationAgent:
         evaluator_summary = self._call_tool("read_evaluator_summary", toolbox.read_evaluator_summary, actions, tools_used)
         comparison = self._call_tool("compare_variants", toolbox.compare_variants, actions, tools_used)
         state = {
+            "role_contract": self.ROLE_CONTRACT,
             "goal": self.goal,
             "round_index": round_index,
             "champion": champion,
             "recent_failures": failures,
             "evaluator_summary": evaluator_summary,
             "variant_comparison": comparison,
-            "prior_context": prior_context or {},
+            "prior_context": self._scoped_prior_context(prior_context),
         }
         decision = self._decide(state, errors)
         if decision.get("fetch_literature"):
@@ -101,6 +117,7 @@ class OptimizationAgent:
             literature_required=bool(decision.get("fetch_literature", False)),
             prompt_context={
                 "controller": "OptimizationAgent",
+                "role_contract": self.ROLE_CONTRACT,
                 "tool_menu": self.TOOL_NAMES,
                 "actions": actions,
                 "failure_reflection": str(decision.get("failure_reflection") or ""),
@@ -143,10 +160,13 @@ class OptimizationAgent:
     def _decide(self, state: dict[str, Any], errors: list[str]) -> dict[str, Any]:
         if self.llm.is_live:
             system = (
-                "You are the controller for an optimization agent. Choose actions from this tool menu only: "
+                "You are the controller for an optimization agent. Your single goal is to choose the next "
+                "optimization direction and tool sequence needed to improve evaluator score. You do not write "
+                "final code, decide correctness, or perform validation as your own judge. Choose actions from this tool menu only: "
                 f"{', '.join(self.TOOL_NAMES)}. Return JSON with fetch_literature, literature_query, "
                 "failure_reflection, next_mechanism, and mechanism_change_required. "
-                "If recent mean_edge values are non-positive or flat, require a foundational mechanism change."
+                "Use only context relevant to the next mechanism. If recent mean_edge values are non-positive "
+                "or flat, require a foundational mechanism change."
             )
             try:
                 decision = self.llm.complete_json(system, json.dumps(state, sort_keys=True, default=str), max_output_tokens=900, temperature=0.2)
@@ -172,6 +192,26 @@ class OptimizationAgent:
             ),
             "mechanism_change_required": flat_or_negative,
         }
+
+    def _scoped_prior_context(self, prior_context: Optional[dict[str, Any]]) -> dict[str, Any]:
+        if not isinstance(prior_context, dict):
+            return {}
+        allowed = {
+            "failure_reflection",
+            "next_mechanism",
+            "mechanism_change_required",
+            "literature_required",
+            "literature_query",
+        }
+        scoped = {key: prior_context.get(key) for key in allowed if key in prior_context}
+        actions = prior_context.get("actions")
+        if isinstance(actions, list):
+            scoped["previous_tools"] = [
+                str(action.get("tool"))
+                for action in actions
+                if isinstance(action, dict) and action.get("tool")
+            ][:12]
+        return scoped
 
     def _call_tool(
         self,
@@ -230,7 +270,7 @@ class OptimizationAgent:
         return output
 
     def _persist(self, store: ArtifactStore, result: OptimizerControllerResult) -> None:
-        path = store.root / "optimization_agent_steps.json"
+        path = getattr(store, "optimizer_agent_steps_path", store.root / "optimization_agent_steps.json")
         rows: list[dict[str, Any]]
         if path.exists():
             try:

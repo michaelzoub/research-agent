@@ -33,6 +33,9 @@ DEFAULT_MODEL_CATALOG: tuple[ModelOption, ...] = (
     ModelOption("anthropic/claude-sonnet-4-5", "anthropic", "claude-sonnet-4-5", "Anthropic", "Anthropic - Claude Sonnet 4.5"),
     ModelOption("anthropic/claude-haiku-4-5", "anthropic", "claude-haiku-4-5", "Anthropic", "Anthropic - Claude Haiku 4.5"),
     ModelOption("kimi/kimi-k2.6", "kimi", "kimi-k2.6", "Kimi", "Kimi - K2.6"),
+    ModelOption("ollama/qwen3.5:latest", "ollama", "qwen3.5:latest", "Ollama", "Ollama - qwen3.5"),
+    ModelOption("ollama/qwen", "ollama", "qwen", "Ollama", "Ollama - qwen"),
+    ModelOption("ollama/qwen2.5-coder", "ollama", "qwen2.5-coder", "Ollama", "Ollama - qwen2.5-coder"),
     ModelOption("local/local-deterministic-fallback", "local", "local-deterministic-fallback", "Local", "Local deterministic fallback"),
 )
 
@@ -79,7 +82,7 @@ def resolve_model_selection(provider: Optional[str], model: Optional[str]) -> tu
         return selected_provider, option.model
     if "/" in selected_model:
         prefix, model_name = selected_model.split("/", 1)
-        if prefix in {"openai", "anthropic", "kimi", "local"}:
+        if prefix in {"openai", "anthropic", "kimi", "ollama", "local"}:
             if selected_provider in {"auto", "", prefix}:
                 return prefix, model_name
             return selected_provider, model_name
@@ -141,7 +144,7 @@ def _is_all_configured_selection(provider: str, model: str) -> bool:
 
 
 def _default_lab(provider: str) -> str:
-    return {"openai": "OpenAI", "anthropic": "Anthropic", "kimi": "Kimi", "local": "Local"}.get(provider, provider.title())
+    return {"openai": "OpenAI", "anthropic": "Anthropic", "kimi": "Kimi", "ollama": "Ollama", "local": "Local"}.get(provider, provider.title())
 
 
 def _default_label(provider: str, model: str) -> str:

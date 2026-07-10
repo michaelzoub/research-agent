@@ -28,6 +28,7 @@ _ROLE_COLORS: dict[str, str] = {
     "research_variant_agent":    "#2563eb",
     "optimize_evaluator":        "#dc2626",
     "llm_thinking":              "#7c3aed",
+    "optimizer_controller":      "#0ea5e9",
     "loop_controller":           "#14b8a6",
     "orchestration":             "#64748b",
     "memory":                    "#0f766e",
@@ -52,6 +53,7 @@ _ROLE_SHORT: dict[str, str] = {
     "research_variant_agent":    "Research",
     "optimize_evaluator":        "Eval",
     "llm_thinking":              "LLM",
+    "optimizer_controller":      "OptCtrl",
     "loop_controller":           "Loop",
     "orchestration":             "Orch",
     "memory":                    "Memory",
@@ -876,6 +878,41 @@ def _optimizer_trace_rows_html(summary: dict[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def _optimizer_agent_rows_html(summary: dict[str, Any]) -> str:
+    rows = ((summary.get("optimizer_agent") or {}).get("rounds") or [])
+    if not rows:
+        return (
+            '<tr><td colspan="8" style="color:#94a3b8;text-align:center;padding:16px;">'
+            'No optimizer-agent controller steps recorded.</td></tr>'
+        )
+    html_rows: list[str] = []
+    for row in rows:
+        tools = ", ".join(str(tool) for tool in row.get("tools", [])) or "—"
+        sources = ", ".join(
+            f"{source}:{count}" for source, count in (row.get("candidate_sources") or {}).items()
+        ) or "—"
+        literature = str(row.get("literature_status") or "not_requested")
+        if row.get("literature_claims"):
+            literature = f"{literature}; {row.get('literature_claims')} claim(s)"
+        proposal = str(row.get("proposal_status") or "not_recorded")
+        if not row.get("used_live_proposal") and row.get("fallback_or_template_count", 0):
+            proposal = f"{proposal}; fallback/template used"
+        edge = row.get("best_mean_edge")
+        html_rows.append(
+            "<tr>"
+            f'<td style="color:#64748b;">{html.escape(str(row.get("round", "—")))}</td>'
+            f'<td>{html.escape(str(row.get("controller_status") or "—"))}<br><span style="color:#94a3b8;">{html.escape(str(row.get("controller_model") or ""))}</span></td>'
+            f'<td style="max-width:260px;">{html.escape(tools)}</td>'
+            f'<td>{html.escape(literature)}</td>'
+            f'<td>{html.escape(proposal)}<br><span style="color:#94a3b8;">{html.escape(str(row.get("proposal_model") or ""))}</span></td>'
+            f'<td>{html.escape(sources)}</td>'
+            f'<td style="font-family:monospace;">{"—" if edge is None else html.escape(f"{float(edge):.3f}")}</td>'
+            f'<td style="max-width:420px;color:#475569;">{html.escape(str(row.get("next_mechanism") or "—")[:220])}</td>'
+            "</tr>"
+        )
+    return "\n".join(html_rows)
+
+
 def write_run_benchmarks(store: ArtifactStore) -> None:
     if not store.harness_diagnosis_path.exists():
         store.write_harness_diagnosis()
@@ -909,6 +946,8 @@ def write_run_benchmarks(store: ArtifactStore) -> None:
     _write_png_from_svg_or_fallback(store.score_improvement_path, score_svg, lambda: _score_improvement_png_fallback(summary))
     _write_png_from_svg_or_fallback(store.root / "optimizer_flow.png", optimizer_flow_svg_text, lambda: optimizer_flow_png(summary))
     _write_png_from_svg_or_fallback(store.champion_tree_graph_path, champion_tree_svg_text, lambda: champion_tree_png(champion_tree))
+    store.optimizer_agent_summary_path.write_text(optimizer_agent_summary_markdown(summary), encoding="utf-8")
+    store.role_trajectory_contract_path.write_text(role_trajectory_contract_markdown(summary), encoding="utf-8")
     (store.root / "run_benchmark.md").write_text(run_benchmark_markdown(summary, dag, optimizer_flow), encoding="utf-8")
     (store.root / "run_benchmark.html").write_text(run_benchmark_html(summary), encoding="utf-8")
     store.run_notebook_path.write_text(json.dumps(run_notebook_export(summary), indent=2) + "\n", encoding="utf-8")
@@ -926,6 +965,7 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
     rounds = store.list("evolution_rounds")
     prd = read_json(store.prd_path, {})
     optimizer_seed_context = read_json(store.optimizer_seed_context_path, {})
+    optimizer_agent_steps = read_json(getattr(store, "optimizer_agent_steps_path", store.root / "optimization_agent_steps.json"), [])
     optimization_result = read_json(store.optimization_result_path, {})
     optimized_candidate_exists = store.optimized_candidate_path.exists()
     optimal_code_exists = store.optimal_code_path.exists()
@@ -941,6 +981,7 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
     models = Counter(str(trace.get("model", "unknown")) for trace in traces)
     best_eval = max(evaluations, key=lambda row: float(row.get("score", 0.0)), default={})
     optimizer_trace = build_optimizer_trace(rounds, variants, evaluations)
+    optimizer_agent = build_optimizer_agent_overview(optimizer_agent_steps, traces, variants, evaluations, claims)
     return {
         "run": run,
         "counts": {
@@ -962,6 +1003,8 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
         "task_ingestion": decisions[0] if decisions else None,
         "prd": prd,
         "optimizer_seed_context": optimizer_seed_context,
+        "optimizer_agent_steps": optimizer_agent_steps,
+        "optimizer_agent": optimizer_agent,
         "optimization_result": optimization_result,
         "harness_diagnosis": harness_diagnosis,
         "cost": cost,
@@ -986,10 +1029,143 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
                 "token_usage": trace.get("token_usage"),
                 "started_at":  trace.get("started_at", ""),
                 "summary":     trace.get("output_summary"),
+                "errors":      trace.get("errors", []),
             }
             for trace in traces
         ],
     }
+
+
+def build_optimizer_agent_overview(
+    steps: list[dict[str, Any]],
+    traces: list[dict[str, Any]],
+    variants: list[dict[str, Any]],
+    evaluations: list[dict[str, Any]],
+    claims: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize the model-driven optimizer controller in output-friendly form."""
+
+    if not steps:
+        return {"enabled": False, "rounds": [], "summary": "No optimizer-agent controller steps recorded."}
+    variants_by_round: dict[int, list[dict[str, Any]]] = {}
+    for variant in variants:
+        try:
+            round_index = int(variant.get("outer_iteration") or 0)
+        except (TypeError, ValueError):
+            round_index = 0
+        variants_by_round.setdefault(round_index, []).append(variant)
+    evals_by_variant: dict[str, list[dict[str, Any]]] = {}
+    for evaluation in evaluations:
+        evals_by_variant.setdefault(str(evaluation.get("variant_id")), []).append(evaluation)
+
+    rows: list[dict[str, Any]] = []
+    for step in sorted(steps, key=lambda row: int(row.get("round_index") or 0)):
+        round_index = int(step.get("round_index") or 0)
+        actions = step.get("actions") if isinstance(step.get("actions"), list) else []
+        tools = [str(action.get("tool")) for action in actions if action.get("tool")]
+        fetch_actions = [action for action in actions if action.get("tool") == "fetch_literature"]
+        prompt_context = step.get("prompt_context") if isinstance(step.get("prompt_context"), dict) else {}
+        role_contract = prompt_context.get("role_contract") if isinstance(prompt_context.get("role_contract"), dict) else {}
+        controller_trace = _find_round_trace(traces, "optimization_agent", round_index)
+        proposal_trace = _find_round_trace(traces, "llm_propose_prediction_market_code", round_index)
+        round_variants = variants_by_round.get(round_index, [])
+        source_counts = Counter(_variant_generation_source(variant) for variant in round_variants)
+        round_evals = [
+            evaluation
+            for variant in round_variants
+            for evaluation in evals_by_variant.get(str(variant.get("id")), [])
+        ]
+        mean_edges = [
+            float((evaluation.get("metrics") or {}).get("mean_edge"))
+            for evaluation in round_evals
+            if isinstance(evaluation.get("metrics"), dict) and (evaluation.get("metrics") or {}).get("mean_edge") is not None
+        ]
+        literature_claims = [
+            claim
+            for claim in claims
+            if str(claim.get("created_by_agent", "")).startswith("prediction_market_entropy_after_round_")
+            and f"round_{round_index}" in str(claim.get("created_by_agent", ""))
+        ]
+        used_live_proposal = (proposal_trace or {}).get("status") == "completed"
+        fallback_or_template_count = sum(
+            count
+            for source, count in source_counts.items()
+            if any(marker in source for marker in ("fallback", "template", "deterministic", "mutation"))
+        )
+        rows.append(
+            {
+                "round": round_index,
+                "role_contract": role_contract,
+                "controller_status": str((controller_trace or {}).get("status") or "not_recorded"),
+                "controller_model": str((controller_trace or {}).get("model") or ""),
+                "controller_errors": (controller_trace or {}).get("errors", []),
+                "tools": tools,
+                "literature_required": bool(step.get("literature_required")),
+                "literature_status": _action_status(fetch_actions),
+                "literature_preview": _join_previews(fetch_actions),
+                "literature_claims": len(literature_claims),
+                "reflection": str(step.get("reflection") or prompt_context.get("failure_reflection") or ""),
+                "next_mechanism": str(prompt_context.get("next_mechanism") or ""),
+                "mechanism_change_required": bool(step.get("mechanism_change_required")),
+                "proposal_status": str((proposal_trace or {}).get("status") or "not_recorded"),
+                "proposal_model": str((proposal_trace or {}).get("model") or ""),
+                "proposal_errors": (proposal_trace or {}).get("errors", []),
+                "used_live_proposal": used_live_proposal,
+                "candidate_count": len(round_variants),
+                "candidate_sources": dict(source_counts),
+                "fallback_or_template_count": fallback_or_template_count,
+                "evaluation_count": len(round_evals),
+                "best_mean_edge": max(mean_edges) if mean_edges else None,
+            }
+        )
+    live_rounds = sum(1 for row in rows if row.get("used_live_proposal"))
+    fallback_rounds = sum(1 for row in rows if row.get("fallback_or_template_count", 0))
+    role_contract = next((row.get("role_contract") for row in rows if row.get("role_contract")), {})
+    return {
+        "enabled": True,
+        "role_contract": role_contract,
+        "rounds": rows,
+        "summary": (
+            f"OptimizationAgent recorded {len(rows)} round(s), "
+            f"{live_rounds} with completed LLM proposal traces and {fallback_rounds} with fallback/template candidates."
+        ),
+    }
+
+
+def _find_round_trace(traces: list[dict[str, Any]], prefix: str, round_index: int) -> dict[str, Any]:
+    expected = f"{prefix}:round_{round_index}"
+    for trace in traces:
+        if str(trace.get("agent_name") or "") == expected:
+            return trace
+    return {}
+
+
+def _variant_generation_source(variant: dict[str, Any]) -> str:
+    metadata = variant.get("metadata") if isinstance(variant.get("metadata"), dict) else {}
+    for key in ("proposal_source", "source", "generation_source", "mutation_source"):
+        if metadata.get(key):
+            return str(metadata.get(key))
+    payload = str(variant.get("payload") or "")
+    if "optimizer_agent_context" in payload or "fresh_literature" in payload:
+        return "llm_or_contextual_candidate"
+    if payload.startswith("pm_strategy="):
+        return "template_pm_strategy"
+    return "unspecified"
+
+
+def _action_status(actions: list[dict[str, Any]]) -> str:
+    if not actions:
+        return "not_requested"
+    if any(action.get("status") == "completed" for action in actions):
+        return "completed"
+    if any(action.get("status") == "failed" for action in actions):
+        return "failed"
+    return str(actions[-1].get("status") or "unknown")
+
+
+def _join_previews(actions: list[dict[str, Any]]) -> str:
+    previews = [str(action.get("output_preview") or "") for action in actions if action.get("output_preview")]
+    return " | ".join(previews)[:800]
 
 
 def build_optimizer_trace(rounds: list[dict[str, Any]], variants: list[dict[str, Any]], evaluations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1874,9 +2050,124 @@ def _convert_with_qlmanage(svg_path: Path, output_path: Path, tmp_dir: Path) -> 
     return False
 
 
+def optimizer_agent_summary_markdown(summary: dict[str, Any]) -> str:
+    optimizer_agent = summary.get("optimizer_agent") or {}
+    lines = [
+        "# Optimizer Agent Summary",
+        "",
+        str(optimizer_agent.get("summary") or "No optimizer-agent controller steps recorded."),
+        "",
+    ]
+    rows = optimizer_agent.get("rounds") or []
+    if not rows:
+        return "\n".join(lines) + "\n"
+    lines.extend(
+        [
+            "## Round Decisions",
+            "",
+            "| Round | Controller | Tools | Literature | Proposal | Candidates | Best mean_edge | Mechanism |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for row in rows:
+        tools = ", ".join(str(tool) for tool in row.get("tools", [])) or "-"
+        candidate_sources = ", ".join(
+            f"{source}:{count}" for source, count in (row.get("candidate_sources") or {}).items()
+        ) or "-"
+        literature = str(row.get("literature_status") or "not_requested")
+        if row.get("literature_claims"):
+            literature = f"{literature}; {row.get('literature_claims')} claim(s)"
+        proposal = str(row.get("proposal_status") or "not_recorded")
+        if not row.get("used_live_proposal") and row.get("fallback_or_template_count", 0):
+            proposal = f"{proposal}; fallback/template candidates used"
+        edge = row.get("best_mean_edge")
+        lines.append(
+            "| {round} | {controller} | {tools} | {literature} | {proposal} | {candidates} | {edge} | {mechanism} |".format(
+                round=row.get("round", "-"),
+                controller=_md_cell(str(row.get("controller_status") or "-")),
+                tools=_md_cell(tools),
+                literature=_md_cell(literature),
+                proposal=_md_cell(proposal),
+                candidates=_md_cell(candidate_sources),
+                edge="-" if edge is None else f"{float(edge):.3f}",
+                mechanism=_md_cell(str(row.get("next_mechanism") or "-")[:160]),
+            )
+        )
+    lines.extend(["", "## Reflections", ""])
+    for row in rows:
+        reflection = str(row.get("reflection") or "").strip()
+        if reflection:
+            lines.append(f"- Round {row.get('round')}: {reflection}")
+        controller_errors = row.get("controller_errors") or []
+        proposal_errors = row.get("proposal_errors") or []
+        for error in controller_errors:
+            lines.append(f"- Round {row.get('round')} controller error: `{str(error)[:220]}`")
+        for error in proposal_errors:
+            lines.append(f"- Round {row.get('round')} proposal error: `{str(error)[:220]}`")
+    return "\n".join(lines) + "\n"
+
+
+def _md_cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def role_trajectory_contract_markdown(summary: dict[str, Any]) -> str:
+    optimizer_agent = summary.get("optimizer_agent") or {}
+    role_contract = optimizer_agent.get("role_contract") if isinstance(optimizer_agent.get("role_contract"), dict) else {}
+    lines = [
+        "# Role Trajectory Contract",
+        "",
+        "This run keeps agent trajectories focused by giving each role a single job, scoped context, and an independent validation handoff.",
+        "",
+        "## Orchestrator",
+        "",
+        "- Goal: plan and decompose the user's objective, assign focused work, and steer execution until validation gates pass.",
+        "- Context policy: keep the full run state in shared artifacts; delegate deep investigation and implementation instead of loading every detail into one trajectory.",
+        "- Does not: make the final correctness call for worker output.",
+        "",
+        "## Workers",
+        "",
+        "- Goal: complete one well-specified feature or candidate mechanism with explicit success criteria.",
+        "- Context policy: read only the feature contract, relevant notes, operational guidelines, and the files/artifacts needed for that feature.",
+        "- Handoff: workers stop when they believe the work is ready and pass artifacts to validation.",
+        "",
+        "## Validators",
+        "",
+        "- Goal: independently judge correctness and completeness against the validation contract.",
+        "- Context policy: inspect completed artifacts, tests, traces, and expected behavior; avoid implementation work.",
+        "- Handoff: validators surface gaps to the orchestrator, which creates follow-up fix work.",
+        "",
+        "## Optimization Controller",
+        "",
+    ]
+    if role_contract:
+        lines.append(f"- Role: `{role_contract.get('role', 'optimization_controller')}`")
+        lines.append(f"- Single goal: {role_contract.get('single_goal', 'choose the next optimization direction')}")
+        does_not_do = role_contract.get("does_not_do") if isinstance(role_contract.get("does_not_do"), list) else []
+        context_policy = role_contract.get("context_policy") if isinstance(role_contract.get("context_policy"), list) else []
+        for item in does_not_do:
+            lines.append(f"- Does not: {item}")
+        for item in context_policy:
+            lines.append(f"- Context policy: {item}")
+    else:
+        lines.append("- No optimizer-controller role contract was recorded for this run.")
+    lines.extend(["", "## Recorded Controller Rounds", ""])
+    rows = optimizer_agent.get("rounds") or []
+    if not rows:
+        lines.append("- No optimizer-controller rounds were recorded.")
+    for row in rows:
+        lines.append(
+            f"- Round {row.get('round')}: tools={', '.join(row.get('tools', [])) or '-'}; "
+            f"mechanism={str(row.get('next_mechanism') or '-')[:180]}; "
+            f"proposal_status={row.get('proposal_status', 'not_recorded')}."
+        )
+    return "\n".join(lines) + "\n"
+
+
 def run_benchmark_markdown(summary: dict[str, Any], dag: str, optimizer_flow: str) -> str:
     counts = summary.get("counts", {})
     decision = summary.get("task_ingestion") or {}
+    optimizer_agent = summary.get("optimizer_agent") or {}
     lines = [
         "# Run Benchmark",
         "",
@@ -1899,6 +2190,14 @@ def run_benchmark_markdown(summary: dict[str, Any], dag: str, optimizer_flow: st
         "```mermaid",
         optimizer_flow.strip(),
         "```",
+        "",
+        "## Optimizer Agent Controller",
+        "",
+        str(optimizer_agent.get("summary") or "No optimizer-agent controller steps recorded."),
+        "",
+        "Detailed controller decisions are written to `optimizer_agent_summary.md`.",
+        "",
+        "Role scoping and validation handoffs are written to `role_trajectory_contract.md`.",
         "",
         "## Round Summary",
     ]
@@ -1938,6 +2237,8 @@ def run_benchmark_html(summary: dict[str, Any]) -> str:
     stats     = _stats_cards_html(summary)
     rnd_rows  = _round_rows_html(summary)
     opt_rows  = _optimizer_trace_rows_html(summary)
+    opt_agent_rows = _optimizer_agent_rows_html(summary)
+    opt_agent_summary = str((summary.get("optimizer_agent") or {}).get("summary") or "No optimizer-agent controller steps recorded.")
 
     # Compact colour legend.
     legend = "".join(
@@ -2060,6 +2361,26 @@ def run_benchmark_html(summary: dict[str, Any]) -> str:
         </tr>
       </thead>
       <tbody>{opt_rows}</tbody>
+    </table>
+  </div>
+
+  <h2>Optimizer Agent Controller</h2>
+  <div class="events-card">
+    <p style="margin:10px 12px;color:#475569;">{html.escape(opt_agent_summary)} <a href="optimizer_agent_summary.md">Open detailed summary</a> · <a href="role_trajectory_contract.md">Open role contract</a></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Round</th>
+          <th>Controller</th>
+          <th>Tools</th>
+          <th>Literature</th>
+          <th>Proposal</th>
+          <th>Candidates</th>
+          <th>Best edge</th>
+          <th>Mechanism</th>
+        </tr>
+      </thead>
+      <tbody>{opt_agent_rows}</tbody>
     </table>
   </div>
 

@@ -95,6 +95,26 @@ initial PRD, dispatches to the selected runtime mode, catches interrupts into a
 partial synthesis flow, records cost, generates run benchmarks, and updates the
 final PRD.
 
+## Role Trajectory Model
+
+The harness should not treat agentic execution as merely splitting work into
+parallel chunks. Each role has one goal, a narrow context budget, and a handoff
+boundary that keeps its trajectory directionally consistent.
+
+| Role | Single goal | Context it should read | Handoff boundary |
+| --- | --- | --- | --- |
+| Orchestrator | Plan and decompose the user's goal, steer execution through validation gates, and create follow-up work from surfaced gaps. | Run plan, PRD, validation contract, compact artifact summaries, and validator findings. It delegates deep investigation and implementation rather than accumulating every detail. | Assigns scoped work to workers and validators; does not make the final correctness judgment itself. |
+| Worker | Complete one well-specified feature, candidate mechanism, or artifact with clear success criteria. | Feature contract, directly relevant source files/artifacts, operational guidelines, and focused research notes. | Stops when it believes the work is ready; independent validation decides correctness. |
+| Validator | Evaluate completed work for correctness and completeness. | Validation contract, completed artifacts, tests, traces, and expected behavior. | Reports gaps to the orchestrator; does not implement fixes. |
+| Optimization controller | Choose the next optimization direction and tool sequence needed to improve evaluator score. | Champion, recent failures, evaluator summary, variant comparison, targeted literature, and compact previous controller state. | Produces prompt context for candidate-generation workers and leaves correctness to evaluator/validator gates. |
+
+The full state lives in shared artifacts instead of any single agent's context:
+`prd.json`, `optimizer_seed_context.json`, `optimization_agent_steps.json`,
+`optimizer_agent_summary.md`, `role_trajectory_contract.md`, traces, variants,
+evaluations, literature claims, and validation reports. Agents read what is
+relevant to their current job and avoid context that is unrelated to their
+single goal or incentive.
+
 ## Three Loop Model
 
 The current code has three nested control concepts:

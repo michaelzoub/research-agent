@@ -51,6 +51,7 @@ from .research import (
     _grade_report_rubric,
     _grade_research_groundedness,
     _grade_research_source_diversity,
+    _grade_research_task_specific_acceptance,
 )
 
 
@@ -62,6 +63,7 @@ def default_graders() -> dict[str, Grader]:
         "mode_selected": Grader("mode_selected", "code", "tool/output verification", 1.0, 1.0, _grade_mode_selected),
         "artifact_report": Grader("artifact_report", "code", "artifact existence", 0.75, 1.0, _grade_report_artifact),
         "research_groundedness": Grader("research_groundedness", "code", "groundedness assertions", 1.25, 0.8, _grade_research_groundedness),
+        "research_task_specific_acceptance": Grader("research_task_specific_acceptance", "code", "task-specific research artifact verification", 1.0, 1.0, _grade_research_task_specific_acceptance),
         "research_source_diversity": Grader("research_source_diversity", "code", "successful tool/API and retained-source family check", 1.25, 1.0, _grade_research_source_diversity),
         "literature_section_evidence": Grader("literature_section_evidence", "code", "paper-section evidence verification", 1.0, 0.8, _grade_literature_section_evidence),
         "hypothesis_evidence_matrix": Grader("hypothesis_evidence_matrix", "code", "hypothesis proof/counterpoint verification", 1.0, 0.8, _grade_hypothesis_evidence_matrix),
@@ -76,7 +78,7 @@ def default_graders() -> dict[str, Grader]:
         "seed_context": Grader("seed_context", "code", "artifact existence", 1.0, 1.0, _grade_seed_context),
         "optimize_query_phases": Grader("optimize_query_phases", "code", "trace/phase verification", 1.0, 1.0, _grade_optimize_query_phases),
         "prediction_market_solution": Grader("prediction_market_solution", "code", "static solution checks", 1.0, 1.0, _grade_prediction_market_solution),
-        "prediction_market_proxy_score": Grader("prediction_market_proxy_score", "code", "local proxy outcome verification", 1.0, 0.5, _grade_prediction_market_proxy_score),
+        "prediction_market_proxy_score": Grader("prediction_market_proxy_score", "code", "official upstream outcome verification", 1.0, 1.0, _grade_prediction_market_proxy_score),
         "prediction_market_official_status": Grader("prediction_market_official_status", "code", "official-status verification", 1.0, 1.0, _grade_prediction_market_official_status),
         "prediction_market_artifact_containment": Grader("prediction_market_artifact_containment", "code", "artifact containment", 1.0, 1.0, _grade_prediction_market_artifact_containment),
         "prediction_market_candidate_files_only_in_outputs": Grader("prediction_market_candidate_files_only_in_outputs", "code", "artifact containment", 1.0, 1.0, _grade_prediction_market_candidate_files_only_in_outputs),

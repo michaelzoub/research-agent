@@ -75,10 +75,14 @@ class SmokeTest(unittest.TestCase):
             self.assertIn("anthropic/claude-sonnet-4-6", choices)
             self.assertIn("openai/gpt-5.2", choices)
             self.assertIn("kimi/kimi-k2.6", choices)
+            self.assertIn("ollama/qwen3.5:latest", choices)
+            self.assertIn("ollama/qwen", choices)
             self.assertIn("anthropic/claude-sonnet-4-5", choices)
             self.assertEqual(resolve_model_selection("auto", "anthropic/claude-sonnet-4-5"), ("anthropic", "claude-sonnet-4-5"))
             self.assertEqual(resolve_model_selection("auto", "openai/gpt-5.2"), ("openai", "gpt-5.2"))
             self.assertEqual(resolve_model_selection("auto", "kimi/kimi-k2.6"), ("kimi", "kimi-k2.6"))
+            self.assertEqual(resolve_model_selection("auto", "ollama/qwen3.5:latest"), ("ollama", "qwen3.5:latest"))
+            self.assertEqual(resolve_model_selection("auto", "ollama/qwen"), ("ollama", "qwen"))
             self.assertEqual(resolve_model_selection("openai", "kimi/kimi-k2.6"), ("kimi", "kimi-k2.6"))
             self.assertEqual(resolve_model_selection("auto", "all-configured"), ("multi", "all-configured"))
 
@@ -105,6 +109,48 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(client.provider, "kimi")
         self.assertEqual(client.model, "kimi-k2.6")
         self.assertTrue(client.is_live)
+
+    def test_llm_client_uses_ollama_chat_api(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout=0):
+            url = request.full_url
+            if url.endswith("/api/tags"):
+                return FakeResponse({"models": [{"name": "qwen"}]})
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse(
+                {
+                    "model": "qwen",
+                    "message": {"role": "assistant", "content": "local answer"},
+                    "prompt_eval_count": 7,
+                    "eval_count": 3,
+                }
+            )
+
+        with unittest.mock.patch.dict(os.environ, {"OLLAMA_HOST": "localhost:11434"}, clear=False):
+            client = LLMClient(provider="auto", model="ollama/qwen")
+            with unittest.mock.patch("urllib.request.urlopen", fake_urlopen):
+                response = client.complete("system", "user", max_output_tokens=12, temperature=0.2)
+
+        self.assertEqual(client.provider, "ollama")
+        self.assertEqual(response.provider, "ollama")
+        self.assertEqual(response.text, "local answer")
+        self.assertEqual(response.cost, 0.0)
+        self.assertEqual(captured["payload"]["model"], "qwen")
+        self.assertEqual(captured["payload"]["options"]["num_predict"], 12)
 
     def test_kimi_requests_force_temperature_one(self) -> None:
         captured: dict[str, object] = {}
@@ -404,7 +450,7 @@ class SmokeTest(unittest.TestCase):
                 asyncio.run(outer._run_optimize_query(store))
             variant_count = len([row for row in store.list("variants") if row["kind"] == "query"])
 
-        self.assertEqual(observed_populations, [3, 48])
+        self.assertEqual(observed_populations, [3, 1])
         self.assertEqual(variant_count, 3)
 
     def test_prediction_market_evaluator_overrides_plain_optimize_to_challenge_flow(self) -> None:
@@ -913,10 +959,14 @@ class SmokeTest(unittest.TestCase):
             self.assertTrue(optimizer_trace)
             self.assertTrue((store.root / "optimizer_flow.mmd").exists())
             self.assertTrue((store.root / "optimizer_flow.png").exists())
+            self.assertTrue(store.optimizer_agent_summary_path.exists())
+            self.assertTrue(store.role_trajectory_contract_path.exists())
             self.assertTrue(store.champion_tree_graph_path.exists())
             self.assertTrue(store.champion_tree_svg_path.exists())
             self.assertTrue(store.champion_tree_mermaid_path.exists())
             self.assertIn("Optimizer Trace", store.run_benchmark_path.read_text(encoding="utf-8"))
+            self.assertIn("Optimizer Agent Controller", store.run_benchmark_path.read_text(encoding="utf-8"))
+            self.assertIn("Optimization Controller", store.role_trajectory_contract_path.read_text(encoding="utf-8"))
 
     def test_optimize_query_mode_feeds_optimizer_with_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1104,7 +1154,7 @@ class SmokeTest(unittest.TestCase):
             self.assertEqual(optimization_result["objective_name"], "prediction_market_mean_edge")
             score_source = optimization_result["official_result"]["score_source"]
             measured = optimization_result["official_result"]["measured"]
-            self.assertIn(score_source, {"upstream_repo_missing", "official_sandbox_failed", "official_scorer_json_error", "official_scorer_no_successes", "upstream_orderbook_pm_challenge"})
+            self.assertIn(score_source, {"upstream_repo_missing", "official_sandbox_failed", "official_scorer_json_error", "official_scorer_no_successes", "upstream_orderbook_pm_challenge", "unmeasured_official_scorer_unavailable"})
             # measured must be truthful: True iff the upstream runner was used.
             if score_source == "upstream_orderbook_pm_challenge":
                 self.assertTrue(measured)
@@ -1121,11 +1171,78 @@ class SmokeTest(unittest.TestCase):
                 self.assertFalse(store.optimized_candidate_path.exists())
                 self.assertFalse(store.optimal_code_path.exists())
                 self.assertFalse(store.solution_path.exists())
-            self.assertTrue(Path(optimization_result["official_result"]["candidate_path"]).exists())
+            candidate_path = optimization_result["official_result"].get("candidate_path")
+            if candidate_path:
+                self.assertTrue(Path(candidate_path).exists())
             self.assertTrue(any("Prediction Market" in source["title"] for source in store.list("sources")))
             prd = json.loads(store.prd_path.read_text(encoding="utf-8"))
             self.assertEqual(prd["product_agent"], "challenge")
             self.assertEqual(prd["agent_harness"]["runtime_mode"], "optimize_query")
+
+    def test_prediction_market_optimizer_reuses_query_ids_as_stable_strategy_lanes(self) -> None:
+        def fake_official(_candidate_path: Path) -> dict[str, object]:
+            return {
+                "mean_edge": 1.0,
+                "score_eligible": True,
+                "official_measured": True,
+                "score_source": "upstream_orderbook_pm_challenge",
+                "success_count": 1,
+                "failure_count": 0,
+                "actions_seen": ["PlaceOrder"],
+                "simulations": 1,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_root = Path(directory) / "run"
+            store = ArtifactStore(run_root)
+            llm = LLMClient(provider="local")
+            llm.provider = "multi"
+            llm.model = "all-configured"
+            llm.model_pool = [("local", "lane-a"), ("local", "lane-b")]
+            outer = EvolutionaryOuterLoop(
+                run_id="run_stable_lanes",
+                goal="prediction market challenge",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: LocalCorpusSearch(Path("examples/corpus/research_corpus.json")),
+                evaluator_name="prediction_market",
+                llm=llm,
+                max_outer_iterations=2,
+                population_size=2,
+            )
+            parents = [
+                Variant(
+                    run_id="run_stable_lanes",
+                    outer_iteration=0,
+                    kind="query",
+                    payload="query lane a",
+                    parent_ids=[],
+                    metadata={"query_variant_id": "query_a"},
+                    id="query_a",
+                ),
+                Variant(
+                    run_id="run_stable_lanes",
+                    outer_iteration=0,
+                    kind="query",
+                    payload="query lane b",
+                    parent_ids=[],
+                    metadata={"query_variant_id": "query_b"},
+                    id="query_b",
+                ),
+            ]
+
+            with unittest.mock.patch("research_harness.loops._run_prediction_market_official", fake_official):
+                asyncio.run(outer._run_prediction_market_optimizer(store, parents, {"summary": "seed"}))
+
+            code_variants = [row for row in store.list("variants") if row["kind"] == "code"]
+            rounds = store.list("evolution_rounds")
+
+            self.assertEqual([round_row["variant_ids"] for round_row in rounds], [["query_a", "query_b"], ["query_a", "query_b"]])
+            self.assertEqual({row["id"] for row in code_variants}, {"query_a", "query_b"})
+            self.assertTrue(all(row["metadata"].get("stable_strategy_lane") for row in code_variants))
+            self.assertTrue((run_root / "candidates" / "query_a.py").exists())
+            self.assertTrue((run_root / "candidates" / "query_b.py").exists())
+            self.assertFalse(any((run_root / "candidates").glob("round_*_query_*.py")))
 
     def test_prediction_market_report_filters_unrelated_sources_for_typos(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1315,6 +1432,111 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("not external sources", report)
         self.assertNotIn("](https://example.org", report)
         self.assertNotIn(r"\url{https://example.org", tex)
+
+    def test_kernel_challenge_report_does_not_import_prediction_market_fixtures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run_kernel")
+            run = RunRecord(
+                id="run_kernel",
+                user_goal="High-performance GPU kernel generation is increasingly important for large-model systems.",
+                task_type="bounded",
+                task_mode="research",
+                product_agent="challenge",
+                harness_config_id="test",
+                prompt_versions={},
+                harness_config_snapshot={"evaluator_name": "length_score"},
+            )
+            gpu_source = store.add_source(
+                Source(
+                    url="https://doi.org/10.1145/gpu-kernel-generation",
+                    title="GPU Kernel Generation For Large Models",
+                    author="Kernel Systems Lab",
+                    date="2026",
+                    source_type="paper",
+                    summary="High-performance GPU kernels improve latency and throughput for large model inference.",
+                    relevance_score=0.94,
+                    credibility_score=0.9,
+                    evidence_sections={"abstract": "GPU kernel generation targets latency, throughput, and correctness for large-model systems."},
+                )
+            )
+            pm_source = store.add_source(
+                Source(
+                    url="https://github.com/danrobinson/prediction-market-challenge",
+                    title="Orderbook Prediction Market Challenge",
+                    author="Dan Robinson",
+                    date="2026-05-04",
+                    source_type="optimization_challenge",
+                    summary="A binary prediction-market optimization challenge with retail flow and stale quotes.",
+                    relevance_score=0.8,
+                    credibility_score=0.88,
+                )
+            )
+            gpu_claim = store.add_claim(
+                Claim(
+                    text="GPU kernel generation should be evaluated on latency, throughput, and correctness.",
+                    source_ids=[gpu_source.id],
+                    confidence=0.82,
+                    support_level="strong",
+                    created_by_agent="test",
+                    run_id=run.id,
+                )
+            )
+            pm_claim = store.add_claim(
+                Claim(
+                    text="Positive edge comes from capturing spread against uninformed retail order flow.",
+                    source_ids=[pm_source.id],
+                    confidence=0.68,
+                    support_level="moderate",
+                    created_by_agent="test",
+                    run_id=run.id,
+                )
+            )
+            store.add_hypothesis(
+                Hypothesis(
+                    text="Kernel optimization should focus on measured latency and correctness.",
+                    supporting_claim_ids=[gpu_claim.id],
+                    contradicting_claim_ids=[],
+                    confidence=0.7,
+                    novelty_score=0.4,
+                    testability_score=0.9,
+                    next_experiment="Run the generated kernel against benchmark inputs.",
+                    run_id=run.id,
+                )
+            )
+            store.add_hypothesis(
+                Hypothesis(
+                    text="Prediction-market retail flow should guide the final strategy.",
+                    supporting_claim_ids=[pm_claim.id],
+                    contradicting_claim_ids=[],
+                    confidence=0.66,
+                    novelty_score=0.4,
+                    testability_score=0.8,
+                    next_experiment="Backtest against orderbook fills.",
+                    run_id=run.id,
+                )
+            )
+
+            asyncio.run(
+                SynthesisAgent(
+                    name="test_synthesis",
+                    role="synthesis_agent",
+                    prompt_template="test",
+                    llm=LLMClient(provider="local"),
+                ).run(run, store)
+            )
+
+            combined = (
+                store.report_path.read_text(encoding="utf-8")
+                + "\n"
+                + store.report_tex_path.read_text(encoding="utf-8")
+            ).lower()
+
+        self.assertIn("gpu kernel generation", combined)
+        self.assertIn("latency, throughput, and correctness", combined)
+        self.assertNotIn("prediction-market", combined)
+        self.assertNotIn("prediction market", combined)
+        self.assertNotIn("uninformed retail order flow", combined)
+        self.assertNotIn("sources: none retained", combined)
 
     def test_research_key_takeaways_do_not_import_unrelated_agentic_storyline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2617,6 +2839,61 @@ class Strategy(BaseStrategy):
 
         self.assertTrue(_prediction_market_no_trade_baseline(code, result, variant))
 
+    def test_prediction_market_unmeasured_candidates_do_not_become_parents_or_structural_fallbacks(self) -> None:
+        from research_harness.loops import _prediction_market_parent_variants, _prediction_market_structural_fallback_variants
+
+        variants = [
+            Variant(run_id="run_pm_parent", outer_iteration=1, kind="code", payload="candidate a", parent_ids=[], metadata={}, id="variant_a"),
+            Variant(run_id="run_pm_parent", outer_iteration=1, kind="code", payload="candidate b", parent_ids=[], metadata={}, id="variant_b"),
+        ]
+        unmeasured = [
+            VariantEvaluation(
+                run_id="run_pm_parent",
+                variant_id="variant_a",
+                inner_loop="optimize",
+                score=0.0,
+                metrics={"score_eligible": False, "score_source": "official_sandbox_failed"},
+                judge_scores=[0.0],
+                summary="docker failed",
+                passed=False,
+            )
+        ]
+
+        self.assertEqual(_prediction_market_parent_variants(variants, [], parent_count=2), [])
+        self.assertEqual(_prediction_market_parent_variants(variants, unmeasured[:0], parent_count=2), [])
+
+        fallbacks = _prediction_market_structural_fallback_variants(
+            run_id="run_pm_parent",
+            goal="prediction market challenge",
+            outer_iteration=1,
+            parents=[],
+            directions=[],
+            entropy_intent=None,
+            population_size=6,
+        )
+
+        self.assertFalse(any(row.metadata.get("structural_archetype") == "cancel_only" for row in fallbacks))
+        self.assertFalse(any("return [CancelAll()]" in row.payload for row in fallbacks))
+
+    def test_docker_sandbox_runner_requires_reachable_daemon(self) -> None:
+        from research_harness.sandbox import DockerSandboxRunner
+
+        completed = type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "daemon unavailable"})()
+        with unittest.mock.patch("research_harness.sandbox.shutil.which", return_value="/usr/bin/docker"):
+            with unittest.mock.patch("research_harness.sandbox.subprocess.run", return_value=completed):
+                runner = DockerSandboxRunner()
+                result = runner.execute_prediction_market(
+                    upstream_path=Path("/tmp/upstream"),
+                    strategy_path=Path("/tmp/strategy.py"),
+                    simulations="1",
+                    steps="1",
+                    seed_start="0",
+                    workers="1",
+                )
+
+        self.assertEqual(result.exit_code, 125)
+        self.assertIn("docker daemon is not reachable", result.stderr)
+
     def test_prediction_market_non_positive_edge_does_not_write_optimal_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory) / "run")
@@ -2942,6 +3219,67 @@ class Strategy(BaseStrategy):
 
         self.assertGreaterEqual(len(grounding_claims), 2)
         self.assertTrue(any("prediction_market_plateau_round_2" in claim["text"] for claim in grounding_claims))
+
+    def test_optimizer_literature_grounding_uses_requested_query_first(self) -> None:
+        calls: list[str] = []
+
+        class QueryCaptureSearch:
+            tool_name = "query_capture"
+
+            def search(self, query: str, limit: int = 4):
+                calls.append(query)
+                if "inventory toxicity cancel threshold" not in query:
+                    return []
+                document = CorpusDocument(
+                    url="https://example.com/requested-query-paper",
+                    title="Requested Query Paper",
+                    author="Researcher",
+                    date="2026",
+                    source_type="paper",
+                    summary=f"Evidence for {query}",
+                    claims=["Requested query evidence claim"],
+                    tags=["market-making"],
+                    credibility_score=0.8,
+                )
+                return [(document, 0.9)][:limit]
+
+            def to_source(self, document, relevance_score):
+                return Source(
+                    url=document.url,
+                    title=document.title,
+                    author=document.author,
+                    date=document.date,
+                    source_type=document.source_type,
+                    summary=document.summary,
+                    relevance_score=relevance_score,
+                    credibility_score=document.credibility_score,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            outer = EvolutionaryOuterLoop(
+                run_id="run_requested_query",
+                goal="prediction market market making strategy",
+                task_mode="optimize_query",
+                source_strategy=[],
+                search_factory=lambda _name: QueryCaptureSearch(),
+                evaluator_name="prediction_market",
+            )
+
+            asyncio.run(
+                outer._record_literature_grounding(
+                    store,
+                    "optimization_agent_round_2_fetch_literature",
+                    requested_queries=["inventory toxicity cancel threshold queue position adverse selection"],
+                )
+            )
+            traces = store.list("agent_traces")
+            sources = store.list("sources")
+
+        self.assertTrue(calls)
+        self.assertIn("inventory toxicity cancel threshold", calls[0])
+        self.assertTrue(any(source.get("title") == "Requested Query Paper" for source in sources))
+        self.assertTrue(any(trace.get("prompt") == calls[0] for trace in traces))
 
     def test_prediction_market_entropy_grounding_fans_out_across_strategy_retrievers(self) -> None:
         calls: list[str] = []
@@ -3404,6 +3742,56 @@ class PredictionMarketSandboxTest(unittest.TestCase):
         # official_measured must be False; only the upstream runner sets it True.
         self.assertFalse(result["official_measured"])
         self.assertNotEqual(result.get("score_source"), "upstream_orderbook_pm_challenge")
+
+    def test_prediction_market_preflight_fails_when_upstream_disabled(self) -> None:
+        from research_harness.loops import _prediction_market_official_preflight
+
+        prev = os.environ.get("PREDICTION_MARKET_USE_UPSTREAM")
+        os.environ["PREDICTION_MARKET_USE_UPSTREAM"] = "0"
+        try:
+            result = _prediction_market_official_preflight()
+        finally:
+            if prev is None:
+                del os.environ["PREDICTION_MARKET_USE_UPSTREAM"]
+            else:
+                os.environ["PREDICTION_MARKET_USE_UPSTREAM"] = prev
+
+        self.assertFalse(result.ok)
+        self.assertIn("upstream scorer not found", result.reason)
+        self.assertEqual(result.execution_mode, "unavailable")
+
+    def test_prediction_market_preflight_accepts_host_mode_with_uv(self) -> None:
+        from research_harness import loops
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "prediction-market-challenge"
+            package_dir = repo / "orderbook_pm_challenge"
+            package_dir.mkdir(parents=True)
+            (repo / "pyproject.toml").write_text(
+                '[project]\nname = "orderbook-pm-challenge"\n'
+                '[project.scripts]\norderbook-pm = "orderbook_pm_challenge.cli:main"\n',
+                encoding="utf-8",
+            )
+            old_path = os.environ.get("PREDICTION_MARKET_CHALLENGE_PATH")
+            old_unsandboxed = os.environ.get("PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM")
+            os.environ["PREDICTION_MARKET_CHALLENGE_PATH"] = str(repo)
+            os.environ["PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM"] = "1"
+            try:
+                with unittest.mock.patch.object(loops.shutil, "which", return_value="/usr/local/bin/uv"):
+                    result = loops._prediction_market_official_preflight()
+            finally:
+                if old_path is None:
+                    del os.environ["PREDICTION_MARKET_CHALLENGE_PATH"]
+                else:
+                    os.environ["PREDICTION_MARKET_CHALLENGE_PATH"] = old_path
+                if old_unsandboxed is None:
+                    del os.environ["PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM"]
+                else:
+                    os.environ["PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM"] = old_unsandboxed
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.execution_mode, "host")
+        self.assertFalse(result.docker_sandbox)
 
     def test_official_scorer_path_requires_upstream_orderbook_repo(self) -> None:
         from research_harness.loops import _find_pm_upstream_path, _is_pm_upstream_repo

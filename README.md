@@ -9,6 +9,8 @@ your prompt -> setup choices -> research/optimization loop -> report + artifacts
 ```
 
 You do not need API keys to try it. Without keys, it uses the bundled local corpus and deterministic fallback model. Add OpenAI/Anthropic keys later for live model calls.
+If you have Ollama running locally, you can also use local models such as
+`qwen3.5:latest` or `qwen` without any cloud API key.
 
 ## Quick Start
 
@@ -22,12 +24,18 @@ cd research-agent
 
 `./autore` with no arguments opens a selection-based setup. Use Up/Down to move through choices and Enter to select. The setup asks plain questions, then starts the run for you.
 
-The CLI opens with an Autore banner, quick command reminders, and a guided prompt. It also groups the finished run into "Open first", optimization artifacts, and diagnostics so the useful files are easier to spot.
+The CLI opens with an Autore Code panel, quick command reminders, and a guided prompt. It also groups the finished run into "Open first", optimization artifacts, and diagnostics so the useful files are easier to spot.
 
 Optional install, so `autore` works from anywhere:
 
 ```bash
 python3 -m pip install -e .
+```
+
+After installing, run:
+
+```bash
+autore
 ```
 
 ### Environment
@@ -45,12 +53,20 @@ RESEARCH_HARNESS_RETRIEVER=auto
 
 RESEARCH_HARNESS_LLM_PROVIDER=auto
 RESEARCH_HARNESS_LLM_MODEL=all-configured
-RESEARCH_HARNESS_LLM_MODELS=openai/gpt-5.5,openai/gpt-5.2,anthropic/claude-opus-4-6,anthropic/claude-sonnet-4-6,anthropic/claude-sonnet-4-5,anthropic/claude-haiku-4-5,local/local-deterministic-fallback
+RESEARCH_HARNESS_LLM_MODELS=openai/gpt-5.5,openai/gpt-5.2,anthropic/claude-opus-4-6,anthropic/claude-sonnet-4-6,anthropic/claude-sonnet-4-5,anthropic/claude-haiku-4-5,ollama/qwen3.5:latest,local/local-deterministic-fallback
+OLLAMA_HOST=http://localhost:11434
 ```
 
 `all-configured` uses every available model in `RESEARCH_HARNESS_LLM_MODELS`
-round-robin. Providers without a valid key are skipped. The local fallback keeps
-offline runs working.
+round-robin. Providers without a valid key, or without a reachable Ollama server,
+are skipped. The local fallback keeps offline runs working.
+
+To use your local qwen model directly:
+
+```bash
+ollama run qwen3.5:latest
+autore "Research local agent evaluation loops" --llm-model ollama/qwen3.5:latest
+```
 
 ### Examples
 
@@ -83,6 +99,25 @@ paired-CRN protocol: 24 simulations, the same seed range for every variant, and
 JSON metrics explaining the result. Use `PREDICTION_MARKET_SIMULATIONS` and
 `PREDICTION_MARKET_SEED_START` when you intentionally want a larger or shifted
 batch.
+
+### Benchmark Policy
+
+The serious optimization benchmark is the prediction-market challenge. Before
+candidate generation, the harness now runs an official-evaluator preflight. If
+the upstream scorer or Docker sandbox is unavailable, the run stops before
+optimization instead of promoting a proxy/local score. Set
+`PREDICTION_MARKET_CHALLENGE_PATH` for the upstream repo, or explicitly set
+`PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM=1` to run the upstream scorer on
+the host with `uv`.
+
+Research evals should prefer task-specific acceptance checks such as finding a
+DOI/arXiv ID, dataset URL, benchmark table, or official measured profit. Generic
+source and claim counts are supporting diagnostics, not proof that the research
+task succeeded.
+
+Self-evolution remains proposal-only: the harness may write
+`harness_changes.json`, but changes are staged for Codex/Claude/human review and
+regression evals before any patch is applied.
 
 ## First Run
 
@@ -242,10 +277,11 @@ Use these when you want repeatable commands instead of the guided setup.
 | `--retriever arxiv` / `openalex` / `semantic_scholar` | Use a specific academic retriever. |
 | `--retriever github` / `web` / `docs_blogs` / `twitter` / `memory` / `alchemy` | Use a specific non-academic or local-memory retriever. |
 | `--llm-provider auto` | Infer provider from the selected model. |
-| `--llm-provider openai` / `anthropic` / `local` / `multi` | Force a provider mode. |
+| `--llm-provider openai` / `anthropic` / `ollama` / `local` / `multi` | Force a provider mode. |
 | `--llm-model all-configured` | Use every configured available model round-robin. |
 | `--no-steering` | Disable live `/article`, `/steer`, and `/note` input during terminal runs. |
 | `--llm-model openai/gpt-5.2` | Use one specific model. |
+| `--llm-model ollama/qwen3.5:latest` | Use your local qwen3.5 model through the Ollama API. |
 | `--list-llm-models` | Print the configured model catalog and exit. |
 | `--max-iterations N` | Set the outer-loop iteration budget. |
 | `--corpus PATH` | Choose the local corpus JSON file. |

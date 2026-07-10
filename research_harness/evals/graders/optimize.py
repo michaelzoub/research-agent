@@ -165,7 +165,7 @@ def _grade_plateau_entropy_exploration(task: EvalTask, store: ArtifactStore) -> 
         intent = metadata.get("meaningful_entropy_intent") if isinstance(metadata, dict) else None
         if isinstance(intent, dict):
             intents.append(intent)
-    meaningful_actions = {"new_strategy_family", "literature_mechanism", "alternative_evaluator", "fresh_search_context"}
+    meaningful_actions = {"uncertainty_axis", "literature_mechanism", "alternative_evaluator", "fresh_search_context"}
     actions = {str(intent.get("action", "")) for intent in intents}
     has_expected_generalization = all(
         str(intent.get("expected_generalization", "")).strip()

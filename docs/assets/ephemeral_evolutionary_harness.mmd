@@ -1,0 +1,32 @@
+flowchart TB
+    A[User Goal + Challenge Config] --> B[Session Controller]
+    B --> C[Initialize Fresh Agent Population]
+
+    subgraph S[Ephemeral Session Evolution]
+        direction TB
+        C --> D[Task Batch + Corpus Snapshot]
+        D --> E[Research Trials]
+        E --> F[Claim + Evidence Extraction]
+        F --> G[Fitness Evaluation]
+        G --> H[Select, Diversify, Mutate]
+        H --> E
+    end
+
+    E --> I[(Session Artifact Store)]
+    F --> I
+    G --> I
+    H --> I
+
+    I --> J[Report + Leaderboard + Best Session Agent]
+    J --> K[Discard Evolved Population]
+    K --> L[Next Challenge Starts Fresh]
+
+    classDef stable fill:#EEF2FF,stroke:#7C3AED,color:#1F2937,stroke-width:1px;
+    classDef ephemeral fill:#F8FAFC,stroke:#94A3B8,color:#111827,stroke-width:1px,stroke-dasharray: 6 4;
+    classDef store fill:#FFF7ED,stroke:#EA580C,color:#111827,stroke-width:1px;
+    classDef reset fill:#FEF2F2,stroke:#DC2626,color:#111827,stroke-width:1px;
+
+    class A,B,J,L stable;
+    class C,D,E,F,G,H ephemeral;
+    class I store;
+    class K reset;

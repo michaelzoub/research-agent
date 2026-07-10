@@ -174,7 +174,7 @@ class LiteratureAgent(BaseAgent):
         for document, relevance in all_results:
             source = store.add_source(self.corpus.to_source(document, relevance))
             for text in document.claims[: self.budget.max_steps]:
-                confidence = round((source.credibility_score * 0.7) + (relevance * 0.3), 2)
+                confidence = min(0.74, round((source.credibility_score * 0.7) + (relevance * 0.3), 2))
                 store.add_claim(
                     Claim(
                         text=text,
@@ -227,7 +227,7 @@ class HypothesisAgent(BaseAgent):
                     text=f"{self.hypothesis_angle.title()} path: {claim['text']}",
                     supporting_claim_ids=[claim["id"]],
                     contradicting_claim_ids=claim.get("contradicted_by", []),
-                    confidence=max(0.2, round(float(claim["confidence"]) - 0.1, 2)),
+                    confidence=min(0.68, max(0.2, round(float(claim["confidence"]) - 0.1, 2))),
                     novelty_score=round(0.55 + (index * 0.08), 2),
                     testability_score=0.72,
                     next_experiment=f"Search for direct evaluations of: {self.hypothesis_angle}.",
@@ -389,9 +389,9 @@ def _llm_filter_sources(
         return candidates
     system = (
         "You are a research librarian selecting sources for a literature review. "
-        "From the candidate list keep only those that directly address the goal and query angle. "
+        "From the candidate list keep sources that directly address the goal and also sources that could challenge, complicate, or redirect the query angle. "
         "Return JSON only: {\"selected_urls\": [str]}. "
-        "Prefer primary sources, empirical evidence, and domain-specific findings. "
+        "Prefer primary sources, empirical evidence, domain-specific findings, and well-grounded counterevidence. "
         "Exclude generic, off-topic, or low-quality sources."
     )
     user = json.dumps(
@@ -407,7 +407,7 @@ def _llm_filter_sources(
         sort_keys=True,
     )
     try:
-        payload = llm.complete_json(system, user, max_output_tokens=400, temperature=0.1)
+        payload = llm.complete_json(system, user, max_output_tokens=400, temperature=0.45)
         selected_urls = {str(u) for u in payload.get("selected_urls", []) if u}
         if not selected_urls:
             return candidates
@@ -750,7 +750,7 @@ def _filter_report_evidence(
     filtered_claims = []
     for claim in claims:
         source_ids = [str(source_id) for source_id in claim.get("source_ids", []) if str(source_id) in relevant_source_ids]
-        if source_ids or _prediction_market_relevance_score(claim) >= 2:
+        if source_ids:
             filtered_claims.append({**claim, "source_ids": source_ids})
     claim_ids = {str(claim.get("id", "")) for claim in filtered_claims}
     filtered_hypotheses = [
@@ -865,9 +865,9 @@ def _filter_general_report_evidence(
 
 
 def _is_prediction_market_report(run: RunRecord, seed_context: dict[str, object]) -> bool:
-    if run.product_agent == "challenge":
-        return True
     if seed_context.get("evaluator_name") == "prediction_market":
+        return True
+    if run.harness_config_snapshot.get("evaluator_name") == "prediction_market":
         return True
     normalized = run.user_goal.lower().replace("-", " ")
     return "prediction market" in normalized or ("prediction" in normalized and "market" in normalized)

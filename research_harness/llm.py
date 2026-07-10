@@ -81,8 +81,11 @@ class LLMClient:
         self.openai_api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.anthropic_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         self.kimi_api_key = api_key or os.environ.get("MOONSHOT_API_KEY") or os.environ.get("KIMI_API_KEY")
+        self.ollama_host = _normalize_ollama_host(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
         if self.provider == "kimi":
             self.api_key = self.kimi_api_key
+        elif self.provider == "ollama":
+            self.api_key = None
         else:
             self.api_key = self.openai_api_key if self.provider in {"auto", "openai"} else self.anthropic_api_key
         self.timeout_seconds = timeout_seconds
@@ -103,11 +106,14 @@ class LLMClient:
             return _looks_like_anthropic_key(self.anthropic_api_key)
         if self.provider == "kimi":
             return _looks_like_kimi_key(self.kimi_api_key)
+        if self.provider == "ollama":
+            return self._ollama_available()
         if self.provider == "auto":
             return (
                 _looks_like_openai_key(self.openai_api_key)
                 or _looks_like_anthropic_key(self.anthropic_api_key)
                 or _looks_like_kimi_key(self.kimi_api_key)
+                or self._ollama_available()
             )
         return False
 
@@ -184,7 +190,7 @@ class LLMClient:
         return sum(float(call.get("cost_usd") or 0.0) for call in self.call_history)
 
     def _response_cost(self, response: LLMResponse) -> float:
-        if response.provider == "local":
+        if response.provider in {"local", "ollama"}:
             return 0.0
         pricing = _pricing_for(self.model)
         return (
@@ -206,7 +212,7 @@ class LLMClient:
             "model_calls": self.call_history,
             "pricing_input_per_token": pricing["input"],
             "pricing_output_per_token": pricing["output"],
-            "pricing_note": "Local deterministic fallback calls are recorded with zero cost; live-provider prices are estimates until verified against billing.",
+            "pricing_note": "Local deterministic fallback and Ollama calls are recorded with zero cost; live-provider prices are estimates until verified against billing.",
         }
 
     def complete_json(self, system: str, user: str, *, max_output_tokens: int = 900, temperature: float = 0.7) -> dict[str, object]:
@@ -338,11 +344,53 @@ class LLMClient:
                 time.sleep(retry_after if retry_after is not None else 1.0 + attempt)
         raise LLMError(f"HTTP 429 from Kimi Chat Completions after retries: {last_body[:1000]}") from last_error
 
+    def _ollama_response(self, system: str, user: str, *, max_output_tokens: int, temperature: float = 0.7) -> LLMResponse:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": False,
+            "options": {
+                "num_predict": max_output_tokens,
+                "temperature": round(max(0.0, min(2.0, temperature)), 2),
+            },
+        }
+        request = urllib.request.Request(
+            f"{self.ollama_host}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "research-harness/0.1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise LLMError(f"HTTP {exc.code} from Ollama chat: {body[:1000]}") from exc
+        except urllib.error.URLError as exc:
+            raise LLMError(f"Could not reach Ollama at {self.ollama_host}: {exc.reason}") from exc
+        message = data.get("message") or {}
+        text = str(message.get("content") or data.get("response") or "")
+        return LLMResponse(
+            text=text,
+            model=str(data.get("model") or self.model),
+            provider="ollama",
+            prompt_tokens=int(data.get("prompt_eval_count") or _estimate_tokens(system + "\n" + user)),
+            completion_tokens=int(data.get("eval_count") or _estimate_tokens(text)),
+        )
+
     def _live_response(self, system: str, user: str, *, max_output_tokens: int, temperature: float) -> LLMResponse:
         if self.provider == "anthropic":
             return self._anthropic_response(system, user, max_output_tokens=max_output_tokens, temperature=temperature)
         if self.provider == "kimi":
             return self._kimi_response(system, user, max_output_tokens=max_output_tokens, temperature=temperature)
+        if self.provider == "ollama":
+            return self._ollama_response(system, user, max_output_tokens=max_output_tokens, temperature=temperature)
         return self._openai_response(system, user, max_output_tokens=max_output_tokens, temperature=temperature)
 
     def _select_execution_model(self) -> tuple[str, str]:
@@ -371,6 +419,8 @@ class LLMClient:
             return _looks_like_anthropic_key(self.anthropic_api_key)
         if provider == "kimi":
             return _looks_like_kimi_key(self.kimi_api_key)
+        if provider == "ollama":
+            return self._ollama_available()
         return False
 
     def validate(self) -> bool:
@@ -378,6 +428,8 @@ class LLMClient:
             return bool(self._available_model_pool())
         if not self.is_live:
             return False
+        if self.provider == "ollama":
+            return self._ollama_available()
         if self.provider == "anthropic":
             payload = {
                 "model": self.model,
@@ -448,12 +500,25 @@ class LLMClient:
                 return False
             raise
 
+    def _ollama_available(self) -> bool:
+        request = urllib.request.Request(
+            f"{self.ollama_host}/api/tags",
+            headers={"User-Agent": "research-harness/0.1.0"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=min(self.timeout_seconds, 2.0)):
+                return True
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            return False
+
     def _local_response(self, system: str, user: str) -> str:
         if "json" in system.lower():
-            return json.dumps({"score": 0.5, "rationale": "Local fallback score; configure OPENAI_API_KEY for live judging."})
+            return json.dumps({"score": 0.5, "rationale": "Local fallback score; configure a live provider or run Ollama for live judging."})
         return (
-            "Local deterministic fallback response. Configure OPENAI_API_KEY, ANTHROPIC_API_KEY, or MOONSHOT_API_KEY "
-            "and choose a live model such as openai/gpt-5.2, anthropic/claude-sonnet-4-5, or kimi/kimi-k2.6.\n\n"
+            "Local deterministic fallback response. Configure OPENAI_API_KEY, ANTHROPIC_API_KEY, MOONSHOT_API_KEY, "
+            "or run Ollama and choose a model such as openai/gpt-5.2, anthropic/claude-sonnet-4-5, "
+            "kimi/kimi-k2.6, or ollama/qwen3.5:latest.\n\n"
             f"Prompt excerpt: {user[:500]}"
         )
 
@@ -471,6 +536,13 @@ def _extract_json(text: str) -> str:
 
 def _estimate_tokens(text: str) -> int:
     return max(1, len(text.split()))
+
+
+def _normalize_ollama_host(value: str) -> str:
+    host = (value or "http://localhost:11434").strip().rstrip("/")
+    if host.startswith(("http://", "https://")):
+        return host
+    return f"http://{host}"
 
 
 def _looks_like_openai_key(api_key: Optional[str]) -> bool:

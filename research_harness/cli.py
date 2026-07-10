@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import os
+import shutil
 import sys
 import termios
 import tty
+from importlib import metadata
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -16,7 +19,7 @@ from .orchestrator import HarnessConfig, Orchestrator
 
 TASK_MODE_CHOICES = ("auto", "research", "optimize", "optimize_query")
 RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "twitter", "memory", "alchemy")
-LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "kimi", "local", "multi")
+LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "kimi", "ollama", "local", "multi")
 
 ANSI = {
     "reset": "\033[0m",
@@ -156,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-model",
         default=os.environ.get("RESEARCH_HARNESS_LLM_MODEL", "openai/gpt-5.2"),
-        help="LLM model id/name. Use provider/model ids like openai/gpt-5.2, anthropic/claude-sonnet-4-6, or all-configured.",
+        help="LLM model id/name. Use provider/model ids like openai/gpt-5.2, anthropic/claude-sonnet-4-6, ollama/qwen3.5:latest, or all-configured.",
     )
     parser.add_argument(
         "--list-llm-models",
@@ -239,22 +242,91 @@ def _print_cli_banner(
     compact: bool = False,
 ) -> None:
     use_color = _use_color() if color is None else color
+    version = _package_version()
     if compact:
         output_func(
-            f"{_paint('Autore', 'teal', enabled=use_color)} "
+            f"{_paint(f'Autore Code v{version}', 'teal', enabled=use_color)} "
             f"{_paint('research + optimize agent harness', 'gray', enabled=use_color)}"
         )
         return
-    output_func(_paint(LOGO.rstrip("\n"), "teal", enabled=use_color))
-    output_func(_paint("Research. Optimize. Challenge. Leave artifacts.", "bold", enabled=use_color))
+    width = max(72, min(116, shutil.get_terminal_size((100, 24)).columns - 4))
+    left_width = max(31, min(46, width // 2 - 2))
+    right_width = width - left_width - 3
+    header = f" Autore Code v{version} "
+    output_func(_paint(header, "teal", enabled=use_color) + _paint("-" * max(0, width - len(header)), "teal", enabled=use_color))
+    border = "+" + "-" * left_width + "+" + "-" * right_width + "+"
+    output_func(_paint(border, "teal", enabled=use_color))
+    left_lines = _banner_left_lines(left_width)
+    right_lines = _banner_right_lines(right_width)
+    max_lines = max(len(left_lines), len(right_lines))
+    for index in range(max_lines):
+        left = left_lines[index] if index < len(left_lines) else ""
+        right = right_lines[index] if index < len(right_lines) else ""
+        output_func(
+            _paint("|", "teal", enabled=use_color)
+            + _banner_cell(left, left_width, use_color=use_color)
+            + _paint("|", "teal", enabled=use_color)
+            + _banner_cell(right, right_width, use_color=use_color)
+            + _paint("|", "teal", enabled=use_color)
+        )
+    output_func(_paint(border, "teal", enabled=use_color))
     output_func("")
-    marker = _paint(">", "green", enabled=use_color)
-    direct_cmd = 'autore "Research ..."'
-    output_func(f"{marker} Guided setup: {_paint('autore', 'blue', enabled=use_color)}")
-    output_func(f"{marker} Direct run:   {_paint(direct_cmd, 'blue', enabled=use_color)}")
-    output_func(f"{marker} Models:       {_paint('autore --list-llm-models', 'blue', enabled=use_color)}")
-    output_func(f"{marker} Evals:        {_paint('autore-eval --suite preflight', 'blue', enabled=use_color)}")
-    output_func("")
+
+
+def _package_version() -> str:
+    try:
+        return metadata.version("research-harness")
+    except metadata.PackageNotFoundError:
+        return "0.1.0"
+
+
+def _banner_left_lines(width: int) -> list[str]:
+    user = getpass.getuser() or "there"
+    model = os.environ.get("RESEARCH_HARNESS_LLM_MODEL", "openai/gpt-5.2")
+    retriever = os.environ.get("RESEARCH_HARNESS_RETRIEVER", "auto")
+    cwd = _compact_path(Path.cwd(), max(18, width - 5))
+    return [
+        f"Welcome back {user}!",
+        "",
+        "     _         _",
+        "    / \\  _   _| |_ ___  _ __ ___",
+        "   / _ \\| | | | __/ _ \\| '__/ _ \\",
+        "  / ___ \\ |_| | || (_) | | |  __/",
+        " /_/   \\_\\__,_|\\__\\___/|_|  \\___|",
+        "",
+        f"Model {model}",
+        f"Retriever {retriever}",
+        cwd,
+    ]
+
+
+def _banner_right_lines(width: int) -> list[str]:
+    return [
+        "Tips for getting started",
+        "Run autore with no args for guided setup.",
+        "Use autore \"goal\" for direct runs.",
+        "Use --llm-model ollama/qwen3.5:latest locally.",
+        "",
+        "What's new",
+        "Claude-style startup panel and guided flow.",
+        "Ollama provider support for local models.",
+        "Install command: python3 -m pip install -e .",
+    ]
+
+
+def _compact_path(path: Path, width: int) -> str:
+    text = str(path).replace(str(Path.home()), "~", 1)
+    if len(text) <= width:
+        return text
+    return "..." + text[-max(1, width - 3):]
+
+
+def _banner_cell(text: str, width: int, *, use_color: bool) -> str:
+    clean = text[: max(0, width - 2)]
+    color = "teal" if clean in {"Tips for getting started", "What's new"} else "gray"
+    if clean.startswith("Welcome back"):
+        color = "bold"
+    return " " + _paint(clean.ljust(width - 2), color, enabled=use_color) + " "
 
 
 def _print_run_summary(run, store, *, output_func: Callable[[str], None] = print, color: Optional[bool] = None) -> None:
@@ -453,7 +525,7 @@ def configure_interactive_run(
 ) -> argparse.Namespace:
     _print_cli_banner(output_func=output_func)
     output_func("Ready to run. Existing flags are used as starting values.")
-    output_func("Tip: press Enter to accept a default; use Up/Down in menus.")
+    output_func("Press Enter to accept defaults; use Up/Down in menus.")
     output_func("")
     args.goal = prompt_text(
         "What should the agent work on?",

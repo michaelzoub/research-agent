@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import re
+import asyncio
 import ipaddress
-import urllib.parse
+import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict
 from typing import Any
@@ -12,74 +13,84 @@ from .base import ToolContext, ToolResult
 
 
 class SearchTool:
-    """One explicit search backend, selected by the caller/model by name."""
+    """Read-only evidence discovery from one registered backend."""
+    is_read_only = True
+
     def __init__(self, backend: Any):
         self.backend = backend
         self.name = str(backend.tool_name)
-        self.description = (
-            "Search the %s source collection for evidence. Use when you need candidate sources; "
-            "do not use to read a known local file or fetch a known URL." % self.name
-        )
-        self.input_schema = {
-            "type": "object",
-            "required": ["query"],
-            "properties": {"query": {"type": "string", "minLength": 2}, "limit": {"type": "integer", "minimum": 1, "maximum": 10}},
-            "additionalProperties": False,
-        }
+        self.description = f"Search {self.name} for candidate evidence. Use to discover sources, not to read a known file or URL."
+        self.input_schema = {"type": "object", "required": ["query"], "properties": {"query": {"type": "string", "minLength": 2}, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, "additionalProperties": False}
 
-    def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         query = str(arguments["query"]).strip()
-        if len(query) < 2:
-            return ToolResult("error", error="query must contain at least two characters.", retryable=False)
-        documents = self.backend.search(query, limit=min(10, max(1, int(arguments.get("limit", 4)))))
+        documents = await asyncio.to_thread(self.backend.search, query, limit=min(10, max(1, int(arguments.get("limit", 4)))))
         sources = [self.backend.to_source(document, relevance) for document, relevance in documents]
         if context.store is not None:
             sources = [context.store.add_source(source) for source in sources]
         metadata = [asdict(source) for source in sources]
-        return ToolResult(
-            "ok",
-            {"query": query, "result_count": len(metadata), "results": [{"title": row["title"], "url": row["url"], "summary": row["summary"]} for row in metadata]},
-            source_metadata=metadata,
-        )
+        return ToolResult("ok", {"query": query, "result_count": len(metadata), "results": [{"title": row["title"], "url": row["url"], "summary": row["summary"]} for row in metadata]}, source_metadata=metadata)
 
 
 class WebFetchTool:
-    name = "fetch_web_page"
-    description = (
-        "Fetch a known public HTTP(S) page as plain text after a search result identifies it. "
-        "Use to inspect a specific URL; do not use to discover sources or access private/local addresses."
-    )
-    input_schema = {
-        "type": "object",
-        "required": ["url"],
-        "properties": {"url": {"type": "string", "description": "Public http(s) URL from a promising source; example: https://arxiv.org/abs/1706.03762"}},
-        "additionalProperties": False,
-    }
+    """Read-only public document fetcher with DNS and redirect SSRF protection."""
+    name = "fetch_document"
+    is_read_only = True
+    description = "Fetch a known public HTTP(S) document after discovery. Rejects private, local, and unsafe redirect destinations."
+    input_schema = {"type": "object", "required": ["url"], "properties": {"url": {"type": "string", "minLength": 8}}, "additionalProperties": False}
 
-    def __init__(self, timeout_seconds: float = 15.0, max_characters: int = 20000):
-        self.timeout_seconds = timeout_seconds
-        self.max_characters = max_characters
+    def __init__(self, timeout_seconds: float = 15.0, max_characters: int = 20000, max_redirects: int = 5):
+        self.timeout_seconds, self.max_characters, self.max_redirects = timeout_seconds, max_characters, max_redirects
 
-    def execute(self, arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
-        url = str(arguments["url"]).strip()
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return ToolResult("error", error="Only public http(s) URLs are supported.", retryable=False)
-        hostname = parsed.hostname.lower()
-        try:
-            if ipaddress.ip_address(hostname).is_private or ipaddress.ip_address(hostname).is_loopback:
-                return ToolResult("error", error="Private or loopback addresses are not permitted.", retryable=False)
-        except ValueError:
-            if hostname == "localhost" or hostname.endswith(".local"):
-                return ToolResult("error", error="Local hostnames are not permitted.", retryable=False)
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "research-harness/0.1.0"}), timeout=self.timeout_seconds) as response:
+    async def execute(self, arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+        return await asyncio.to_thread(self._fetch, str(arguments["url"]).strip())
+
+    def _fetch(self, url: str) -> ToolResult:
+        for _ in range(self.max_redirects + 1):
+            error = _public_url_error(url)
+            if error:
+                return ToolResult("error", error=error)
+            opener = urllib.request.build_opener(_NoRedirect())
+            try:
+                response = opener.open(urllib.request.Request(url, headers={"User-Agent": "research-harness/0.2.0"}), timeout=self.timeout_seconds)
+            except urllib.error.HTTPError as exc:
+                if exc.code in {301, 302, 303, 307, 308}:
+                    target = exc.headers.get("Location")
+                    if not target:
+                        return ToolResult("error", error="Redirect response did not include a Location header.")
+                    url = urllib.parse.urljoin(url, target)
+                    continue
+                return ToolResult("error", error=f"HTTP {exc.code} while fetching URL.", retryable=exc.code >= 500)
+            except (urllib.error.URLError, TimeoutError) as exc:
+                return ToolResult("error", error=f"Network error: {exc}", retryable=True)
+            with response:
                 content_type = str(response.headers.get("Content-Type") or "")
-                if "text" not in content_type and "json" not in content_type and content_type:
-                    return ToolResult("error", error="URL did not return a text-compatible content type.", retryable=False)
-                text = response.read(self.max_characters + 1).decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            return ToolResult("error", error="HTTP %s while fetching URL." % exc.code, retryable=exc.code >= 500)
-        except (urllib.error.URLError, TimeoutError) as exc:
-            return ToolResult("error", error="Network error: %s" % exc, retryable=True)
-        return ToolResult("ok", {"url": url, "content": text[: self.max_characters], "truncated": len(text) > self.max_characters})
+                if content_type and not any(kind in content_type.lower() for kind in ("text", "json", "pdf")):
+                    return ToolResult("error", error="URL did not return a supported document content type.")
+                raw = response.read(self.max_characters + 1)
+            text = raw.decode("utf-8", errors="replace")
+            return ToolResult("ok", {"url": url, "content_type": content_type, "content": text[: self.max_characters], "truncated": len(raw) > self.max_characters})
+        return ToolResult("error", error="Too many redirects.")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def _public_url_error(url: str) -> str | None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "Only public http(s) URLs are supported."
+    hostname = parsed.hostname.lower()
+    if hostname == "localhost" or hostname.endswith(".local"):
+        return "Private or loopback addresses are not permitted."
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)}
+    except socket.gaierror:
+        return "URL hostname could not be resolved."
+    for address in addresses:
+        candidate = ipaddress.ip_address(address)
+        if not candidate.is_global:
+            return "Private or loopback addresses are not permitted."
+    return None

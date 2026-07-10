@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from .model_catalog import ALL_CONFIGURED_MODEL_ID, configured_model_pool, resolve_model_selection
 
@@ -57,6 +57,26 @@ def _pricing_for(model: str) -> dict[str, float]:
 @dataclass
 class LLMResponse:
     text: str
+    model: str
+    provider: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+
+
+@dataclass
+class ModelToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ModelTurn:
+    """Provider-neutral representation of a native model response."""
+    text: str
+    tool_calls: list[ModelToolCall]
+    stop_reason: str
     model: str
     provider: str
     prompt_tokens: int = 0
@@ -182,6 +202,99 @@ class LLMClient:
             raise
         finally:
             self.provider, self.model = stored_provider, stored_model
+
+    def complete_turn(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        *,
+        max_output_tokens: int = 1200,
+        temperature: float = 0.35,
+    ) -> ModelTurn:
+        """Generate one provider-native tool-use turn.
+
+        JSON-emulated tool selection is deliberately not used here. Providers that
+        lack native tool calling should be selected only with an explicit fallback
+        decider at the application boundary.
+        """
+        active_provider, active_model = self._select_execution_model()
+        stored_provider, stored_model = self.provider, self.model
+        self.provider, self.model = active_provider, active_model
+        try:
+            if not self.is_live:
+                raise LLMError("A live provider with native tool calling is required for this run.")
+            if self.provider == "anthropic":
+                turn = self._anthropic_turn(messages, tools, max_output_tokens=max_output_tokens, temperature=temperature)
+            elif self.provider == "ollama":
+                turn = self._ollama_turn(messages, tools, max_output_tokens=max_output_tokens, temperature=temperature)
+            else:
+                turn = self._openai_turn(messages, tools, max_output_tokens=max_output_tokens, temperature=temperature)
+            turn.cost = self._response_cost(LLMResponse("", turn.model, turn.provider, turn.prompt_tokens, turn.completion_tokens))
+            self.total_prompt_tokens += turn.prompt_tokens
+            self.total_completion_tokens += turn.completion_tokens
+            self.call_history.append({
+                "provider": turn.provider, "model": turn.model,
+                "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens,
+                "total_tokens": turn.prompt_tokens + turn.completion_tokens,
+                "cost_usd": round(turn.cost, 6), "is_live": True,
+                "status": "completed", "call_type": "native_tool_turn",
+                "tool_calls": len(turn.tool_calls), "stop_reason": turn.stop_reason,
+            })
+            return turn
+        except Exception as exc:
+            self.call_history.append({"provider": self.provider, "model": self.model, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "is_live": self.provider != "local", "status": "failed", "call_type": "native_tool_turn", "error": f"{type(exc).__name__}: {exc}"})
+            raise
+        finally:
+            self.provider, self.model = stored_provider, stored_model
+
+    def _openai_turn(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]], *, max_output_tokens: int, temperature: float) -> ModelTurn:
+        payload = {
+            "model": self.model,
+            "messages": _openai_history(messages),
+            "tools": [{"type": "function", "function": {"name": item["name"], "description": item["description"], "parameters": item["input_schema"]}} for item in tools],
+            "tool_choice": "auto",
+            "max_completion_tokens": max_output_tokens,
+            "temperature": temperature,
+        }
+        endpoint = "https://api.moonshot.ai/v1/chat/completions" if self.provider == "kimi" else "https://api.openai.com/v1/chat/completions"
+        api_key = self.kimi_api_key if self.provider == "kimi" else self.openai_api_key
+        data = _post_json(endpoint, payload, {"Authorization": f"Bearer {api_key}"}, self.timeout_seconds)
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        calls = []
+        for item in message.get("tool_calls") or []:
+            function = item.get("function") or {}
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            calls.append(ModelToolCall(str(item.get("id") or f"call_{len(calls) + 1}"), str(function.get("name") or ""), arguments))
+        usage = data.get("usage") or {}
+        return ModelTurn(str(message.get("content") or ""), calls, str(choice.get("finish_reason") or ("tool_calls" if calls else "stop")), str(data.get("model") or self.model), self.provider, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0))
+
+    def _anthropic_turn(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]], *, max_output_tokens: int, temperature: float) -> ModelTurn:
+        system, history = _anthropic_history(messages)
+        payload = {
+            "model": self.model, "system": system, "messages": history,
+            "tools": [{"name": item["name"], "description": item["description"], "input_schema": item["input_schema"]} for item in tools],
+            "max_tokens": max_output_tokens, "temperature": temperature,
+        }
+        data = _post_json("https://api.anthropic.com/v1/messages", payload, {"x-api-key": str(self.anthropic_api_key), "anthropic-version": "2023-06-01"}, self.timeout_seconds)
+        blocks = data.get("content") or []
+        calls = [ModelToolCall(str(block.get("id") or f"toolu_{index}"), str(block.get("name") or ""), dict(block.get("input") or {})) for index, block in enumerate(blocks) if block.get("type") == "tool_use"]
+        text = "\n".join(str(block.get("text") or "") for block in blocks if block.get("type") == "text")
+        usage = data.get("usage") or {}
+        return ModelTurn(text, calls, str(data.get("stop_reason") or ("tool_use" if calls else "end_turn")), str(data.get("model") or self.model), "anthropic", int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0))
+
+    def _ollama_turn(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]], *, max_output_tokens: int, temperature: float) -> ModelTurn:
+        payload = {"model": self.model, "messages": _ollama_history(messages), "tools": [{"type": "function", "function": {"name": item["name"], "description": item["description"], "parameters": item["input_schema"]}} for item in tools], "stream": False, "options": {"num_predict": max_output_tokens, "temperature": round(max(0.0, min(2.0, temperature)), 2)}}
+        data = _post_json(f"{self.ollama_host}/api/chat", payload, {}, self.timeout_seconds)
+        message = data.get("message") or {}
+        calls = []
+        for index, item in enumerate(message.get("tool_calls") or []):
+            function = item.get("function") or item
+            calls.append(ModelToolCall(str(item.get("id") or f"ollama_call_{index}"), str(function.get("name") or ""), dict(function.get("arguments") or {})))
+        return ModelTurn(str(message.get("content") or ""), calls, str(data.get("done_reason") or ("tool_calls" if calls else "stop")), str(data.get("model") or self.model), "ollama", int(data.get("prompt_eval_count") or 0), int(data.get("eval_count") or 0))
 
     def total_cost(self) -> float:
         """Return accumulated cost in USD based on model pricing table."""
@@ -521,6 +634,67 @@ class LLMClient:
             "kimi/kimi-k2.6, or ollama/qwen3.5:latest.\n\n"
             f"Prompt excerpt: {user[:500]}"
         )
+
+
+def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout_seconds: float) -> dict[str, Any]:
+    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "User-Agent": "research-harness/0.2.0", **headers}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise LLMError(f"HTTP {exc.code} from model provider: {body[:1000]}") from exc
+    except urllib.error.URLError as exc:
+        raise LLMError(f"Could not reach model provider: {exc.reason}") from exc
+
+
+def _openai_history(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    history: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        if role == "assistant":
+            calls = message.get("tool_calls") or []
+            entry: dict[str, Any] = {"role": "assistant", "content": message.get("content") or None}
+            if calls:
+                entry["tool_calls"] = [{"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": json.dumps(call.get("arguments") or {}, sort_keys=True)}} for call in calls]
+            history.append(entry)
+        elif role == "tool":
+            history.append({"role": "tool", "tool_call_id": message["tool_call_id"], "content": json.dumps(message.get("content") or {}, sort_keys=True, default=str)})
+        else:
+            history.append({"role": role, "content": str(message.get("content") or "")})
+    return history
+
+
+def _ollama_history(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Ollama follows the OpenAI-shaped roles, except tool responses carry content.
+    return _openai_history(messages)
+
+
+def _anthropic_history(messages: Sequence[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    system_parts: list[str] = []
+    history: list[dict[str, Any]] = []
+    pending_results: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        if role == "system":
+            system_parts.append(str(message.get("content") or ""))
+        elif role == "tool":
+            pending_results.append({"type": "tool_result", "tool_use_id": message["tool_call_id"], "content": json.dumps(message.get("content") or {}, sort_keys=True, default=str)})
+        else:
+            if pending_results:
+                history.append({"role": "user", "content": pending_results})
+                pending_results = []
+            if role == "assistant":
+                blocks: list[dict[str, Any]] = []
+                if message.get("content"):
+                    blocks.append({"type": "text", "text": str(message["content"])})
+                blocks.extend({"type": "tool_use", "id": call["id"], "name": call["name"], "input": call.get("arguments") or {}} for call in message.get("tool_calls") or [])
+                history.append({"role": "assistant", "content": blocks})
+            else:
+                history.append({"role": "user", "content": str(message.get("content") or "")})
+    if pending_results:
+        history.append({"role": "user", "content": pending_results})
+    return "\n\n".join(system_parts), history
 
 
 def _extract_json(text: str) -> str:

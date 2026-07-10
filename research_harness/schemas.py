@@ -9,7 +9,7 @@ from uuid import uuid4
 TaskType = Literal["bounded", "open_ended"]
 TaskMode = Literal["optimize", "research", "optimize_query"]
 ProductAgent = Literal["research", "optimize", "challenge"]
-RunStatus = Literal["running", "completed", "failed", "cancelled"]
+RunStatus = Literal["running", "completed", "needs_input", "partial", "budget_exhausted", "cancelled", "safety_stopped", "failed"]
 WritePolicy = Literal["append_only", "upsert_by_url", "upsert_by_text"]
 LoopTaskStatus = Literal["pending", "running", "passed", "failed", "skipped"]
 LoopTaskAction = Literal["search", "hypothesize", "critique", "synthesize", "debug_harness"]

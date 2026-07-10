@@ -17,7 +17,6 @@ from .model_catalog import format_model_catalog, model_choices, resolve_model_se
 from .orchestrator import HarnessConfig, Orchestrator
 
 
-TASK_MODE_CHOICES = ("auto", "research", "optimize", "optimize_query")
 RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "twitter", "memory", "alchemy")
 LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "kimi", "ollama", "local", "multi")
 
@@ -45,8 +44,7 @@ HELP_EPILOG = """
 Examples:
   autore
   autore "Research how multi-agent systems improve literature review quality"
-  autore "Optimize a tiny scoring function" --task-mode optimize --evaluator length_score
-  autore "Get to $10 profit in the prediction market challenge" --task-mode optimize_query --evaluator prediction_market
+  autore "Compare a proposed strategy with the registered evaluator" --evaluator length_score
 
 Useful companions:
   autore --list-llm-models
@@ -67,12 +65,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive",
         action="store_true",
         help="Open the selection-based run setup, using any supplied flags as defaults.",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["agent", "standard", "deterministic"],
-        default=os.environ.get("RESEARCH_HARNESS_MODE"),
-        help="Execution architecture. Omit for the model-directed tool-using agent. Use standard or deterministic for legacy workflows.",
     )
     parser.add_argument(
         "--corpus",
@@ -96,59 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations",
         type=int,
         default=12,
-        help="Maximum outer-loop iterations for the default evolutionary agent loop.",
-    )
-    parser.add_argument(
-        "--optimization-preset",
-        choices=("standard", "challenge"),
-        default=os.environ.get("RESEARCH_HARNESS_OPTIMIZATION_PRESET", "standard"),
-        help="Use challenge for high-width optimization: 48+ variants, 20+ iterations, top-4 parents, capped evaluator parallelism, and plateau continuation.",
-    )
-    parser.add_argument(
-        "--population-size",
-        type=int,
-        default=int(os.environ.get("RESEARCH_HARNESS_POPULATION_SIZE", "4")),
-        help="Evolutionary variant population per round. The challenge preset raises this to at least 48.",
-    )
-    parser.add_argument(
-        "--query-population-size",
-        type=int,
-        default=int(os.environ["RESEARCH_HARNESS_QUERY_POPULATION_SIZE"]) if os.environ.get("RESEARCH_HARNESS_QUERY_POPULATION_SIZE") else None,
-        help="Optional optimize_query research fan-out cap. Challenge preset defaults this to 16 while keeping optimizer population wide.",
-    )
-    parser.add_argument(
-        "--parent-count",
-        type=int,
-        default=int(os.environ.get("RESEARCH_HARNESS_PARENT_COUNT", "2")),
-        help="Number of top-scoring variants promoted as parents for the next optimization round.",
-    )
-    parser.add_argument(
-        "--parallel-evaluator-cap",
-        type=int,
-        default=int(os.environ.get("RESEARCH_HARNESS_PARALLEL_EVALUATOR_CAP", "8")),
-        help="Maximum concurrent evaluator calls for optimization/challenge variants.",
-    )
-    parser.add_argument(
-        "--no-direction-entropy",
-        action="store_true",
-        help="Disable deterministic strategy-family/mechanism forcing across generated variants.",
-    )
-    parser.add_argument(
-        "--novelty-fraction",
-        type=float,
-        default=float(os.environ.get("RESEARCH_HARNESS_NOVELTY_FRACTION", "0.25")),
-        help="Fraction of each generation reserved for non-descendant novelty directions.",
-    )
-    parser.add_argument(
-        "--task-mode",
-        choices=TASK_MODE_CHOICES,
-        default=os.environ.get("RESEARCH_HARNESS_TASK_MODE", "auto"),
-        help="Task ingestion mode for the evolutionary agent loop. Auto uses evaluator availability and prompt heuristics.",
+        help="Maximum model turns for this run.",
     )
     parser.add_argument(
         "--evaluator",
         default=os.environ.get("RESEARCH_HARNESS_EVALUATOR"),
-        help="Registered deterministic evaluator name for optimize-mode tasks.",
+        help="Optional registered evaluator made available to the agent as a controlled capability.",
     )
     parser.add_argument(
         "--llm-provider",
@@ -534,45 +479,6 @@ def configure_interactive_run(
         input_func=input_func,
         output_func=output_func,
     )
-    args.task_mode = prompt_choice(
-        "What kind of run is this?",
-        [
-            ("auto", "Auto decide"),
-            ("research", "Research and synthesize"),
-            ("optimize", "Optimize against an evaluator"),
-            ("optimize_query", "Research first, then optimize"),
-        ],
-        default=args.task_mode or "auto",
-        input_func=input_func,
-        output_func=output_func,
-        key_reader=key_reader,
-    )
-    if args.task_mode in {"optimize", "optimize_query"}:
-        evaluator = prompt_choice(
-            "Which evaluator should score candidates?",
-            [
-                ("", "Decide from the prompt"),
-                ("length_score", "length_score demo evaluator"),
-                ("prediction_market", "prediction_market challenge evaluator"),
-                ("custom", "Type a custom evaluator name"),
-            ],
-            default=args.evaluator or "",
-            input_func=input_func,
-            output_func=output_func,
-            key_reader=key_reader,
-        )
-        if evaluator == "custom":
-            evaluator = prompt_text(
-                "Evaluator name",
-                default=None,
-                required=True,
-                input_func=input_func,
-                output_func=output_func,
-            )
-        args.evaluator = evaluator or None
-        if args.evaluator == "prediction_market":
-            args.task_mode = "optimize_query"
-            args.optimization_preset = "challenge"
     args.retriever = prompt_choice(
         "Where should research evidence come from?",
         [
@@ -594,8 +500,8 @@ def configure_interactive_run(
         key_reader=key_reader,
     )
     args.max_iterations = prompt_int(
-        "Iteration budget",
-        default=max(args.max_iterations, 20) if args.optimization_preset == "challenge" else args.max_iterations,
+        "Maximum model turns",
+        default=args.max_iterations,
         input_func=input_func,
         output_func=output_func,
     )
@@ -661,19 +567,9 @@ def main() -> None:
     if args.preflight:
         run_preflight_evals(args)
     config = HarnessConfig(
-        mode=args.mode or "agent",
         retriever=args.retriever,
-        max_loop_iterations=args.max_iterations,
-        max_loop_iterations_explicit=getattr(args, "max_iterations_explicit", False),
-        task_mode=args.task_mode,
+        max_iterations=args.max_iterations,
         evaluator_name=args.evaluator,
-        evolution_population_size=args.population_size,
-        query_population_size=args.query_population_size,
-        optimization_preset=args.optimization_preset,
-        optimizer_parent_count=args.parent_count,
-        parallel_evaluator_cap=args.parallel_evaluator_cap,
-        force_direction_entropy=not args.no_direction_entropy,
-        novelty_fraction=args.novelty_fraction,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
         session_projects_dir=args.session_projects_dir,
@@ -684,7 +580,7 @@ def main() -> None:
         enable_steering=(not args.no_steering and not args.quiet and sys.stdin.isatty()),
     )
     orchestrator = Orchestrator(args.corpus, args.output, config)
-    run, store = asyncio.run(orchestrator.run(args.goal, mode=args.mode))
+    run, store = asyncio.run(orchestrator.run(args.goal))
     _print_run_summary(run, store)
 
 

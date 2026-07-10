@@ -233,7 +233,7 @@ section_mark("session_y2")
 # ── Finalization ───────────────────────────────────────────────────────────────
 gap()
 section_mark("finalize_y1")
-M("orch",  "store", "write_prd() · cost.json · cost_events.json")
+M("orch",  "store", "write_run_state() · cost.json · cost_events.json")
 M("orch",  "store", "diagnose_snapshot() → failure_taxonomy · score_patterns")
 M("store", "world", "mirror rows → world_model.sqlite · run_observability", col="#00695c")
 M("world", "orch",  "updated dedup_keys · provenance_edges", ret=True, col="#00695c")

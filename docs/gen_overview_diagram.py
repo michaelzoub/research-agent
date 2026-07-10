@@ -7,7 +7,7 @@ Outputs: docs/assets/architecture_overview.svg + .png
 
 Changes vs v1:
 - CLI removed (noise; User talks directly to Orchestrator)
-- PRD write moved to finalization only (by design, not written at startup)
+- Run state is updated as actions are observed, not used as a predefined plan
 - Evolutionary loop shown with explicit loop frame
 """
 
@@ -205,7 +205,7 @@ gap()
 
 # ── FINALIZATION ──────────────────────────────────────────────────────────────
 mark("final_y1")
-M("orch",  "store", "finalize: costs · diagnostics · report · PRD")
+M("orch",  "store", "finalize: costs · diagnostics · report · run state")
 M("store", "world", "mirror → world_model.sqlite · observability")
 mark("final_y2")
 

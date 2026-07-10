@@ -261,7 +261,7 @@ def _human_span_label(raw_name: str, role: str, counts: Counter[str]) -> str:
             return "Build seed context"
         return f"Orchestration {index}"
     if role == "memory":
-        return "Memory / PRD"
+        return "Memory / run state"
     if role == "search_literature":
         number = _trailing_number(raw_name)
         return f"Literature search {number}" if number else "Literature search"
@@ -963,7 +963,7 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
     variants = store.list("variants")
     evaluations = store.list("variant_evaluations")
     rounds = store.list("evolution_rounds")
-    prd = read_json(store.prd_path, {})
+    run_state = read_json(store.run_state_path, {})
     optimizer_seed_context = read_json(store.optimizer_seed_context_path, {})
     optimizer_agent_steps = read_json(getattr(store, "optimizer_agent_steps_path", store.root / "optimization_agent_steps.json"), [])
     optimization_result = read_json(store.optimization_result_path, {})
@@ -1001,7 +1001,7 @@ def build_run_summary(store: ArtifactStore) -> dict[str, Any]:
             "failed_agents": sum(1 for trace in traces if trace.get("status") != "completed"),
         },
         "task_ingestion": decisions[0] if decisions else None,
-        "prd": prd,
+        "run_state": run_state,
         "optimizer_seed_context": optimizer_seed_context,
         "optimizer_agent_steps": optimizer_agent_steps,
         "optimizer_agent": optimizer_agent,
@@ -1412,7 +1412,7 @@ def decision_dag_mermaid(summary: dict[str, Any]) -> str:
         "flowchart TD",
         f'  prompt["Prompt: {_mermaid(str(run.get("user_goal", "")))}"]',
         f'  route["Task router\\nProduct: {decision.get("product_agent", run.get("product_agent", "unknown"))}\\nMode: {decision.get("selected_mode", run.get("task_mode", "unknown"))}"]',
-        '  memory["LeadResearcher memory\\nPRD + plan + objective + seed context"]',
+        '  memory["LeadResearcher memory\\nstate + evidence + objective + seed context"]',
         '  propose["Propose specialized subagent tasks / variants"]',
         '  subagents["Parallel subagents\\nresearch / optimizer evaluators"]',
         '  rank["Evaluate, rank, select parents"]',
@@ -1828,7 +1828,7 @@ def decision_dag_svg(summary: dict[str, Any]) -> str:
     add("prompt", left_x, y, "1 User Prompt", str(run.get("user_goal", ""))[:64], "#dbeafe")
     add("route", right_x, y, "2 Task Router", f"{decision.get('product_agent', run.get('product_agent', 'unknown'))} / {decision.get('selected_mode', run.get('task_mode', 'unknown'))}", "#fce7f3")
     y += 88
-    add("memory", left_x, y, "3 Lead Research Context", "PRD, plan, objective, seed context", "#ccfbf1")
+    add("memory", left_x, y, "3 Lead Research Context", "state, evidence, objective, seed context", "#ccfbf1")
     add("propose", right_x, y, "4 Propose Variants", f"{counts.get('variants', 0)} query/code variants across {counts.get('outer_rounds', 0)} rounds", "#e0f2fe")
     y += 88
     add("fanout", left_x, y, "5 Parallel Evaluation Batch", "variant evaluations run as independent async tasks", "#dbeafe")
@@ -1919,7 +1919,7 @@ def decision_dag_png(summary: dict[str, Any]) -> bytes:
     cards.append((x1, y, w, h, "1 User prompt", str(run.get("user_goal", ""))[:64], "#dbeafe"))
     cards.append((x2, y, w, h, "2 Task router", f"{decision.get('product_agent', run.get('product_agent', 'unknown'))} / {decision.get('selected_mode', run.get('task_mode', 'unknown'))}", "#fce7f3"))
     y += 88
-    cards.append((x1, y, w, h, "3 Lead research context", "PRD, source strategy, objective, context", "#ccfbf1"))
+    cards.append((x1, y, w, h, "3 Lead research context", "state, evidence, objective, context", "#ccfbf1"))
     cards.append((x2, y, w, h, "4 Propose variants", f"{counts.get('variants', 0)} query/code variants across {counts.get('outer_rounds', 0)} rounds", "#e0f2fe"))
     y += 88
     cards.append((x1, y, w, h, "5 Parallel evaluation batch", "variant evaluations run as independent tasks", "#dbeafe"))

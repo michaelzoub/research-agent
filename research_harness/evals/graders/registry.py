@@ -6,8 +6,8 @@ from .core import (
     _grade_isolation_clean_trial,
     _grade_mode_selected,
     _grade_outcome_completed,
-    _grade_prd_tasks_executed,
-    _grade_prd_tasks_executed_deterministic,
+    _grade_run_actions_executed,
+    _grade_run_actions_executed_deterministic,
     _grade_report_artifact,
     _grade_transcript_progress,
 )
@@ -58,8 +58,8 @@ from .research import (
 def default_graders() -> dict[str, Grader]:
     return {
         "outcome_completed": Grader("outcome_completed", "code", "outcome verification", 1.0, 1.0, _grade_outcome_completed),
-        "prd_tasks_executed": Grader("prd_tasks_executed", "code", "prd execution verification", 1.0, 1.0, _grade_prd_tasks_executed),
-        "prd_tasks_executed_deterministic": Grader("prd_tasks_executed_deterministic", "code", "deterministic PRD execution verification", 1.0, 1.0, _grade_prd_tasks_executed_deterministic),
+        "run_actions_executed": Grader("run_actions_executed", "code", "run action execution verification", 1.0, 1.0, _grade_run_actions_executed),
+        "run_actions_executed_deterministic": Grader("run_actions_executed_deterministic", "code", "deterministic action execution verification", 1.0, 1.0, _grade_run_actions_executed_deterministic),
         "mode_selected": Grader("mode_selected", "code", "tool/output verification", 1.0, 1.0, _grade_mode_selected),
         "artifact_report": Grader("artifact_report", "code", "artifact existence", 0.75, 1.0, _grade_report_artifact),
         "research_groundedness": Grader("research_groundedness", "code", "groundedness assertions", 1.25, 0.8, _grade_research_groundedness),

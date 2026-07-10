@@ -1,6 +1,6 @@
 ---
 name: research-agent-architecture
-description: Maintain the research-harness architecture where each product option is an agent defined as model plus harness. Use when changing orchestrator routing, product agents, loop modes, PRD generation, artifact flow, parallel execution, or docs that explain research, optimize, and challenge agents.
+description: Maintain the research-harness architecture where each product option is an agent defined as model plus harness. Use when changing orchestrator routing, product agents, loop modes, run-state artifacts, parallel execution, or docs that explain research, optimize, and challenge agents.
 ---
 
 # Research Agent Architecture
@@ -19,7 +19,7 @@ agent = model + harness
 ```
 
 The model is `LLMClient` or a compatible model client. The harness is the loop,
-tools, evaluators, artifact store, PRD generation, budgets, traces, stopping
+tools, evaluators, artifact store, run state, budgets, traces, stopping
 rules, and orchestration policy.
 
 ## Product Agents
@@ -34,19 +34,20 @@ Keep these product agents first-class:
 Do not collapse product-agent identity into loop mode. `task_mode` says how the
 run executes; `product_agent` says which product option the user invoked.
 
-## PRD Contract
+## Probabilistic Loop Contract
 
-Every product agent run writes `prd.json` with:
+Every product agent run writes `run_state.json` with:
 
 - selected `product_agent`
 - selected runtime `task_mode`
 - agent-harness definition
-- ordered tasks
-- acceptance criteria
+- observed actions and their evidence
+- stopping rationale
 - artifact paths
 
-When adding a new task, ensure it appears in `organized_tasks` and has concrete
-acceptance criteria.
+Do not add a fixed task sequence. The model chooses its next action from the
+goal, current state, retrieved evidence, evaluator feedback, failures, and
+remaining budget.
 
 ## Parallelism Rule
 
@@ -54,9 +55,9 @@ The orchestrator decides parallelism based on dependencies:
 
 - independent role agents may use `asyncio.gather`
 - independent variant evaluations may use `asyncio.gather`
-- critique, synthesis, and PRD completion should run after their inputs exist
+- critique and synthesis should run only when the available evidence warrants them
 
-Make dependency order visible in `LoopTask` records and PRD output.
+Record the action basis and observed outcome in `LoopTask` records and run state.
 
 ## Gotchas
 
@@ -66,4 +67,3 @@ Make dependency order visible in `LoopTask` records and PRD output.
   separate product agent because it has external contracts and official graders.
 - Updating only docs is not enough when the invariant should be enforced by
   tests or graders.
-

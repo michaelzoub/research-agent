@@ -131,3 +131,32 @@ class DockerSandboxRunner:
             except Exception as exc:
                 return SandboxExecutionResult("", f"{type(exc).__name__}: {exc}", 1)
         return SandboxExecutionResult(completed.stdout, completed.stderr, completed.returncode)
+
+    def execute_python(self, code: str, *, timeout_seconds: Optional[float] = None) -> SandboxExecutionResult:
+        """Execute a short analysis script in the same network-isolated boundary."""
+        if not self.available:
+            return SandboxExecutionResult("", "docker executable not found on PATH", 127)
+        if not self.daemon_available:
+            return SandboxExecutionResult("", "docker daemon is not reachable", 125)
+        with tempfile.TemporaryDirectory(prefix="research_harness_code_docker_") as directory:
+            sandbox_dir = Path(directory)
+            script = sandbox_dir / "analysis.py"
+            script.write_text(code, encoding="utf-8")
+            command = [
+                "docker", "run", "--rm", "--network", self.network,
+                "--cpus", os.environ.get("RESEARCH_HARNESS_DOCKER_CPUS", "2"),
+                "--memory", os.environ.get("RESEARCH_HARNESS_DOCKER_MEMORY", "2g"),
+                "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+                "-v", f"{sandbox_dir}:/workspace:ro", "-w", "/workspace", self.image,
+                "python", "-I", "analysis.py",
+            ]
+            try:
+                completed = subprocess.run(
+                    command, check=False, text=True, capture_output=True,
+                    timeout=timeout_seconds or min(self.timeout_seconds, 60.0),
+                )
+            except subprocess.TimeoutExpired as exc:
+                return SandboxExecutionResult(exc.stdout or "", exc.stderr or "analysis execution timed out", 124, timed_out=True)
+            except Exception as exc:
+                return SandboxExecutionResult("", "%s: %s" % (type(exc).__name__, exc), 1)
+        return SandboxExecutionResult(completed.stdout, completed.stderr, completed.returncode)

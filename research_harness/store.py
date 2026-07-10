@@ -89,7 +89,7 @@ class ArtifactStore:
         self.report_tex_path = self.root / "final_report.tex"
         self.report_pdf_path = self.root / "final_report.pdf"
         self.report_preview_path = self.root / "final_report_preview.png"
-        self.prd_path = self.root / "prd.json"
+        self.run_state_path = self.root / "run_state.json"
         self.prior_run_memory_path = self.root / "prior_run_memory.json"
         self.optimizer_seed_context_path = self.root / "optimizer_seed_context.json"
         self.optimizer_agent_steps_path = self.root / "optimization_agent_steps.json"
@@ -117,6 +117,7 @@ class ArtifactStore:
         self.run_notebook_path = self.root / "run_notebook.ipynb"
         self.harness_diagnosis_path = self.root / "harness_diagnosis.json"
         self.loop_continuation_path = self.root / "loop_continuation_decisions.json"
+        self.agent_transcript_path = self.root / "agent_messages.json"
         self.user_steering_inbox_path = self.root / "user_steering_inbox.jsonl"
         self.user_steering_state_path = self.root / "user_steering_state.json"
         self.progress_path = self.root / "progress.txt"
@@ -425,11 +426,11 @@ class ArtifactStore:
         self._record_artifact_write(self.report_preview_path, "report_preview")
         return self.report_preview_path
 
-    def write_prd(self, payload: dict[str, Any]) -> Path:
-        self._snapshot_before_write(self.prd_path, "before writing PRD")
-        self.prd_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        self._record_artifact_write(self.prd_path, "prd")
-        return self.prd_path
+    def write_run_state(self, payload: dict[str, Any]) -> Path:
+        self._snapshot_before_write(self.run_state_path, "before writing run state")
+        self.run_state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(self.run_state_path, "run_state")
+        return self.run_state_path
 
     def write_prior_run_memory(self, payload: dict[str, Any]) -> Path:
         self._snapshot_before_write(self.prior_run_memory_path, "before writing prior run memory")
@@ -442,6 +443,12 @@ class ArtifactStore:
         self.optimizer_seed_context_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self._record_artifact_write(self.optimizer_seed_context_path, "optimizer_seed_context")
         return self.optimizer_seed_context_path
+
+    def write_agent_transcript(self, payload: dict[str, Any]) -> Path:
+        self._snapshot_before_write(self.agent_transcript_path, "before writing agent message transcript")
+        self.agent_transcript_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+        self._record_artifact_write(self.agent_transcript_path, "agent_messages")
+        return self.agent_transcript_path
 
     def write_solution(self, text: str) -> Path:
         self._snapshot_before_write(self.solution_path, "before writing solution code")
@@ -777,7 +784,7 @@ def _format_progress_for_terminal(text: str) -> str:
         return f"{red_italic}{text}{reset}"
     if text.startswith("# "):
         return f"{bold}{text}{reset}"
-    if re.match(r"^(Starting run|Execution mode|Goal|PRD|Run:|Status|Artifacts):", text):
+    if re.match(r"^(Starting run|Execution mode|Goal|Run state|Run:|Status|Artifacts):", text):
         return f"{cyan_bold}{text}{reset}"
     if re.match(r"^(Task \d+: passed|<promise>COMPLETE</promise>)", text):
         return f"{green_bold}{text}{reset}"

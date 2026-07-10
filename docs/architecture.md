@@ -9,7 +9,7 @@ agent = model + harness
 
 The model is `LLMClient` or a compatible client. The harness is everything that
 makes the model act reliably: routing, loops, tools, evaluators, artifact store,
-budgets, traces, PRD state, stopping rules, and benchmark/eval reporting.
+budgets, traces, run state, stopping rules, and benchmark/eval reporting.
 
 ## Repository Map
 
@@ -17,7 +17,7 @@ budgets, traces, PRD state, stopping rules, and benchmark/eval reporting.
 | --- | --- |
 | `autore`, `autore-bench` | Thin shell entrypoints for the CLI and benchmark runner. |
 | `research_harness/cli.py` | Interactive and flag-driven CLI; creates `HarnessConfig` and starts the orchestrator. |
-| `research_harness/orchestrator.py` | Top-level run coordinator: planning, product-agent routing, PRD tasks, source strategy, sessions, finalization. |
+| `research_harness/orchestrator.py` | Top-level run coordinator: product-agent routing, evidence-driven action selection, source strategy, sessions, finalization. |
 | `research_harness/loops.py` | Runtime loop core: routing, research/query loops, optimization loops, prediction-market challenge logic, plateau/entropy policies, output rendering. |
 | `research_harness/loop_routing.py` | Evaluator registry and task/product-agent routing. |
 | `research_harness/loop_evaluators.py` | Evaluator result dataclass and normalization/JSON failure helpers. |
@@ -26,7 +26,7 @@ budgets, traces, PRD state, stopping rules, and benchmark/eval reporting.
 | `research_harness/agents.py` | Role-agent workers: literature, hypothesis, critic, synthesis, and harness debugger. |
 | `research_harness/search.py` | Retriever abstraction and backends for local corpus, academic APIs, web/docs/social/code, memory, and Alchemy. |
 | `research_harness/store.py` | File-backed artifact store plus SQLite world-model mirror and provenance edges. |
-| `research_harness/schemas.py` | Dataclasses for runs, PRD tasks, variants, evaluations, claims, traces, costs, and research plans. |
+| `research_harness/schemas.py` | Dataclasses for runs, actions, variants, evaluations, claims, traces, costs, and research plans. |
 | `research_harness/llm.py` | Live OpenAI/Anthropic/local fallback model client, token/cost accounting, JSON completion wrapper. |
 | `research_harness/run_benchmarks.py` | Per-run benchmark summaries, Mermaid/SVG/PNG/HTML/Notebook artifacts, optimizer and champion visualizations. |
 | `research_harness/benchmark.py` | Cross-run benchmark dashboard generation. |
@@ -65,7 +65,7 @@ flowchart TD
   orch --> plan["ResearchPlan"]
   orch --> strategy["SourceStrategy"]
   orch --> store["ArtifactStore"]
-  orch --> prd["prd.json"]
+  orch --> state["run_state.json"]
   orch --> router["TaskRouter"]
 
   router --> research["Research product agent"]
@@ -87,13 +87,13 @@ flowchart TD
   orch --> roles["Role agents"]
   roles --> store
 
-  store --> outputs["Report, PRD, traces, variants, scores, optimized code, benchmarks"]
+  store --> outputs["Report, run state, traces, variants, scores, optimized code, benchmarks"]
 ```
 
-The orchestrator owns run lifecycle. It creates the plan and store, writes the
-initial PRD, dispatches to the selected runtime mode, catches interrupts into a
+The orchestrator owns run lifecycle. It creates the state store, dispatches to
+the selected runtime mode, catches interrupts into a
 partial synthesis flow, records cost, generates run benchmarks, and updates the
-final PRD.
+final run-state record.
 
 ## Role Trajectory Model
 
@@ -103,13 +103,13 @@ boundary that keeps its trajectory directionally consistent.
 
 | Role | Single goal | Context it should read | Handoff boundary |
 | --- | --- | --- | --- |
-| Orchestrator | Plan and decompose the user's goal, steer execution through validation gates, and create follow-up work from surfaced gaps. | Run plan, PRD, validation contract, compact artifact summaries, and validator findings. It delegates deep investigation and implementation rather than accumulating every detail. | Assigns scoped work to workers and validators; does not make the final correctness judgment itself. |
+| Orchestrator | Maintain boundaries and surface current evidence. | Run state, evaluator feedback, compact artifact summaries, and validator findings. It does not prescribe a fixed trajectory. | Delegates or selects work only when current evidence justifies it. |
 | Worker | Complete one well-specified feature, candidate mechanism, or artifact with clear success criteria. | Feature contract, directly relevant source files/artifacts, operational guidelines, and focused research notes. | Stops when it believes the work is ready; independent validation decides correctness. |
 | Validator | Evaluate completed work for correctness and completeness. | Validation contract, completed artifacts, tests, traces, and expected behavior. | Reports gaps to the orchestrator; does not implement fixes. |
 | Optimization controller | Choose the next optimization direction and tool sequence needed to improve evaluator score. | Champion, recent failures, evaluator summary, variant comparison, targeted literature, and compact previous controller state. | Produces prompt context for candidate-generation workers and leaves correctness to evaluator/validator gates. |
 
 The full state lives in shared artifacts instead of any single agent's context:
-`prd.json`, `optimizer_seed_context.json`, `optimization_agent_steps.json`,
+`run_state.json`, `optimizer_seed_context.json`, `optimization_agent_steps.json`,
 `optimizer_agent_summary.md`, `role_trajectory_contract.md`, traces, variants,
 evaluations, literature claims, and validation reports. Agents read what is
 relevant to their current job and avoid context that is unrelated to their
@@ -122,13 +122,13 @@ The current code has three nested control concepts:
 | Loop | Implementation | Responsibility |
 | --- | --- | --- |
 | Session loop | `sessions.py`, `Orchestrator._start_session_store` | Context isolation and optional cross-run session memory. |
-| PRD/Ralph loop | `Orchestrator._run_loop` and loop-task helpers | Pick incomplete PRD tasks, execute them, update `prd.json`, append `progress.txt`, stop on task completion or budget. |
+| Probabilistic loop | `Orchestrator._run_loop` and loop-action helpers | Select the next action from current evidence and evaluator feedback, record it in `run_state.json`, and stop on sufficient evidence, safety boundary, or budget. |
 | Evolutionary loop | `EvolutionaryOuterLoop` in `loops.py` | Propose query/code variants, evaluate, rank, select parents, detect plateau, introduce entropy, and persist best artifacts. |
 
 ```mermaid
 flowchart TD
-  session["Session / output root"] --> prdloop["PRD loop"]
-  prdloop --> pick["Pick next LoopTask"]
+  session["Session / output root"] --> actionloop["Probabilistic loop"]
+  actionloop --> pick["Select next action from evidence"]
   pick --> evo["EvolutionaryOuterLoop"]
   evo --> propose["Propose variants"]
   propose --> evaluate["Evaluate in inner loop"]
@@ -137,8 +137,8 @@ flowchart TD
   entropy -->|yes| refresh["LLM-selected literature entropy / steering"]
   refresh --> propose
   entropy -->|no| artifacts["Persist outputs"]
-  artifacts --> prdloop
-  prdloop --> done["All PRD stories pass or budget ends"]
+  artifacts --> actionloop
+  actionloop --> done["Evidence sufficient, safety boundary, or budget ends"]
 ```
 
 ## Orchestrator
@@ -155,10 +155,10 @@ sessions, and steering.
    source strategy hints.
 3. Choose source backends from the plan and retriever config.
 4. Create `RunRecord`, session state, and `ArtifactStore`.
-5. Write initial `prd.json`.
+5. Initialize `run_state.json`.
 6. Run deterministic, standard/fanout, or evolutionary/loop mode.
 7. On interrupt, synthesize partial artifacts instead of losing the run.
-8. Finalize status, cost, PRD, benchmark visuals, and run metadata.
+8. Finalize status, cost, run state, benchmark visuals, and run metadata.
 
 The challenge preset adjusts defaults: at least 20 iterations unless the user
 explicitly capped them, optimizer population at least 48, query research fan-out
@@ -183,7 +183,7 @@ The remaining `loops.py` concerns are:
 | Concern | Current symbols |
 | --- | --- |
 | Inner loops | `ResearchLoop`, `OptimizationQueryLoop`, `OptimizeLoop`, `InnerLoopResult`. |
-| Outer loop | `EvolutionaryOuterLoop`, parent selection, continuation decisions, PRD-facing output. |
+| Outer loop | `EvolutionaryOuterLoop`, parent selection, continuation decisions, evidence-facing output. |
 | Plateau/entropy | `PlateauDetector`, `DirectionSpec`, forced directions, LLM entropy-axis selection, recovery metadata. |
 | Optimization artifacts | best candidate selection, `optimized_candidate.txt`, `optimal_code.py`, `optimization_result.json`. |
 | Prediction-market challenge | upstream path discovery, sandbox/local/official scoring, candidate rendering, solution mirroring. |
@@ -259,7 +259,7 @@ Important artifacts:
 
 | Artifact | Meaning |
 | --- | --- |
-| `prd.json` | Product agent, task mode, agent-harness definition, tasks, status, acceptance criteria, artifact paths. |
+| `run_state.json` | Product agent, task mode, agent-harness boundaries, observed actions, evidence, stopping rationale, artifact paths. |
 | `progress.txt` | Human-readable step log. |
 | `trace.jsonl`, `agent_traces.json` | Timing, prompts, model labels, tool calls, errors, and failure localization. |
 | `sources.json`, `claims.json`, `hypotheses.json` | Research world model for a run. |
@@ -273,10 +273,10 @@ Important artifacts:
 | `cost.json`, `cost_events.json` | Token/cost accounting. |
 | `harness_diagnosis.json`, `harness_changes.json` | Failure taxonomy and proposed harness improvements. |
 
-## PRD Contract
+## Probabilistic Loop Contract
 
-Every product-agent run writes `prd.json`. The run tasks are normalized into
-user-story-shaped records:
+Every product-agent run writes `run_state.json`. It records actions after they
+occur rather than creating a user-story-shaped plan:
 
 ```json
 {
@@ -287,9 +287,9 @@ user-story-shaped records:
 }
 ```
 
-The PRD also records selected `product_agent`, selected runtime `task_mode`,
-agent-harness definition, artifact paths, source strategy, stopping rules, and
-progress. The PRD is updated after task execution and again during finalization.
+The run state also records selected `product_agent`, selected runtime `task_mode`,
+agent-harness boundaries, artifact paths, source strategy, stopping rules, and
+progress. It is updated after each action and again during finalization.
 
 ## Optimization And Challenge Outputs
 
@@ -332,7 +332,7 @@ flowchart TD
 ```
 
 The suites cover core flows, edge cases, and preflight gates. Graders check
-outcomes, PRD completion, trajectory shape, loop behavior, optimizer artifacts,
+outcomes, observed-action integrity, trajectory shape, loop behavior, optimizer artifacts,
 prediction-market containment/status, research groundedness, source diversity,
 and LLM-style quality judgments.
 

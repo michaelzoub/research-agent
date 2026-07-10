@@ -7,8 +7,8 @@ artifacts, not as a single opaque model call.
 ## Core Pattern
 
 1. Route the goal to a product agent: `research`, `optimize`, or `challenge`.
-2. Write `prd.json` before execution so the run has explicit tasks, acceptance
-   criteria, and artifact contracts.
+2. Initialize `run_state.json` before execution so the run can record evidence,
+   actions actually taken, budgets, and stopping rationale.
 3. Run loop rounds until a score threshold, plateau, budget, or external stop
    condition fires.
 4. Evaluate candidate trials in parallel whenever they are independent.

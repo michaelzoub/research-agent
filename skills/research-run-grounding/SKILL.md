@@ -32,7 +32,7 @@ Research runs should preserve:
 - `hypotheses.json`: hypothesis, supporting/contradicting claims, next experiment
 - `contradictions.json` and `open_questions.json`
 - `final_report.md`
-- `prd.json`
+- `run_state.json`
 - trajectory files such as `progress.txt`, `trace.jsonl`, and `agent_traces.json`
 
 ## Quality Rules

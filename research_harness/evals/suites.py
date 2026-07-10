@@ -28,8 +28,8 @@ def default_eval_suite() -> EvalSuite:
                 ],
                 grader_ids=[
                     "outcome_completed",
-                    "prd_tasks_executed",
-                    "prd_tasks_executed_deterministic",
+                    "run_actions_executed",
+                    "run_actions_executed_deterministic",
                     "research_groundedness",
                     "research_task_specific_acceptance",
                     "literature_section_evidence",
@@ -61,7 +61,7 @@ def default_eval_suite() -> EvalSuite:
                 grader_ids=[
                     "outcome_completed",
                     "mode_selected",
-                    "prd_tasks_executed",
+                    "run_actions_executed",
                     "optimize_score",
                     "optimization_code_artifact",
                     "transcript_progress",
@@ -83,7 +83,7 @@ def default_eval_suite() -> EvalSuite:
                 grader_ids=[
                     "outcome_completed",
                     "mode_selected",
-                    "prd_tasks_executed",
+                    "run_actions_executed",
                     "seed_context",
                     "optimize_query_phases",
                     "optimization_code_artifact",
@@ -110,7 +110,7 @@ def default_eval_suite() -> EvalSuite:
                 grader_ids=[
                     "outcome_completed",
                     "mode_selected",
-                    "prd_tasks_executed",
+                    "run_actions_executed",
                     "seed_context",
                     "optimization_code_artifact",
                     "prediction_market_solution",
@@ -138,7 +138,7 @@ def default_eval_suite() -> EvalSuite:
                 ],
                 grader_ids=[
                     "outcome_completed",
-                    "prd_tasks_executed",
+                    "run_actions_executed",
                     "artifact_report",
                     "report_no_fabricated_sources",
                     "prompt_output_relevance",

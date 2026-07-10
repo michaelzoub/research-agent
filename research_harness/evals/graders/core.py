@@ -16,22 +16,22 @@ def _grade_outcome_completed(task: EvalTask, store: ArtifactStore) -> GraderResu
     return _result("outcome_completed", "code", "outcome verification", 1.0 if passed else 0.0, passed, 1.0, f"Run status is {status}.", [{"status": status, "expected": "completed", "passed": passed}])
 
 
-def _grade_prd_tasks_executed(task: EvalTask, store: ArtifactStore) -> GraderResult:
-    prd = json.loads(store.prd_path.read_text(encoding="utf-8")) if store.prd_path.exists() else {}
-    organized_tasks = prd.get("organized_tasks", []) if isinstance(prd, dict) else []
+def _grade_run_actions_executed(task: EvalTask, store: ArtifactStore) -> GraderResult:
+    run_state = json.loads(store.run_state_path.read_text(encoding="utf-8")) if store.run_state_path.exists() else {}
+    observed_actions = run_state.get("observed_actions", []) if isinstance(run_state, dict) else []
     loop_tasks = {row.get("id"): row for row in store.list("loop_tasks")}
     iterations_by_task = {}
     for iteration in store.list("loop_iterations"):
         iterations_by_task.setdefault(iteration.get("task_id"), []).append(iteration)
     task_checks = []
-    for item in organized_tasks:
+    for item in observed_actions:
         source_task_id = item.get("source_task_id")
         loop_task = loop_tasks.get(source_task_id)
         iterations = iterations_by_task.get(source_task_id, [])
         status_matches = bool(loop_task) and item.get("status") == loop_task.get("status")
         task_checks.append(
             {
-                "prd_task_id": item.get("id"),
+                "action_id": item.get("id"),
                 "source_task_id": source_task_id,
                 "has_loop_task": bool(loop_task),
                 "has_iteration": bool(iterations),
@@ -40,36 +40,36 @@ def _grade_prd_tasks_executed(task: EvalTask, store: ArtifactStore) -> GraderRes
             }
         )
     checks = [
-        ("prd_exists", store.prd_path.exists()),
-        ("prd_has_tasks", bool(organized_tasks)),
-        ("all_prd_tasks_have_loop_tasks", all(check["has_loop_task"] for check in task_checks)),
-        ("all_prd_tasks_have_iterations", all(check["has_iteration"] for check in task_checks)),
-        ("all_prd_task_statuses_match", all(check["status_matches"] for check in task_checks)),
+        ("run_state_exists", store.run_state_path.exists()),
+        ("run_state_has_actions", bool(observed_actions)),
+        ("all_actions_have_loop_tasks", all(check["has_loop_task"] for check in task_checks)),
+        ("all_actions_have_iterations", all(check["has_iteration"] for check in task_checks)),
+        ("all_action_statuses_match", all(check["status_matches"] for check in task_checks)),
     ]
     score = sum(1 for _, passed in checks if passed) / len(checks)
     passed = score == 1.0
     return _result(
-        "prd_tasks_executed",
+        "run_actions_executed",
         "code",
-        "prd execution verification",
+        "run action execution verification",
         score,
         passed,
         1.0,
-        f"Verified {sum(1 for check in task_checks if check['passed'])}/{len(task_checks)} PRD task(s) against loop tasks and iterations.",
+        f"Verified {sum(1 for check in task_checks if check['passed'])}/{len(task_checks)} observed action(s) against loop tasks and iterations.",
         [{"check": name, "passed": passed} for name, passed in checks] + task_checks,
     )
 
 
-def _grade_prd_tasks_executed_deterministic(task: EvalTask, store: ArtifactStore) -> GraderResult:
-    prd = json.loads(store.prd_path.read_text(encoding="utf-8")) if store.prd_path.exists() else {}
-    organized_tasks = prd.get("organized_tasks", []) if isinstance(prd, dict) else []
+def _grade_run_actions_executed_deterministic(task: EvalTask, store: ArtifactStore) -> GraderResult:
+    run_state = json.loads(store.run_state_path.read_text(encoding="utf-8")) if store.run_state_path.exists() else {}
+    observed_actions = run_state.get("observed_actions", []) if isinstance(run_state, dict) else []
     loop_tasks = {row.get("id"): row for row in store.list("loop_tasks")}
     iterations_by_task: dict[str, list[dict[str, Any]]] = {}
     for iteration in store.list("loop_iterations"):
         iterations_by_task.setdefault(str(iteration.get("task_id")), []).append(iteration)
 
     task_assertions: list[dict[str, Any]] = []
-    for item in organized_tasks:
+    for item in observed_actions:
         source_task_id = str(item.get("source_task_id") or "")
         loop_task = loop_tasks.get(source_task_id)
         iterations = iterations_by_task.get(source_task_id, [])
@@ -80,11 +80,11 @@ def _grade_prd_tasks_executed_deterministic(task: EvalTask, store: ArtifactStore
         passed = bool(loop_task) and terminal_status and attempted and iteration_terminal and evidence
         task_assertions.append(
             {
-                "prd_task_id": item.get("id"),
+                "action_id": item.get("id"),
                 "source_task_id": source_task_id,
                 "title": item.get("title"),
                 "has_loop_task": bool(loop_task),
-                "terminal_prd_status": terminal_status,
+                "terminal_action_status": terminal_status,
                 "attempted": attempted,
                 "has_terminal_iteration": iteration_terminal,
                 "has_result_or_error_evidence": evidence,
@@ -93,21 +93,21 @@ def _grade_prd_tasks_executed_deterministic(task: EvalTask, store: ArtifactStore
         )
 
     global_checks = [
-        ("prd_exists", store.prd_path.exists()),
-        ("prd_has_tasks", bool(organized_tasks)),
-        ("no_pending_prd_tasks", bool(organized_tasks) and all(str(item.get("status")) in {"passed", "failed", "skipped"} for item in organized_tasks)),
+        ("run_state_exists", store.run_state_path.exists()),
+        ("run_state_has_actions", bool(observed_actions)),
+        ("no_pending_actions", bool(observed_actions) and all(str(item.get("status")) in {"passed", "failed", "skipped"} for item in observed_actions)),
         ("every_task_attempted_with_evidence", bool(task_assertions) and all(item["passed"] for item in task_assertions)),
     ]
     score = sum(1 for _, passed in global_checks if passed) / len(global_checks)
     passed = score == 1.0
     return _result(
-        "prd_tasks_executed_deterministic",
+        "run_actions_executed_deterministic",
         "code",
-        "deterministic PRD execution verification",
+        "deterministic action execution verification",
         score,
         passed,
         1.0,
-        f"Deterministically verified {sum(1 for item in task_assertions if item['passed'])}/{len(task_assertions)} PRD task(s) reached terminal execution with evidence.",
+        f"Deterministically verified {sum(1 for item in task_assertions if item['passed'])}/{len(task_assertions)} action(s) reached terminal execution with evidence.",
         [{"check": name, "passed": passed} for name, passed in global_checks] + task_assertions,
     )
 

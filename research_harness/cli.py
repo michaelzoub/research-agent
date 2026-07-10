@@ -70,9 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=["standard", "deterministic"],
+        choices=["agent", "standard", "deterministic"],
         default=os.environ.get("RESEARCH_HARNESS_MODE"),
-        help="Optional legacy mode. Omit for the default nested evolutionary agent loop. Use standard for old fan-out/fan-in.",
+        help="Execution architecture. Omit for the model-directed tool-using agent. Use standard or deterministic for legacy workflows.",
     )
     parser.add_argument(
         "--corpus",
@@ -342,7 +342,7 @@ def _print_run_summary(run, store, *, output_func: Callable[[str], None] = print
 
     primary_artifacts = [
         ("report", store.report_path),
-        ("prd", store.prd_path),
+        ("run state", store.run_state_path),
         ("benchmark", store.run_benchmark_path),
         ("notebook", store.run_notebook_path),
     ]
@@ -661,7 +661,7 @@ def main() -> None:
     if args.preflight:
         run_preflight_evals(args)
     config = HarnessConfig(
-        mode=args.mode or "evolutionary",
+        mode=args.mode or "agent",
         retriever=args.retriever,
         max_loop_iterations=args.max_iterations,
         max_loop_iterations_explicit=getattr(args, "max_iterations_explicit", False),

@@ -209,8 +209,8 @@
 <text x="1025.0" y="1759.0" text-anchor="middle" style="font-family:'Inter','Helvetica Neue',sans-serif;font-size:10px;" fill="#558b2f">write optimization_result.json · optimal_code.py</text>
 <line x1="470.0" y1="1825.8" x2="1390.0" y2="1825.8" stroke="#006064" stroke-width="1.5" />
 <polygon points="1390.0,1825.8 1381.0,1821.3 1381.0,1830.3" fill="#006064"/>
-<rect x="803.2" y="1807.8" width="253.6" height="15.0" rx="5" ry="5" fill="#fafbfc" stroke="none" stroke-width="0" opacity="1.0"/>
-<text x="930.0" y="1819.8" text-anchor="middle" style="font-family:'Inter','Helvetica Neue',sans-serif;font-size:10px;" fill="#006064">write_prd() · cost.json · cost_events.json</text>
+<rect x="785.8" y="1807.8" width="288.4" height="15.0" rx="5" ry="5" fill="#fafbfc" stroke="none" stroke-width="0" opacity="1.0"/>
+<text x="930.0" y="1819.8" text-anchor="middle" style="font-family:'Inter','Helvetica Neue',sans-serif;font-size:10px;" fill="#006064">write_run_state() · cost.json · cost_events.json</text>
 <line x1="470.0" y1="1865.8" x2="1390.0" y2="1865.8" stroke="#006064" stroke-width="1.5" />
 <polygon points="1390.0,1865.8 1381.0,1861.3 1381.0,1870.3" fill="#006064"/>
 <rect x="765.5" y="1847.8" width="329.0" height="15.0" rx="5" ry="5" fill="#fafbfc" stroke="none" stroke-width="0" opacity="1.0"/>

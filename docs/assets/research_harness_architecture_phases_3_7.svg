@@ -81,12 +81,12 @@
   <text class="small" x="342" y="380">build HarnessConfig, load dotenv, route mode</text>
 
   <rect class="note" x="445" y="432" width="260" height="92" rx="8"/>
-  <text class="callout-title" x="467" y="464">RunRecord + PRD</text>
+  <text class="callout-title" x="467" y="464">RunRecord + State</text>
   <text class="callout" x="467" y="489">prompt_versions</text>
   <text class="callout" x="467" y="511">harness_config_snapshot</text>
   <text class="phase" x="646" y="464" text-anchor="end">P4</text>
   <path class="arrow-soft" d="M 575 525 L 1335 525"/>
-  <text class="small" x="730" y="507">persist initial run, prd.json, progress.txt</text>
+  <text class="small" x="730" y="507">persist run state, progress.txt</text>
 
   <path class="arrow-soft" d="M 575 590 L 1608 590"/>
   <text class="small" x="735" y="572">retrieve prior artifacts / memory retriever context</text>

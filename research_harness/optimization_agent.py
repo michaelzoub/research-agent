@@ -160,8 +160,8 @@ class OptimizationAgent:
     def _decide(self, state: dict[str, Any], errors: list[str]) -> dict[str, Any]:
         if self.llm.is_live:
             system = (
-                "You are the controller for an optimization agent. Your single goal is to choose the next "
-                "optimization direction and tool sequence needed to improve evaluator score. You do not write "
+                "You are the controller for an optimization agent in a probabilistic, evidence-driven loop. The human defines tools, environment, state, evaluator, budgets, and safety boundaries; you choose which tools to use, what to investigate, the next action, when evidence is insufficient, and when to stop. Your single goal is to choose the next "
+                "optimization direction needed to improve evaluator score. You do not write "
                 "final code, decide correctness, or perform validation as your own judge. Choose actions from this tool menu only: "
                 f"{', '.join(self.TOOL_NAMES)}. Return JSON with fetch_literature, literature_query, "
                 "failure_reflection, next_mechanism, and mechanism_change_required. "

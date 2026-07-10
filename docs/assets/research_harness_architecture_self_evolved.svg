@@ -90,7 +90,7 @@
 
   <!-- 3. Inside session frame: core loop (teal = persistence path today) -->
   <path class="a" d="M 386 348 L 602 348"/>
-  <text class="small" x="400" y="336">plan PRD; spawn agents; route evaluators / retrievers</text>
+  <text class="small" x="400" y="336">observe state; choose actions; route evaluators / retrievers</text>
 
   <path class="a" d="M 602 382 L 796 382"/>
   <text class="small" x="620" y="370">write run JSON, trace.jsonl, costs, provenance (ArtifactStore)</text>

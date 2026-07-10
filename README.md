@@ -145,7 +145,7 @@ The most useful files are:
 | --- | --- |
 | `final_report.md` | Main human-readable report. |
 | `optimal_code.py` | Best selected code, when the run used an optimizer. |
-| `prd.json` | Task plan, status, and acceptance criteria. |
+| `run_state.json` | Auditable record of actions, evidence, and stopping state. |
 | `cost.json` | Model usage and estimated cost. |
 | `failed_paths.json` | Failed attempts, causes, and retryability. |
 | `progress.txt` | Step-by-step log of what happened. |
@@ -220,7 +220,7 @@ Each run creates `outputs/<NNN>_run_<slug>/`.
 | --- | --- |
 | `final_report.md` | Final synthesis report. Start here for research runs. |
 | `optimal_code.py` | Universal best-code artifact for optimizer runs, when applicable. |
-| `prd.json` | Organized task map with status, dependencies, and acceptance criteria. |
+| `run_state.json` | Auditable record of actions actually taken, evidence, and stopping state. |
 | `cost.json` | Per-run model usage totals and estimated cost. |
 | `failed_paths.json` | Failed paths, causes, severity, and retryability. |
 | `progress.txt` | Human-readable progress log. |

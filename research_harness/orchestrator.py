@@ -18,6 +18,7 @@ from .agents import (
     SynthesisAgent,
 )
 from .llm import LLMClient
+from .research_agent import AgentRunConfig, ResearchAgent
 from .loops import EvaluatorRegistry, EvolutionaryOuterLoop, TaskRouter, _loop_objective_from_goal
 from .run_benchmarks import write_run_benchmarks
 from .schemas import AgentBudget, AgentTrace, CostEvent, LoopIteration, LoopTask, LoopTaskAction, ResearchPlan, RunRecord, SourceStrategyItem, TaskType, new_id, now_iso, to_dict
@@ -156,10 +157,12 @@ class Orchestrator:
             f"Prior output memory: checked {prior_run_memory.get('checked_run_count', 0)} run(s); "
             f"{len(prior_run_memory.get('avoid_directions', []))} prior direction(s) to avoid."
         )
-        self._write_prd(store, run, plan, source_strategy, selected_mode, stage="planned")
-        store.append_progress(f"PRD: {store.prd_path}")
+        self._write_run_state(store, run, plan, source_strategy, selected_mode, stage="started")
+        store.append_progress(f"Run state: {store.run_state_path}")
         try:
-            if selected_mode == "deterministic":
+            if selected_mode == "agent":
+                await self._run_agent(run, store)
+            elif selected_mode == "deterministic":
                 await self._run_phase1(run, store, plan, source_strategy)
             elif selected_mode in {"standard", "fanout"}:
                 await self._run_phase2(run, store, plan, source_strategy)
@@ -180,7 +183,7 @@ class Orchestrator:
             # Use real accumulated token counts from the LLM client.
             run.total_tokens = self.llm.total_prompt_tokens + self.llm.total_completion_tokens
             run.total_cost = round(self.llm.total_cost(), 6)
-            self._write_prd(store, run, plan, source_strategy, selected_mode, stage="completed")
+            self._write_run_state(store, run, plan, source_strategy, selected_mode, stage="completed")
             # Write a per-run cost breakdown so it's easy to audit spend.
             cost_payload = self.llm.cost_breakdown()
             cost_payload["run_id"] = run.id
@@ -192,7 +195,7 @@ class Orchestrator:
                     run_id=run.id,
                     agent_name="orchestration:finalize_run_outputs",
                     role="orchestration",
-                    prompt="Write final PRD and cost artifacts before benchmark generation.",
+                    prompt="Write final run-state and cost artifacts before benchmark generation.",
                     model="deterministic-orchestrator",
                     tools_used=[],
                     tool_calls=[],
@@ -200,14 +203,14 @@ class Orchestrator:
                     runtime_ms=max(0, int((time.perf_counter() - final_started) * 1000)),
                     status="completed",
                     errors=[],
-                    output_summary="Final PRD and cost artifacts written.",
+                    output_summary="Final run-state and cost artifacts written.",
                     started_at=final_started_at,
                     failure_component="orchestration",
                 )
             )
             run.completed_at = now_iso()
             store.update_run(run)
-            self._write_prd(store, run, plan, source_strategy, selected_mode, stage="completed")
+            self._write_run_state(store, run, plan, source_strategy, selected_mode, stage="completed")
             cost_payload["completed_at"] = run.completed_at
             #todoz; check cosr func
             store.write_cost(cost_payload)
@@ -247,7 +250,7 @@ class Orchestrator:
                 store.write_report(
                     report.rstrip()
                     + "\n\n## Run Interrupted\n"
-                    + "- This report was synthesized after an interrupt signal. Treat conclusions as partial and inspect `progress.txt`, `prd.json`, and optimization artifacts for the exact stopping point.\n"
+                    + "- This report was synthesized after an interrupt signal. Treat conclusions as partial and inspect `progress.txt`, `run_state.json`, and optimization artifacts for the exact stopping point.\n"
                 )
         store.append_progress("Interrupt synthesis complete: partial final_report.md and run artifacts were written.")
 
@@ -261,7 +264,7 @@ class Orchestrator:
                 task.result_summary = task.last_error
                 task.completed_at = now_iso()
                 store.update_loop_task(task)
-        self._update_prd_tasks(store)
+        self._update_run_state_actions(store)
 
     def _synthesis_task_for_interrupt(self, store: ArtifactStore) -> LoopTask:
         tasks = [LoopTask(**row) for row in store.list("loop_tasks")]
@@ -325,7 +328,7 @@ class Orchestrator:
     def load_prior_run_memory(self, goal: str, limit: int = 6) -> dict[str, Any]:
         return _load_prior_run_memory(self.output_root, goal, limit=limit)
 
-    def _write_prd(
+    def _write_run_state(
         self,
         store: ArtifactStore,
         run: RunRecord,
@@ -336,11 +339,11 @@ class Orchestrator:
     ) -> None:
         loop_tasks = store.list("loop_tasks")
         if loop_tasks:
-            tasks = [_prd_task_from_loop_task(task, index) for index, task in enumerate(loop_tasks, start=1)]
+            tasks = [_run_action_from_loop_task(task, index) for index, task in enumerate(loop_tasks, start=1)]
         else:
             tasks = []
         payload = {
-            "schema_version": "research_harness_prd_v1",
+            "schema_version": "research_harness_run_state_v1",
             "stage": stage,
             "run": to_dict(run),
             "execution_mode": selected_mode,
@@ -348,21 +351,24 @@ class Orchestrator:
             "product_agent": run.product_agent,
             "goal": run.user_goal,
             "agent_harness": {
-                "definition": "A product agent is model + harness: model client, loop policy, tools/evaluators, artifact store, budgets, and traces.",
+                "definition": "A product agent is a model operating inside a human-designed harness.",
+                "human_controls": ["tools", "environment", "state", "evaluator", "budgets", "safety boundaries"],
+                "model_controls": ["which tools to use", "what to investigate", "what to do next", "when evidence is insufficient", "when to stop"],
+                "search_learning_controls": "Use repeated evaluation results, retrieved evidence, and failure traces to learn which search strategies improve outcomes.",
                 "runtime_mode": run.task_mode,
                 "parallelism_policy": "The orchestrator may fan out role agents or variant evaluations with asyncio.gather when task dependencies allow it.",
             },
-            "ralph_loop": {
-                "definition": "PRD-driven long-running loop: persist tasks in prd.json, append progress.txt, run fresh loop iterations, and stop only when PRD items pass or the iteration budget is reached.",
-                "state_files": ["prd.json", "progress.txt", "trace.jsonl"],
-                "completion_rule": "All organized_tasks must have passes=true. Explicit objective targets, such as profit_usd, keep optimizer tasks incomplete until reached.",
+            "probabilistic_loop": {
+                "definition": "Evidence-driven loop: choose each action from the current goal, observations, evaluator feedback, failures, and remaining budget. It does not execute a predefined task sequence.",
+                "state_files": ["run_state.json", "progress.txt", "trace.jsonl"],
+                "completion_rule": "Stop when evidence supports the requested conclusion or objective, evidence is insufficient and further work is not justified, a safety boundary applies, or the budget is exhausted.",
                 "max_iterations": self.config.max_loop_iterations,
             },
             "research_architecture": _research_architecture_payload(self.config, run.task_mode),
             "objective": _objective_payload(run.user_goal, self.config.evaluator_name, store),
             "plan": to_dict(plan),
             "source_strategy": [to_dict(item) for item in source_strategy],
-            "organized_tasks": tasks,
+            "observed_actions": tasks,
             "artifacts": {
                 "final_report": str(store.report_path),
                 "final_report_tex": str(store.report_tex_path),
@@ -393,11 +399,11 @@ class Orchestrator:
                 "failure_taxonomy_path": str(store.harness_diagnosis_path),
             },
             "notes": [
-                "This file is the run-local PRD/task map.",
-                "organized_tasks is populated from runtime loop_tasks after the deterministic loop creates work.",
+                "This file is an auditable record of decisions and actions actually taken.",
+                "observed_actions is populated from runtime loop actions; it is not a plan for future work.",
             ],
         }
-        store.write_prd(payload)
+        store.write_run_state(payload)
 
     def classify_task(self, goal: str) -> TaskType:
         normalized = goal.lower()
@@ -816,18 +822,18 @@ class Orchestrator:
             )
         )
         store.append_progress(f"Task {iteration}: {task.status} - {result.summary}")
-        self._update_prd_tasks(store)
+        self._update_run_state_actions(store)
 
-    def _update_prd_tasks(self, store: ArtifactStore) -> None:
-        """Refresh organized_tasks in prd.json after each story completes."""
+    def _update_run_state_actions(self, store: ArtifactStore) -> None:
+        """Refresh the action history after each runtime action completes."""
         loop_tasks = store.list("loop_tasks")
-        if not loop_tasks or not store.prd_path.exists():
+        if not loop_tasks or not store.run_state_path.exists():
             return
-        tasks = [_prd_task_from_loop_task(task, index) for index, task in enumerate(loop_tasks, start=1)]
+        tasks = [_run_action_from_loop_task(task, index) for index, task in enumerate(loop_tasks, start=1)]
         try:
-            existing = json.loads(store.prd_path.read_text(encoding="utf-8"))
-            existing["organized_tasks"] = tasks
-            store.write_prd(existing)
+            existing = json.loads(store.run_state_path.read_text(encoding="utf-8"))
+            existing["observed_actions"] = tasks
+            store.write_run_state(existing)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -881,7 +887,7 @@ class Orchestrator:
             )
         )
         store.append_progress(f"Task {iteration}: skipped - {summary}")
-        self._update_prd_tasks(store)
+        self._update_run_state_actions(store)
 
     def create_loop_tasks(self, plan: ResearchPlan, source_strategy: list[SourceStrategyItem]) -> list[LoopTask]:
         tasks: list[LoopTask] = []
@@ -1025,6 +1031,24 @@ class Orchestrator:
             write_policy=write_policy,  # type: ignore[arg-type]
             reporting_schema=self.config.default_budget.reporting_schema,
         )
+
+    async def _run_agent(self, run: RunRecord, store: ArtifactStore) -> None:
+        """Run the model-directed loop; tool selection stays with the model."""
+        retrievers = [self.config.retriever] if self.config.retriever != "auto" else [
+            "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "memory"
+        ]
+        agent = ResearchAgent.with_research_tools(
+            self.llm,
+            [self._retriever_for(name) for name in retrievers],
+            AgentRunConfig(
+                max_iterations=self.config.max_loop_iterations,
+                max_runtime_seconds=self.config.default_budget.max_runtime_seconds,
+            ),
+        )
+        result = agent.run(run.user_goal, workspace=Path.cwd(), store=store, run_id=run.id)
+        store.append_progress("Tool-using agent termination: %s" % result.termination_reason)
+        if result.termination_reason != "final":
+            raise RuntimeError("Tool-using agent did not complete: %s" % result.termination_reason)
 
     #todo: parallelize this
     def _retriever_for(self, retriever: str) -> SearchBackend:
@@ -1741,7 +1765,7 @@ def _interrupted_report(run: RunRecord, store: ArtifactStore, reason: str) -> st
             "",
             "## Important Artifacts",
             f"- Progress log: `{store.progress_path.name}`",
-            f"- PRD/status: `{store.prd_path.name}`",
+            f"- Run state: `{store.run_state_path.name}`",
             f"- Cost: `{store.cost_path.name}`",
             f"- Failed paths: `{store.failed_paths_path.name}`",
             f"- Harness changes: `{store.harness_changes_path.name}`",
@@ -1775,11 +1799,10 @@ def _first_json_row(path: Path) -> dict[str, object]:
     return rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
 
 
-def _prd_task_from_loop_task(task: dict[str, object], index: int) -> dict[str, object]:
+def _run_action_from_loop_task(task: dict[str, object], index: int) -> dict[str, object]:
     priority = int(task.get("priority", index) or index)
-    dependencies = [] if priority <= 1 else [f"US-{priority - 1:03d}"]
     return {
-        "id": f"US-{priority:03d}",
+        "id": f"action-{priority:03d}",
         "source_task_id": task.get("id"),
         "title": task.get("title"),
         "kind": task.get("action"),
@@ -1787,7 +1810,7 @@ def _prd_task_from_loop_task(task: dict[str, object], index: int) -> dict[str, o
         "status": task.get("status"),
         "passes": bool(task.get("passes")),
         "attempts": int(task.get("attempts", 0) or 0),
-        "dependencies": dependencies,
+        "decision_basis": "runtime action record; not a predefined sequence",
         "params": task.get("params", {}),
         "acceptanceCriteria": task.get("acceptance_criteria", []),
         "result_summary": task.get("result_summary"),

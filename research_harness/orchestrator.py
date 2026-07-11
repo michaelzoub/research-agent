@@ -15,9 +15,7 @@ from .schemas import AgentBudget, CostEvent, RunRecord, now_iso, to_dict
 from .search import AlchemySearch, ArxivSearch, DocsBlogsSearch, GitHubSearch, LocalCorpusSearch, OpenAlexSearch, PriorArtifactMemorySearch, SearchBackend, SemanticScholarSearch, SocialWebSearch, WebSearch, WikipediaSearch
 from .sessions import SessionStore, default_session_projects_dir
 from .store import ArtifactStore
-
-
-RUN_SLUG_STOPWORDS = {"a", "an", "and", "are", "be", "for", "how", "in", "of", "on", "please", "research", "the", "to", "what", "which", "will"}
+from .run_visuals import write_research_run_visuals
 
 
 @dataclass
@@ -25,7 +23,7 @@ class HarnessConfig:
     """Safety, budgets, and available capabilities—not a trajectory selector."""
     id: str = "model-directed-agent-v1"
     retriever: str = "auto"
-    max_iterations: int = 12
+    max_iterations: int = 20
     evaluator_name: Optional[str] = None
     llm_provider: str = "auto"
     llm_model: str = "gpt-5.2"
@@ -59,18 +57,18 @@ class Orchestrator:
         session_store = self._start_session_store(goal, run)
         store = ArtifactStore(self.output_root / run.id, echo_progress=self.config.echo_progress, session_store=session_store)
         store.add_run(run)
-        store.write_prior_run_memory(prior_memory)
         store.append_progress(f"Starting model-directed run {run.id}")
         store.append_progress(f"Goal: {goal}")
         self._write_run_state(store, run, prior_memory, stage="started")
         agent = ResearchAgent.with_research_tools(
             self.llm,
-            [self._retriever_for(name) for name in self._registered_retrievers()],
+            [self._retriever_for(name) for name in self._enabled_retrievers()],
             AgentRunConfig(max_iterations=self.config.max_iterations, max_tool_calls=self.config.default_budget.max_tool_calls, max_runtime_seconds=self.config.default_budget.max_runtime_seconds, max_cost_usd=self.config.max_cost_usd),
         )
         try:
             result = await agent.arun(goal, workspace=Path.cwd(), readable_roots=list(self.config.workspace_roots or (Path.cwd(),)), store=store, run_id=run.id)
             run.status = result.status if result.status in {"completed", "needs_input", "partial", "budget_exhausted", "cancelled", "safety_stopped", "failed"} else "failed"
+            write_research_run_visuals(store, result.events)
             store.append_progress(f"Agent termination: {result.termination_reason}")
         except Exception as exc:
             run.status = "failed"
@@ -105,10 +103,19 @@ class Orchestrator:
                 break
         return {"checked_run_count": len(matches), "relevant_trajectories": matches}
 
-    def _registered_retrievers(self) -> list[str]:
+    def _enabled_retrievers(self) -> list[str]:
+        """Return source capabilities enabled by configuration, never a search plan.
+
+        The model receives these as tools and selects whether to call one, which
+        one to call, and what query to make.  This boundary exists only so the
+        harness can enforce permissions and expose an auditable capability set.
+        """
         if self.config.retriever != "auto":
             return [self.config.retriever]
-        return ["local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "memory"]
+        # The local corpus is intentionally fixture-only.  Mixing example.org
+        # records into a live research run makes a failed discovery pass look
+        # grounded and trains the agent to report fabricated-looking evidence.
+        return ["arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "memory"]
 
     def _retriever_for(self, retriever: str) -> SearchBackend:
         registry: dict[str, Any] = {"local": lambda: LocalCorpusSearch(self.corpus_path), "arxiv": lambda: ArxivSearch(llm=self.llm), "openalex": OpenAlexSearch, "semantic_scholar": SemanticScholarSearch, "github": GitHubSearch, "web": WebSearch, "docs_blogs": DocsBlogsSearch, "twitter": SocialWebSearch, "memory": lambda: PriorArtifactMemorySearch(self.output_root), "wikipedia": WikipediaSearch, "alchemy": AlchemySearch}
@@ -126,11 +133,17 @@ class Orchestrator:
                 transcript = {}
         store.write_run_state({
             "schema_version": "model_directed_run_state_v1", "stage": stage, "run": to_dict(run), "goal": run.user_goal,
-            "available_tools": self._registered_retrievers() + ["fetch_document", "read_workspace_file", "execute_python_analysis"],
-            "prior_relevant_memory": prior_memory,
-            "events": transcript.get("events", []), "messages": transcript.get("messages", []), "tool_calls": transcript.get("tool_calls", []),
+            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal", "consult_specialist"],
+            "prior_relevant_memory": {"checked_run_count": prior_memory.get("checked_run_count", 0), "relevant_run_count": len(prior_memory.get("relevant_trajectories", []))},
+            "observed_counts": {"events": len(transcript.get("events", [])), "messages": len(transcript.get("messages", [])), "tool_calls": len(transcript.get("tool_calls", []))},
             "termination": transcript.get("termination_reason"),
-            "artifacts": {"agent_transcript": str(store.agent_transcript_path), "final_report": str(store.report_path), "cost": str(store.cost_path), "prior_memory": str(store.prior_run_memory_path)},
+            "artifacts": {
+                "agent_transcript": str(store.agent_transcript_path),
+                "event_log": str(store.agent_event_log_path),
+                "final_report": str(store.report_path),
+                "cost": str(store.cost_path),
+                **({"agent_timeline": str(store.agent_timeline_path), "champion_tree": str(store.champion_tree_path)} if store.agent_timeline_path.exists() and store.champion_tree_path.exists() else {}),
+            },
             "notes": ["This event history is append-only from actual model turns and tool results.", "No predefined plan, source strategy, or execution mode is recorded or used."],
         })
 
@@ -173,5 +186,5 @@ def _terms(value: str) -> list[str]:
 
 
 def goal_slug(goal: str, max_length: int = 72) -> str:
-    words = [word for word in _terms(goal) if word not in RUN_SLUG_STOPWORDS]
+    words = _terms(goal)
     return ("-".join(words)[:max_length].strip("-") or "research-run")

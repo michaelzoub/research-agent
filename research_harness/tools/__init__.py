@@ -3,6 +3,7 @@
 from .base import BaseTool, ToolContext, ToolRegistry, ToolResult
 from .code import CodeExecutionTool
 from .files import FileReadTool
-from .research import SearchTool, WebFetchTool
+from .research import DocumentFigureTool, SearchTool, WebFetchTool
+from .terminal import TerminalExecutionTool
 
-__all__ = ["BaseTool", "CodeExecutionTool", "FileReadTool", "SearchTool", "ToolContext", "ToolRegistry", "ToolResult", "WebFetchTool"]
+__all__ = ["BaseTool", "CodeExecutionTool", "DocumentFigureTool", "FileReadTool", "SearchTool", "TerminalExecutionTool", "ToolContext", "ToolRegistry", "ToolResult", "WebFetchTool"]

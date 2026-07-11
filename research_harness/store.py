@@ -78,10 +78,6 @@ class ArtifactStore:
         self.echo_progress = echo_progress
         self.session_store = session_store
         self.root.mkdir(parents=True, exist_ok=True)
-        for filename in ENTITY_FILES.values():
-            path = self.root / filename
-            if not path.exists():
-                path.write_text("[]\n", encoding="utf-8")
         self.trace_log_path = self.root / "trace.jsonl"
         self.cost_path = self.root / "cost.json"
         self.sqlite_path = sqlite_path or self.root.parent / "world_model.sqlite"
@@ -98,9 +94,7 @@ class ArtifactStore:
         self.optimized_candidate_path = self.root / "optimized_candidate.txt"
         self.optimal_code_path = self.root / "optimal_code.py"
         self.candidates_dir = self.root / "candidates"
-        self.candidates_dir.mkdir(parents=True, exist_ok=True)
         self.champions_dir = self.root / "champions"
-        self.champions_dir.mkdir(parents=True, exist_ok=True)
         self.champion_tree_path = self.root / "champion_tree.json"
         self.champion_tree_graph_path = self.root / "champion_tree.png"
         self.champion_tree_svg_path = self.root / "champion_tree.svg"
@@ -124,10 +118,6 @@ class ArtifactStore:
         self.progress_path = self.root / "progress.txt"
         if not self.progress_path.exists():
             self.progress_path.write_text("", encoding="utf-8")
-        if not self.user_steering_inbox_path.exists():
-            self.user_steering_inbox_path.write_text("", encoding="utf-8")
-        if not self.user_steering_state_path.exists():
-            self.user_steering_state_path.write_text('{"consumed": 0}\n', encoding="utf-8")
         if not self.agent_event_log_path.exists():
             self.agent_event_log_path.write_text("", encoding="utf-8")
         self._migrate_sqlite()
@@ -318,6 +308,8 @@ class ArtifactStore:
             self.session_store.append_event("user_steering", payload)
 
     def ingest_pending_user_steering(self, run_id: Optional[str] = None) -> int:
+        if not self.user_steering_inbox_path.exists():
+            return 0
         lines = self.user_steering_inbox_path.read_text(encoding="utf-8").splitlines()
         state = _read_json(self.user_steering_state_path, {"consumed": 0})
         consumed = max(0, int(state.get("consumed") or 0))
@@ -387,6 +379,8 @@ class ArtifactStore:
 
     def list(self, entity: str) -> list[dict[str, Any]]:
         path = self.root / ENTITY_FILES[entity]
+        if not path.exists():
+            return []
         return json.loads(path.read_text(encoding="utf-8"))
 
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
@@ -485,6 +479,7 @@ class ArtifactStore:
         return self.optimization_result_path
 
     def write_round_champion(self, round_index: int, payload: dict[str, Any]) -> Path:
+        self.champions_dir.mkdir(parents=True, exist_ok=True)
         path = self.champions_dir / f"round_{round_index:03d}_champion.json"
         self._snapshot_before_write(path, "before writing round champion")
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -526,6 +521,7 @@ class ArtifactStore:
 
     def _write(self, entity: str, rows: list[dict[str, Any]]) -> None:
         path = self.root / ENTITY_FILES[entity]
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     def _snapshot_before_write(self, path: Path, reason: str) -> None:

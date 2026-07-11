@@ -15,11 +15,12 @@ Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or run a compatible Ollama model for 
 
 ```bash
 autore "Research a current technical question" --retriever web --max-iterations 8
+autore "Find source figures for this claim" --max-tool-calls 48 --max-runtime-seconds 300
 autore "Analyze this repository's public architecture" --retriever local
 autore --help
 ```
 
-There is no execution-mode flag. All tasks start the same `ResearchAgent`; tools are optional capabilities selected by the model. Registered capabilities include source search, public document fetching, approved-workspace reads, and sandboxed Python analysis. Before using a tool, the model records a concise public decision summary. This is an auditable rationale for the action, not hidden chain-of-thought.
+There is no execution-mode flag. All tasks start the same `ResearchAgent`; tools are optional capabilities selected by the model. Registered capabilities include source search, public document fetching, figure inspection (caption, image URL, and aspect-ratio metadata), approved-workspace reads, sandboxed Python analysis, and bounded host-terminal inspection (`curl`, `npm`, `git`, and `rg`). The terminal tool runs direct argv only—never a shell—uses an ephemeral home with no inherited credentials, and is limited to read-only subcommands and public HTTP(S) GET/HEAD requests. A failed or empty discovery call stays in the audit trail but does not consume the successful-evidence allowance, so the agent can recover through another source. Before using a tool, the model records a concise public decision summary. This is an auditable rationale for the action, not hidden chain-of-thought.
 
 ## Artifacts
 
@@ -34,7 +35,7 @@ Each run writes `outputs/<run>/`:
 
 Workspace reads are deny-by-default for sensitive files such as `.env` and `.git`. Document retrieval validates every DNS-resolved host and redirect against private, loopback, link-local, and reserved addresses. HTML documents may be rendered into compact Markdown through curl.md after the target URL passes those checks; direct fetch remains available as the fallback.
 
-Search tools must return relevant records or an explicit error. A DuckDuckGo bot challenge is surfaced as a tool failure; arXiv exact IDs are fetched directly and unrelated papers are rejected before persistence. The harness compacts source records before returning them to the model while retaining complete source metadata in the artifact store.
+Search tools must return relevant records or an explicit error. A DuckDuckGo bot challenge is surfaced as a tool failure, not bypassed. The agent can recover with registered primary-source APIs or direct public URLs through `fetch_document`, figure inspection, or the bounded terminal tool; arXiv exact IDs are fetched directly and unrelated papers are rejected before persistence. The harness compacts source records before returning them to the model while retaining complete source metadata in the artifact store.
 
 ## Test
 

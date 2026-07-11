@@ -15,6 +15,7 @@ from typing import Callable, Optional
 from .evals.suites import SUITE_CHOICES
 from .model_catalog import format_model_catalog, model_choices, resolve_model_selection
 from .orchestrator import HarnessConfig, Orchestrator
+from .schemas import AgentBudget
 
 
 RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "twitter", "memory", "alchemy")
@@ -87,8 +88,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=12,
+        default=20,
         help="Maximum model turns for this run.",
+    )
+    parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=48,
+        help="Maximum evidence-producing external-tool calls. Failed or empty discovery calls remain visible but do not spend this evidence budget.",
+    )
+    parser.add_argument(
+        "--max-runtime-seconds",
+        type=float,
+        default=300.0,
+        help="Wall-clock limit for the run, including source and figure inspection.",
     )
     parser.add_argument(
         "--evaluator",
@@ -306,7 +319,7 @@ def _print_run_summary(run, store, *, output_func: Callable[[str], None] = print
     ]
     output_func("")
     output_func(_paint("Open first", "teal", enabled=use_color))
-    for label, path in primary_artifacts:
+    for label, path in [(label, path) for label, path in primary_artifacts if path.exists()]:
         output_func(f"  {_paint(label.ljust(10), 'gray', enabled=use_color)} {path}")
     available_optional = [(label, path) for label, path in optional_artifacts if path.exists()]
     if available_optional:
@@ -316,7 +329,7 @@ def _print_run_summary(run, store, *, output_func: Callable[[str], None] = print
             output_func(f"  {_paint(label.ljust(10), 'gray', enabled=use_color)} {path}")
     output_func("")
     output_func(_paint("Diagnostics", "teal", enabled=use_color))
-    for label, path in diagnostics:
+    for label, path in [(label, path) for label, path in diagnostics if path.exists()]:
         output_func(f"  {_paint(label.ljust(10), 'gray', enabled=use_color)} {path}")
 
 
@@ -572,6 +585,10 @@ def main() -> None:
         fork_session_id=args.fork_session,
         enable_sessions=not args.no_sessions,
         echo_progress=not args.quiet,
+        default_budget=AgentBudget(
+            max_tool_calls=args.max_tool_calls,
+            max_runtime_seconds=args.max_runtime_seconds,
+        ),
     )
     orchestrator = Orchestrator(args.corpus, args.output, config)
     run, store = asyncio.run(orchestrator.run(args.goal))

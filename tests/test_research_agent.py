@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import subprocess
 import tempfile
 import time
 import unittest
@@ -11,11 +12,13 @@ from typing import Any
 
 from research_harness.cli import build_parser
 from research_harness.llm import ModelToolCall, ModelTurn
+from research_harness.agents import SpecialistConsultationTool
 from research_harness.orchestrator import HarnessConfig
-from research_harness.research_agent import AgentRunConfig, FinalAnswerValidator, ResearchAgent
-from research_harness.search import ArxivSearch, LocalCorpusSearch, WebSearch, _arxiv_identifier, _arxiv_query
+from research_harness.research_agent import AgentRunConfig, FinalAnswerValidator, ResearchAgent, _join_answer_chunks, _partial_synthesis
+from research_harness.search import ArxivSearch, LocalCorpusSearch, WebSearch, _arxiv_identifier, _arxiv_query, _retrieval_query
 from research_harness.store import ArtifactStore
-from research_harness.tools import SearchTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
+from research_harness.tools import DocumentFigureTool, SearchTool, TerminalExecutionTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
+from research_harness.tools.research import _FigureHTMLParser, _image_dimensions, _inspection_urls
 
 
 class ScriptedDecider:
@@ -92,13 +95,48 @@ class ResearchAgentTest(unittest.TestCase):
         result = ResearchAgent(decider, ToolRegistry([]), AgentRunConfig(max_iterations=2)).run("Do work.", workspace=Path.cwd())
 
         self.assertEqual(result.termination_reason, "budget_exhausted")
-        self.assertIn("Partial result", result.final_answer)
+        self.assertIn("Incomplete evidence packet", result.final_answer)
 
     def test_web_fetch_rejects_private_network_targets(self) -> None:
         result = asyncio.run(WebFetchTool().execute({"url": "http://127.0.0.1/private"}, ToolContext(workspace=Path.cwd())))
 
         self.assertEqual(result.status, "error")
         self.assertIn("Private or loopback", result.error or "")
+
+    def test_terminal_executes_direct_argv_and_preserves_output(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def runner(argv: list[str], cwd: Path, timeout_seconds: float):
+            captured.update({"argv": argv, "cwd": cwd, "timeout": timeout_seconds})
+            return subprocess.CompletedProcess(argv, 0, stdout="real command output", stderr="")
+
+        tool = TerminalExecutionTool(runner=runner)
+        with mock.patch("research_harness.tools.terminal.shutil.which", return_value="/usr/bin/curl"), mock.patch("research_harness.tools.terminal._public_url_error", return_value=None):
+            result = asyncio.run(tool.execute(
+                {"command": "curl", "args": ["https://example.org/paper"], "timeout_seconds": 12},
+                ToolContext(workspace=Path.cwd()),
+            ))
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(captured["argv"], ["/usr/bin/curl", "https://example.org/paper"])
+        self.assertEqual(captured["cwd"], Path.cwd().resolve())
+        self.assertEqual(captured["timeout"], 12)
+        self.assertEqual(result.data["stdout"], "real command output")
+        self.assertEqual(result.source_metadata[0]["url"], "https://example.org/paper")
+
+    def test_terminal_rejects_private_curl_and_mutating_npm(self) -> None:
+        tool = TerminalExecutionTool()
+        private_curl = asyncio.run(tool.execute(
+            {"command": "curl", "args": ["http://127.0.0.1/private"]}, ToolContext(workspace=Path.cwd())
+        ))
+        npm_install = asyncio.run(tool.execute(
+            {"command": "npm", "args": ["install", "some-package"]}, ToolContext(workspace=Path.cwd())
+        ))
+
+        self.assertEqual(private_curl.status, "error")
+        self.assertIn("Private or loopback", private_curl.error or "")
+        self.assertEqual(npm_install.status, "error")
+        self.assertIn("limited", npm_install.error or "")
 
     def test_registry_rejects_invalid_tool_arguments_before_execution(self) -> None:
         backend = LocalCorpusSearch(Path("examples/corpus/research_corpus.json"))
@@ -197,6 +235,91 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual({message["tool_call_id"] for message in responses}, {"first", "second"})
         self.assertEqual(result.tool_calls[1]["status"], "skipped")
 
+    def test_retryable_tool_errors_do_not_consume_evidence_budget(self) -> None:
+        class RecoveringTool:
+            name, description, is_read_only = "recovering", "recovering", True
+            input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                self.attempts += 1
+                if self.attempts == 1:
+                    return ToolResult("error", error="temporary search backend failure", retryable=True)
+                return ToolResult("ok", {"evidence": "retrieved"})
+
+        class ErrorThenRecover:
+            def __init__(self) -> None:
+                self.turns = [
+                    ModelTurn("Try discovery.", [ModelToolCall("one", "recovering", {})], "tool_calls", "test", "test"),
+                    ModelTurn("Try an alternative route.", [ModelToolCall("two", "recovering", {})], "tool_calls", "test", "test"),
+                    ModelTurn("Grounded result.", [], "stop", "test", "test"),
+                ]
+
+            def decide(self, _messages: Any, _tools: Any) -> ModelTurn:
+                return self.turns.pop(0)
+
+        result = ResearchAgent(ErrorThenRecover(), ToolRegistry([RecoveringTool()]), AgentRunConfig(max_iterations=4, max_tool_calls=1)).run("Recover from a temporary source failure.", workspace=Path.cwd())
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual([call["status"] for call in result.tool_calls], ["error", "ok"])
+
+    def test_empty_discovery_does_not_consume_evidence_budget(self) -> None:
+        class EmptyThenEvidenceTool:
+            name, description, is_read_only = "discovery", "discovery", True
+            input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                self.attempts += 1
+                if self.attempts == 1:
+                    return ToolResult("ok", {"result_count": 0})
+                return ToolResult("ok", {"result_count": 1}, source_metadata=[{"url": "https://example.org/evidence"}])
+
+        class TwoDiscoveryPasses:
+            def __init__(self) -> None:
+                self.turns = [
+                    ModelTurn("Try one source.", [ModelToolCall("one", "discovery", {})], "tool_calls", "test", "test"),
+                    ModelTurn("Try a second source.", [ModelToolCall("two", "discovery", {})], "tool_calls", "test", "test"),
+                    ModelTurn("Grounded result https://example.org/evidence", [], "stop", "test", "test"),
+                ]
+
+            def decide(self, _messages: Any, _tools: Any) -> ModelTurn:
+                return self.turns.pop(0)
+
+        result = ResearchAgent(TwoDiscoveryPasses(), ToolRegistry([EmptyThenEvidenceTool()]), AgentRunConfig(max_iterations=4, max_tool_calls=1)).run("Find external evidence.", workspace=Path.cwd())
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual([call["status"] for call in result.tool_calls], ["ok", "ok"])
+
+    def test_html_figure_parser_preserves_caption_and_image_url(self) -> None:
+        parser = _FigureHTMLParser("https://example.org/paper")
+        parser.feed('<figure class="ltx_figure"><img src="images/plot.png"><figcaption>Figure 2: Agent performance over time.</figcaption></figure>')
+
+        self.assertEqual(parser.figures, [{"image_url": "https://example.org/images/plot.png", "caption": "Figure 2: Agent performance over time."}])
+
+    def test_figure_inspection_registers_direct_figure_assets_for_citation(self) -> None:
+        tool = DocumentFigureTool()
+        inspected = ToolResult("ok", {
+            "source_url": "https://example.org/paper",
+            "figures": [{"image_url": "https://example.org/figures/one.png", "caption": "Figure 1: Verified result."}],
+        })
+        with mock.patch.object(tool, "_inspect", return_value=inspected):
+            result = asyncio.run(tool.execute({"url": "https://example.org/paper"}, ToolContext(workspace=Path.cwd())))
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(
+            {source["url"] for source in result.source_metadata},
+            {"https://example.org/paper", "https://example.org/figures/one.png"},
+        )
+
+    def test_image_dimensions_reads_png_header(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (1200).to_bytes(4, "big") + (800).to_bytes(4, "big")
+        self.assertEqual(_image_dimensions(png), (1200, 800))
+
     def test_arxiv_query_preserves_exact_ids_and_filters_irrelevant_results(self) -> None:
         self.assertEqual(_arxiv_identifier("Concrete Problems in AI Safety 1606.06565"), "1606.06565")
         self.assertNotIn("%", _arxiv_query("Stochastic Parrots Bender Gebru 2021"))
@@ -211,6 +334,22 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertNotIn("%25", urlopen.call_args.args[0].full_url)
 
+    def test_arxiv_retrieval_query_drops_figure_format_noise(self) -> None:
+        self.assertEqual(
+            _retrieval_query("FunSearch figure chart algorithm discovery performance"),
+            "funsearch algorithm discovery",
+        )
+
+    def test_figure_inspection_uses_arxiv_pdf_when_html_is_unavailable(self) -> None:
+        self.assertEqual(
+            _inspection_urls("https://arxiv.org/abs/2304.03442v2"),
+            [
+                "https://arxiv.org/html/2304.03442v2",
+                "https://arxiv.org/pdf/2304.03442v2",
+                "https://arxiv.org/abs/2304.03442v2",
+            ],
+        )
+
     def test_web_search_reports_duckduckgo_bot_challenge(self) -> None:
         response = mock.MagicMock()
         response.read.return_value = b"<html><div class='anomaly-modal'>Unfortunately, bots use DuckDuckGo too.</div></html>"
@@ -223,6 +362,58 @@ class ResearchAgentTest(unittest.TestCase):
         status, feedback = FinalAnswerValidator().validate("A confident but uncited answer.", "Use external sources to explain AGI limitations.", [])
         self.assertEqual(status, "REVISE")
         self.assertIn("external evidence", feedback)
+
+    def test_generic_source_handoff_is_not_accepted_as_final_research_answer(self) -> None:
+        status, feedback = FinalAnswerValidator().validate(
+            "Pick one: Option A: send 5 candidate URLs. Option B: give permission to use another discovery source.",
+            "Use external sources to find figures.",
+            [],
+        )
+        self.assertEqual(status, "REVISE")
+        self.assertIn("generic request", feedback)
+
+    def test_citation_validation_normalizes_http_and_https(self) -> None:
+        status, _feedback = FinalAnswerValidator().validate(
+            "See https://arxiv.org/abs/1606.06565v2.",
+            "Use external sources.",
+            [{"url": "http://arxiv.org/abs/1606.06565v2"}],
+        )
+        self.assertEqual(status, "PASS")
+
+    def test_length_continuation_does_not_break_url(self) -> None:
+        self.assertEqual(
+            _join_answer_chunks(["Source: https://arxiv.org", "/abs/1606.06565v2" ]),
+            "Source: https://arxiv.org/abs/1606.06565v2",
+        )
+
+    def test_incomplete_evidence_packet_preserves_retrieved_summary(self) -> None:
+        report = _partial_synthesis(
+            [{"title": "Primary result", "url": "https://example.org/result", "summary": "The source contains the directly retrieved result."}],
+            None,
+        )
+
+        self.assertIn("Incomplete evidence packet", report)
+        self.assertIn("directly retrieved result", report)
+        self.assertIn("https://example.org/result", report)
+
+    def test_controller_can_consult_a_model_chosen_specialist(self) -> None:
+        class SpecialistLLM:
+            model_label = "specialist-test"
+
+            def complete(self, _system: str, _prompt: str, **_kwargs: Any):
+                from research_harness.llm import LLMResponse
+                return LLMResponse("Evidence is weak because the baseline is mismatched.", "specialist-test", "test", 12, 8, 0.01)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            tool = SpecialistConsultationTool(SpecialistLLM())
+            result = asyncio.run(tool.execute(
+                {"specialty": "evidence critic", "question": "Assess the baseline.", "evidence": ["Model A beat Model B."]},
+                ToolContext(workspace=Path.cwd(), store=store, run_id="run_specialist"),
+            ))
+            self.assertEqual(result.status, "ok")
+            self.assertIn("baseline is mismatched", result.data["response"])
+            self.assertEqual(store.list("agent_traces")[0]["role"], "specialist_consultation")
 
 
 if __name__ == "__main__":

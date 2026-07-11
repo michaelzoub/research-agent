@@ -147,7 +147,8 @@ class ArxivSearch:
 
     def search(self, query: str, limit: int = 4) -> list[tuple[CorpusDocument, float]]:
         identifier = _arxiv_identifier(query)
-        cleaned_query = _arxiv_query(query)
+        retrieval_query = _retrieval_query(query)
+        cleaned_query = _arxiv_query(retrieval_query)
         if not cleaned_query and not identifier:
             return []
         params_dict = {"start": 0, "max_results": limit, "sortBy": "relevance", "sortOrder": "descending"}
@@ -165,7 +166,7 @@ class ArxivSearch:
         documents = _parse_arxiv_feed(payload)
         if identifier:
             return [(document, 1.0) for document in documents if identifier in document.url][:limit]
-        return _score_documents(query, documents)[:limit]
+        return _score_documents(retrieval_query, documents)[:limit]
 
     def to_source(self, document: CorpusDocument, relevance_score: float) -> Source:
         return Source(
@@ -752,12 +753,25 @@ def _is_run_dir(name: str) -> bool:
 
 
 def _arxiv_query(text: str) -> str:
-    terms = _ordered_content_tokens(text)[:6]
+    terms = _ordered_content_tokens(text)[:3]
     if not terms:
         return ""
     # urlencode() handles escaping exactly once. Quoting terms here produced
     # literal percent escapes in arXiv's query parser and irrelevant newest work.
     return " AND ".join(f"all:{term}" for term in terms)
+
+
+_RETRIEVAL_NOISE_TERMS = {
+    "figure", "figures", "chart", "charts", "diagram", "diagrams",
+    "graphic", "graphics", "caption", "captions", "performance", "paper",
+    "papers", "report", "reports", "source", "sources", "research",
+}
+
+
+def _retrieval_query(text: str) -> str:
+    """Keep paper-identifying terms, not output-format instructions, in API search."""
+    terms = [term for term in _ordered_content_tokens(text) if term not in _RETRIEVAL_NOISE_TERMS]
+    return " ".join(terms[:4]) or text
 
 
 def _arxiv_identifier(text: str) -> str:

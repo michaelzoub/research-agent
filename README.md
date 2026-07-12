@@ -1,6 +1,6 @@
 # research-harness
 
-`autore` runs one model-directed agent loop. The model decides whether to answer directly, use registered tools, recover from failures, request input, inspect evidence, or stop. The harness enforces permissions, budgets, persistence, validation, and deterministic evaluation; it does not prescribe a research sequence.
+`autore` runs one model-directed agent loop. The model decides whether to answer directly, use registered tools, recover from failures, request input, inspect evidence, or stop. The harness enforces permissions, budgets, persistence, validation, and deterministic evaluation.
 
 ## Quick start
 
@@ -20,7 +20,7 @@ autore "Analyze this repository's public architecture" --retriever local
 autore --help
 ```
 
-There is no execution-mode flag. All tasks start the same `ResearchAgent`; tools are optional capabilities selected by the model. Registered capabilities include source search, public document fetching, figure inspection (caption, image URL, and aspect-ratio metadata), approved-workspace reads, sandboxed Python analysis, and bounded host-terminal inspection (`curl`, `npm`, `git`, and `rg`). The terminal tool runs direct argv only—never a shell—uses an ephemeral home with no inherited credentials, and is limited to read-only subcommands and public HTTP(S) GET/HEAD requests. A failed or empty discovery call stays in the audit trail but does not consume the successful-evidence allowance, so the agent can recover through another source. Before using a tool, the model records a concise public decision summary. This is an auditable rationale for the action, not hidden chain-of-thought.
+All tasks start the same `ResearchAgent`; tools are optional capabilities selected by the model. Registered capabilities include source search, public document fetching, figure inspection (caption, image URL, and aspect-ratio metadata), approved-workspace reads, sandboxed Python analysis, and bounded host-terminal inspection (`curl`, `npm`, `git`, and `rg`). The terminal tool runs direct argv only—never a shell—uses an ephemeral home with no inherited credentials, and is limited to read-only subcommands and public HTTP(S) GET/HEAD requests. A failed or empty discovery call stays in the audit trail but does not consume the successful-evidence allowance, so the agent can recover through another source. Before using a tool, the model records a concise public decision summary. This is an auditable rationale for the action, not hidden chain-of-thought.
 
 ## Artifacts
 

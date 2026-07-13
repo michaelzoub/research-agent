@@ -179,7 +179,7 @@ def evaluator_context(evaluator_name: str | None) -> str:
     return (
         "A prediction_market grader is configured. ‘PM challenge’ means the configured prediction-market challenge, "
         "not project/product management. The only scoring authority is the upstream prediction-market evaluator. "
-        "The registered upstream baseline is prediction_market/starter_strategy (examples/starter_strategy.py); use it to verify the public interface, but improve it only through observed official scorer feedback. "
+        "The CLI injects the exact adapter-resolved upstream baseline source and absolute path into this objective; do not guess or search for a starter_strategy path. Use it to verify the public interface, but improve it only through observed official scorer feedback. "
         "Selecting this grader is an explicit request to optimize against it, not to give a generic PM overview. "
         "The required public interface is exactly: "
         "from orderbook_pm_challenge.strategy import BaseStrategy; "

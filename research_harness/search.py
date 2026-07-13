@@ -543,43 +543,6 @@ class WikipediaSearch:
         return _source_from_document(document, relevance_score)
 
 
-class PriorArtifactMemorySearch:
-    tool_name = "prior_artifact_memory_search"
-
-    def __init__(self, output_root: Path):
-        self.output_root = output_root
-
-    def search(self, query: str, limit: int = 4) -> list[tuple[CorpusDocument, float]]:
-        documents = []
-        for run_dir in sorted(path for path in self.output_root.iterdir() if _is_run_dir(path.name)):
-            if not run_dir.is_dir():
-                continue
-            run_record = _first_json_row(run_dir / "runs.json")
-            claims = _read_json(run_dir / "claims.json", [])
-            sources = _read_json(run_dir / "sources.json", [])
-            real_sources = [s for s in sources if "example.com" not in str(s.get("url", ""))]
-            source_titles = [str(source.get("title", "")) for source in real_sources[:5]]
-            summary = " ".join(str(claim.get("text", "")) for claim in claims[:5]) or "Prior run artifact."
-            goal = str(run_record.get("user_goal", run_dir.name))
-            documents.append(
-                CorpusDocument(
-                    url=str(run_dir),
-                    title=f"Prior run: {goal[:90]}",
-                    author="research-harness",
-                    date=str(run_record.get("completed_at", ""))[:10],
-                    source_type="prior_artifact_memory",
-                    summary=f"{summary} Sources included: {', '.join(source_titles)}",
-                    claims=[str(claim.get("text", "")) for claim in claims[:3] if claim.get("text")],
-                    tags=["prior-run", "artifact-memory"],
-                    credibility_score=0.58,
-                )
-            )
-        return _score_documents(query, documents)[:limit]
-
-    def to_source(self, document: CorpusDocument, relevance_score: float) -> Source:
-        return _source_from_document(document, relevance_score)
-
-
 def _tokens(text: str) -> set[str]:
     return {match.group(0).lower() for match in TOKEN_RE.finditer(text)}
 
@@ -741,15 +704,6 @@ def _read_json(path: Path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return default
-
-
-def _first_json_row(path: Path) -> dict:
-    rows = _read_json(path, [])
-    return rows[0] if rows else {}
-
-
-def _is_run_dir(name: str) -> bool:
-    return name.startswith("run_") or bool(re.match(r"^\d+_run_", name))
 
 
 def _arxiv_query(text: str) -> str:

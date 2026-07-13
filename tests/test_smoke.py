@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from research_harness.orchestrator import HarnessConfig, Orchestrator, goal_slug
 
@@ -52,12 +54,36 @@ class OrchestratorSmokeTest(unittest.TestCase):
                     echo_progress=False, enable_sessions=False,
                 ),
             )
-            _run, store = asyncio.run(orchestrator.run("Optimize PM challenge."))
+            with patch.dict(os.environ, {"PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM": "1"}):
+                _run, store = asyncio.run(orchestrator.run("Optimize PM challenge."))
 
             self.assertTrue(store.agent_transcript_path.exists())
             self.assertFalse(store.optimization_result_path.exists())
             state = json.loads(store.run_state_path.read_text(encoding="utf-8"))
             self.assertIn("evaluate_prediction_market_candidate", state["available_tools"])
+            preflight = json.loads(store.grader_preflight_path.read_text(encoding="utf-8"))
+            self.assertTrue(preflight["ok"])
+            self.assertIn("class Strategy(BaseStrategy)", preflight["baseline_code"])
+
+    def test_unavailable_grader_stops_before_any_model_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"PREDICTION_MARKET_USE_UPSTREAM": "0"}
+        ):
+            orchestrator = Orchestrator(
+                Path("examples/corpus/research_corpus.json"),
+                Path(directory),
+                HarnessConfig(
+                    retriever="local", llm_provider="local", evaluator_name="prediction_market",
+                    echo_progress=False, enable_sessions=False,
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "Official grader preflight failed"):
+                asyncio.run(orchestrator.run("Optimize PM challenge."))
+
+            run_root = next(path for path in Path(directory).iterdir() if path.is_dir())
+            preflight = json.loads((run_root / "grader_preflight.json").read_text(encoding="utf-8"))
+            self.assertFalse(preflight["ok"])
+            self.assertFalse((run_root / "agent_messages.json").exists())
 
     def test_auto_retrieval_excludes_the_fixture_corpus(self) -> None:
         orchestrator = Orchestrator(

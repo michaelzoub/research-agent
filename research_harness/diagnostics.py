@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 from collections import Counter, defaultdict
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 def classify_failure(message: str, *, component: str = "unknown") -> dict[str, Any]:
@@ -62,7 +60,7 @@ def component_from_trace(trace: dict[str, Any]) -> str:
     return "unknown"
 
 
-def diagnose_snapshot(snapshot: dict[str, list[dict[str, Any]]], *, run_root: Optional[Path] = None) -> dict[str, Any]:
+def diagnose_snapshot(snapshot: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     traces = snapshot.get("agent_traces", [])
     claims = snapshot.get("claims", [])
     sources = snapshot.get("sources", [])
@@ -109,46 +107,8 @@ def diagnose_snapshot(snapshot: dict[str, list[dict[str, Any]]], *, run_root: Op
             "evaluation_count": len(evaluations),
         },
         "localized_components": _localize_components(components, failures, claims, sources, contradictions, evaluations),
-        "prior_run_comparison": compare_trace_patterns(traces, load_prior_trace_patterns(run_root.parent, run_root.name) if run_root else []),
     }
     return diagnosis
-
-
-def load_prior_trace_patterns(output_root: Path, current_run_id: str, *, limit: int = 8) -> list[dict[str, Any]]:
-    runs = []
-    if not output_root.exists():
-        return runs
-    for run_dir in sorted((path for path in output_root.iterdir() if path.is_dir() and path.name != current_run_id), reverse=True)[:limit]:
-        traces_path = run_dir / "agent_traces.json"
-        rounds_path = run_dir / "evolution_rounds.json"
-        if not traces_path.exists():
-            continue
-        try:
-            traces = json.loads(traces_path.read_text(encoding="utf-8"))
-            rounds = json.loads(rounds_path.read_text(encoding="utf-8")) if rounds_path.exists() else []
-        except json.JSONDecodeError:
-            continue
-        runs.append({"run_id": run_dir.name, "trace_patterns": _trace_patterns(traces), "round_signals": [row.get("termination_signal") for row in rounds]})
-    return runs
-
-
-def compare_trace_patterns(current_traces: list[dict[str, Any]], prior_runs: list[dict[str, Any]]) -> dict[str, Any]:
-    current = _trace_patterns(current_traces)
-    prior_components = Counter()
-    prior_failures = Counter()
-    for run in prior_runs:
-        patterns = run.get("trace_patterns") or {}
-        prior_components.update(patterns.get("components", {}))
-        prior_failures.update(patterns.get("failure_categories", {}))
-    current_failures = Counter(current.get("failure_categories", {}))
-    recurring = sorted(set(current_failures) & set(prior_failures))
-    return {
-        "prior_run_count": len(prior_runs),
-        "current_components": current.get("components", {}),
-        "recurring_failure_categories": recurring,
-        "new_failure_categories": sorted(set(current_failures) - set(prior_failures)),
-        "prior_component_counts": dict(prior_components),
-    }
 
 
 def score_harness_change(change: dict[str, Any], diagnosis: dict[str, Any]) -> dict[str, float]:

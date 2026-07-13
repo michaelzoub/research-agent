@@ -69,16 +69,6 @@ class LoopIteration:
 
 
 @dataclass
-class TaskIngestionDecision:
-    requested_mode: str
-    selected_mode: TaskMode
-    reason: str
-    evaluator_name: Optional[str] = None
-    product_agent: ProductAgent = "research"
-    id: str = field(default_factory=lambda: new_id("decision"))
-
-
-@dataclass
 class Variant:
     run_id: str
     outer_iteration: int
@@ -253,8 +243,6 @@ class RunRecord:
     user_goal: str
     task_type: TaskType
     harness_config_id: str
-    task_mode: Optional[TaskMode] = None
-    product_agent: Optional[ProductAgent] = None
     status: RunStatus = "running"
     total_cost: float = 0.0
     total_tokens: int = 0

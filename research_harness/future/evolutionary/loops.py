@@ -39,7 +39,7 @@ from .loop_utils import (
     strip_run_artifacts as _strip_run_artifacts,
     support_level as _support_level,
 )
-from ...loop_routing import EvaluatorFn, EvaluatorRegistry, TaskRouter
+from .routing import EvaluatorFn, EvaluatorRegistry, TaskRouter
 from .optimization_agent import OptimizationAgent, OptimizerToolbox
 from optimization_graders import get_optimization_grader
 from ...schemas import (

@@ -10,10 +10,9 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from .llm import LLMClient
-from .loop_routing import EvaluatorRegistry, TaskRouter
 from .research_agent import AgentRunConfig, ResearchAgent
 from .schemas import AgentBudget, CostEvent, RunRecord, now_iso, to_dict
-from .search import AlchemySearch, ArxivSearch, DocsBlogsSearch, GitHubSearch, LocalCorpusSearch, OpenAlexSearch, PriorArtifactMemorySearch, SearchBackend, SemanticScholarSearch, SocialWebSearch, WebSearch, WikipediaSearch
+from .search import AlchemySearch, ArxivSearch, DocsBlogsSearch, GitHubSearch, LocalCorpusSearch, OpenAlexSearch, SearchBackend, SemanticScholarSearch, SocialWebSearch, WebSearch, WikipediaSearch
 from .sessions import SessionStore, default_session_projects_dir
 from .store import ArtifactStore
 from .tools import evaluator_context
@@ -52,7 +51,6 @@ class Orchestrator:
             raise ValueError(f"--llm-provider {self.config.llm_provider} requires configured credentials.")
 
     async def run(self, goal: str) -> Tuple[RunRecord, ArtifactStore]:
-        prior_memory = self.load_prior_run_memory(goal)
         run = RunRecord(
             id=self._next_run_id(goal), user_goal=goal, task_type="open_ended",
             harness_config_id=self.config.id, prompt_versions=_prompt_versions(),
@@ -63,13 +61,22 @@ class Orchestrator:
         store.add_run(run)
         store.append_progress(f"Starting model-directed run {run.id}")
         store.append_progress(f"Goal: {goal}")
-        self._write_run_state(store, run, prior_memory, stage="started")
+        self._write_run_state(store, run, stage="started")
         try:
-            decision = self._optimization_decision(goal)
-            if decision is not None:
-                store.add_task_ingestion_decision(decision)
-                store.append_progress(f"Evaluator configured ({decision.evaluator_name}); retaining the model-directed base loop.")
-            agent_objective = _agent_objective(goal, self.config.evaluator_name)
+            grader_bootstrap: Optional[dict[str, Any]] = None
+            if self.config.evaluator_name:
+                store.append_progress(
+                    f"Grader configured ({self.config.evaluator_name}); exposing its registered tools to the model-directed loop."
+                )
+                grader_bootstrap = _grader_bootstrap_context(self.config.evaluator_name)
+                store.write_grader_preflight(grader_bootstrap)
+                store.append_progress(
+                    f"Grader preflight: ok={grader_bootstrap['ok']} mode={grader_bootstrap['execution_mode']} "
+                    f"upstream={grader_bootstrap['upstream_path']}"
+                )
+                if not grader_bootstrap["ok"]:
+                    raise RuntimeError(f"Official grader preflight failed: {grader_bootstrap['reason']}")
+            agent_objective = _agent_objective(goal, self.config.evaluator_name, grader_bootstrap)
             agent = ResearchAgent.with_research_tools(
                 self.llm,
                 [self._retriever_for(name) for name in self._enabled_retrievers()],
@@ -93,32 +100,10 @@ class Orchestrator:
             cost.update({"run_id": run.id, "completed_at": run.completed_at})
             store.write_cost(cost)
             store.update_run(run)
-            self._write_run_state(store, run, prior_memory, stage="completed")
+            self._write_run_state(store, run, stage="completed")
             if session_store is not None:
                 session_store.complete_session(status=run.status, summary=f"Run {run.id} {run.status}.")
         return run, store
-
-    def _optimization_decision(self, goal: str):
-        if not self.config.evaluator_name:
-            return None
-        registry = EvaluatorRegistry()
-        decision = TaskRouter(registry, self.llm).decide(goal, evaluator_name=self.config.evaluator_name)
-        return decision if decision.selected_mode in {"optimize", "optimize_query"} and decision.evaluator_name else None
-
-    def load_prior_run_memory(self, goal: str, limit: int = 6) -> dict[str, Any]:
-        matches: list[dict[str, Any]] = []
-        for path in sorted(self.output_root.glob("*_run_*/run_state.json"), reverse=True):
-            try:
-                state = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            previous_goal = str(state.get("goal") or "")
-            overlap = len(set(_terms(goal)) & set(_terms(previous_goal)))
-            if overlap:
-                matches.append({"run_id": state.get("run", {}).get("id"), "goal": previous_goal, "status": state.get("run", {}).get("status"), "path": str(path), "overlap": overlap})
-            if len(matches) >= limit:
-                break
-        return {"checked_run_count": len(matches), "relevant_trajectories": matches}
 
     def _enabled_retrievers(self) -> list[str]:
         """Return source capabilities enabled by configuration, never a search plan.
@@ -132,16 +117,16 @@ class Orchestrator:
         # The local corpus is intentionally fixture-only.  Mixing example.org
         # records into a live research run makes a failed discovery pass look
         # grounded and trains the agent to report fabricated-looking evidence.
-        return ["arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "memory"]
+        return ["arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs"]
 
     def _retriever_for(self, retriever: str) -> SearchBackend:
-        registry: dict[str, Any] = {"local": lambda: LocalCorpusSearch(self.corpus_path), "arxiv": lambda: ArxivSearch(llm=self.llm), "openalex": OpenAlexSearch, "semantic_scholar": SemanticScholarSearch, "github": GitHubSearch, "web": WebSearch, "docs_blogs": DocsBlogsSearch, "twitter": SocialWebSearch, "memory": lambda: PriorArtifactMemorySearch(self.output_root), "wikipedia": WikipediaSearch, "alchemy": AlchemySearch}
+        registry: dict[str, Any] = {"local": lambda: LocalCorpusSearch(self.corpus_path), "arxiv": lambda: ArxivSearch(llm=self.llm), "openalex": OpenAlexSearch, "semantic_scholar": SemanticScholarSearch, "github": GitHubSearch, "web": WebSearch, "docs_blogs": DocsBlogsSearch, "twitter": SocialWebSearch, "wikipedia": WikipediaSearch, "alchemy": AlchemySearch}
         try:
             return registry[retriever.lower()]()
         except KeyError as exc:
             raise ValueError(f"Unknown retriever: {retriever}") from exc
 
-    def _write_run_state(self, store: ArtifactStore, run: RunRecord, prior_memory: dict[str, Any], *, stage: str) -> None:
+    def _write_run_state(self, store: ArtifactStore, run: RunRecord, *, stage: str) -> None:
         transcript: dict[str, Any] = {}
         if store.agent_transcript_path.exists():
             try:
@@ -151,7 +136,6 @@ class Orchestrator:
         store.write_run_state({
             "schema_version": "model_directed_run_state_v1", "stage": stage, "run": to_dict(run), "goal": run.user_goal,
             "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal", "consult_specialist"] + (["evaluate_prediction_market_candidate", "spawn_optimization_agents", "run_parameter_sweep", "save_learning"] if self.config.evaluator_name == "prediction_market" else []),
-            "prior_relevant_memory": {"checked_run_count": prior_memory.get("checked_run_count", 0), "relevant_run_count": len(prior_memory.get("relevant_trajectories", []))},
             "observed_counts": {"events": len(transcript.get("events", [])), "messages": len(transcript.get("messages", [])), "tool_calls": len(transcript.get("tool_calls", []))},
             "termination": transcript.get("termination_reason"),
             "artifacts": {
@@ -161,6 +145,7 @@ class Orchestrator:
                 "cost": str(store.cost_path),
                 "learnings": str(store.learnings_path),
                 "learning_log": str(store.learning_log_path),
+                **({"grader_preflight": str(store.grader_preflight_path)} if store.grader_preflight_path.exists() else {}),
                 **({"agent_timeline": str(store.agent_timeline_path), "champion_tree": str(store.champion_tree_path)} if store.agent_timeline_path.exists() and store.champion_tree_path.exists() else {}),
             },
             "notes": ["This event history is append-only from actual model turns and tool results.", "No predefined plan, source strategy, or execution mode is recorded or used."],
@@ -187,10 +172,46 @@ class Orchestrator:
         return f"{(max(numbers) + 1 if numbers else 1):03d}_run_{goal_slug(goal)}"
 
 
-def _agent_objective(goal: str, evaluator_name: Optional[str]) -> str:
+def _agent_objective(
+    goal: str,
+    evaluator_name: Optional[str],
+    grader_bootstrap: Optional[dict[str, Any]] = None,
+) -> str:
     """Expose evaluator identity as context, never as a prescribed trajectory."""
     context = evaluator_context(evaluator_name)
+    if grader_bootstrap and grader_bootstrap.get("ok"):
+        context = (
+            f"{context}\n\n"
+            "The grader adapter already completed runtime preflight successfully. Do not spend tool calls locating the "
+            "challenge repository or starter file. The exact adapter-resolved baseline and path are supplied below; use "
+            "this public interface to author a complete candidate, then call evaluate_prediction_market_candidate.\n"
+            f"Execution mode: {grader_bootstrap.get('execution_mode')}\n"
+            f"Upstream path: {grader_bootstrap.get('upstream_path')}\n"
+            f"Baseline path: {grader_bootstrap.get('baseline_path')}\n"
+            "Baseline source:\n```python\n"
+            f"{grader_bootstrap.get('baseline_code', '').rstrip()}\n```"
+        )
     return f"{context}\n\nUser request:\n{goal}" if context else goal
+
+
+def _grader_bootstrap_context(identifier: str) -> dict[str, Any]:
+    from optimization_graders import get_optimization_grader
+
+    grader = get_optimization_grader(identifier)
+    preflight = grader.preflight()
+    baselines = grader.registered_baselines()
+    baseline_path = baselines.get("starter_strategy")
+    baseline_code = baseline_path.read_text(encoding="utf-8") if baseline_path and baseline_path.is_file() else ""
+    return {
+        "grader_id": identifier,
+        "ok": bool(preflight.ok),
+        "reason": preflight.reason,
+        "execution_mode": preflight.execution_mode,
+        "docker_sandbox": bool(preflight.docker_sandbox),
+        "upstream_path": preflight.upstream_path,
+        "baseline_path": str(baseline_path) if baseline_path else None,
+        "baseline_code": baseline_code,
+    }
 
 
 def _config_snapshot(config: HarnessConfig) -> dict[str, Any]:

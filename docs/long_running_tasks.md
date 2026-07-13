@@ -19,17 +19,22 @@ outputs/<run>/sources.json
 outputs/<run>/final_report.md
 ```
 
-## Prediction-market status
+## Prediction-market optimization
 
-The deterministic prediction-market evaluator and challenge utilities remain in the repository, but the single production agent loop does **not yet** expose experiment submission or candidate promotion as tools. Therefore this older command is intentionally unsupported:
+Enable the official prediction-market challenge grader with `--grader`; `--grader-loops` requests the number of official candidate evaluations:
 
-The older task-mode selector is intentionally unsupported.
+```bash
+./autore "Optimize the prediction-market challenge with literature-guided market making." \
+  --grader \
+  --grader-loops 6 \
+  --max-iterations 20
+```
 
-Do not expect `autore` to optimize a strategy or claim a profit target from `--evaluator prediction_market` until the controlled `ExperimentSystem` tools are implemented. The next architecture step is to expose evaluator inspection, experiment proposal, submission, result inspection, and comparison to the same `ResearchAgent`; evaluator execution and promotion remain deterministic and model-independent.
+The model controls research and candidate revisions. The registered grader is the only scoring authority, and an unavailable grader produces an error rather than a fabricated score.
 
 ## Resuming work
 
-Runs are durable but not yet resumable from an existing event stream. Use the prior run’s report, sources, event log, and failed paths as context for a new goal. Explicit checkpoint/resume support is tracked in [TODO.md](../TODO.md).
+Runs are durable but not yet resumable from an existing event stream. New runs do not automatically ingest previous reports, sources, event logs, or failed paths. Explicit checkpoint/resume support is tracked in [TODO.md](../TODO.md).
 
 ## Parallelism
 

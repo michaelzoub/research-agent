@@ -18,7 +18,6 @@ TOOL_SOURCE_FAMILIES = {
     "github_repo_search": "github",
     "local_corpus_search": "local",
     "openalex_api_search": "openalex",
-    "prior_artifact_memory_search": "memory",
     "semantic_scholar_api_search": "semantic_scholar",
     "social_web_search": "social",
     "web_search": "web",

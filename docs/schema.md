@@ -105,16 +105,9 @@ and observability indexes behind `ArtifactStore`.
 
 ## runs
 
-`task_mode` and `product_agent` remain nullable compatibility fields for
-historical deterministic utility artifacts. A production model-directed run does
-not select either field; its authoritative trajectory is `agent_events.jsonl`
-and `run_state.json`.
-
 - `id`
 - `user_goal`
 - `task_type`
-- `task_mode`
-- `product_agent`
 - `started_at`
 - `completed_at`
 - `status`
@@ -158,18 +151,8 @@ and `run_state.json`.
 - `components`
 - `failure_taxonomy`
 - `localized_components`
-- `prior_run_comparison`
 - `score_patterns`
 - `trace_patterns`
-
-## task_ingestion_decisions
-
-- `id`
-- `requested_mode`
-- `selected_mode`
-- `product_agent`
-- `evaluator_name`
-- `reason`
 
 ## Optimization artifacts
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -69,6 +70,8 @@ class ModelToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    raw_arguments: Optional[str] = None
+    argument_error: Optional[str] = None
 
 
 @dataclass
@@ -226,10 +229,13 @@ class LLMClient:
         try:
             if not self.is_live:
                 raise LLMError("A live provider with native tool calling is required for this run.")
+            _validate_tool_history(messages)
             if self.provider == "anthropic":
                 turn = self._anthropic_turn(messages, tools, max_output_tokens=max_output_tokens, temperature=temperature)
             elif self.provider == "ollama":
                 turn = self._ollama_turn(messages, tools, max_output_tokens=max_output_tokens, temperature=temperature)
+            elif self.provider == "kimi":
+                turn = self._kimi_turn(messages, tools, max_output_tokens=max_output_tokens)
             else:
                 turn = self._openai_turn(messages, tools, max_output_tokens=max_output_tokens, temperature=temperature)
             turn.cost = self._response_cost(LLMResponse("", turn.model, turn.provider, turn.prompt_tokens, turn.completion_tokens))
@@ -251,28 +257,72 @@ class LLMClient:
             self.provider, self.model = stored_provider, stored_model
 
     def _openai_turn(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]], *, max_output_tokens: int, temperature: float) -> ModelTurn:
+        return self._openai_compatible_turn(
+            messages, tools,
+            endpoint="https://api.openai.com/v1/chat/completions",
+            api_key=self.openai_api_key,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            require_assistant_content=False,
+        )
+
+    def _kimi_turn(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]], *, max_output_tokens: int) -> ModelTurn:
+        """Kimi adapter over the shared OpenAI-compatible transport."""
+        return self._openai_compatible_turn(
+            messages, tools,
+            endpoint="https://api.moonshot.ai/v1/chat/completions",
+            api_key=self.kimi_api_key,
+            # Kimi reasoning tokens and serialized tool arguments share this
+            # budget. Code-bearing calls were repeatedly truncated at 1,200
+            # tokens before their required `code` argument was emitted.
+            max_output_tokens=max(max_output_tokens, 8192),
+            temperature=1,
+            require_assistant_content=True,
+        )
+
+    def _openai_compatible_turn(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        *,
+        endpoint: str,
+        api_key: Optional[str],
+        max_output_tokens: int,
+        temperature: float,
+        require_assistant_content: bool,
+    ) -> ModelTurn:
         payload = {
             "model": self.model,
-            "messages": _openai_history(messages),
+            "messages": _openai_history(messages, require_assistant_content=require_assistant_content),
             "tools": [{"type": "function", "function": {"name": item["name"], "description": item["description"], "parameters": item["input_schema"]}} for item in tools],
             "tool_choice": "auto",
             "max_completion_tokens": max_output_tokens,
             "temperature": temperature,
             **({"seed": self.seed} if self.seed is not None and self.provider in {"openai", "kimi"} else {}),
         }
-        endpoint = "https://api.moonshot.ai/v1/chat/completions" if self.provider == "kimi" else "https://api.openai.com/v1/chat/completions"
-        api_key = self.kimi_api_key if self.provider == "kimi" else self.openai_api_key
         data = _post_json(endpoint, payload, {"Authorization": f"Bearer {api_key}"}, self.timeout_seconds)
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         calls = []
         for item in message.get("tool_calls") or []:
             function = item.get("function") or {}
+            raw_arguments = str(function.get("arguments") or "{}")
+            argument_error = None
             try:
-                arguments = json.loads(function.get("arguments") or "{}")
-            except json.JSONDecodeError:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as exc:
                 arguments = {}
-            calls.append(ModelToolCall(str(item.get("id") or f"call_{len(calls) + 1}"), str(function.get("name") or ""), arguments))
+                argument_error = (
+                    f"Provider returned incomplete or invalid JSON tool arguments: {exc.msg}. "
+                    "Resend the complete tool call arguments."
+                )
+            calls.append(ModelToolCall(
+                str(item.get("id") or f"call_{len(calls) + 1}"),
+                str(function.get("name") or ""),
+                arguments,
+                raw_arguments=raw_arguments,
+                argument_error=argument_error,
+            ))
         usage = data.get("usage") or {}
         return ModelTurn(str(message.get("content") or ""), calls, str(choice.get("finish_reason") or ("tool_calls" if calls else "stop")), str(data.get("model") or self.model), self.provider, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0))
 
@@ -641,26 +691,88 @@ class LLMClient:
 
 
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout_seconds: float) -> dict[str, Any]:
-    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "User-Agent": "research-harness/0.2.0", **headers}, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise LLMError(f"HTTP {exc.code} from model provider: {body[:1000]}") from exc
-    except urllib.error.URLError as exc:
-        raise LLMError(f"Could not reach model provider: {exc.reason}") from exc
+    attempts = max(1, int(os.environ.get("RESEARCH_HARNESS_LLM_ATTEMPTS", "3")))
+    encoded = json.dumps(payload).encode("utf-8")
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(url, data=encoded, headers={"Content-Type": "application/json", "User-Agent": "research-harness/0.2.0", **headers}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            retryable = exc.code in {408, 409, 429} or 500 <= exc.code <= 599
+            if retryable and attempt < attempts:
+                time.sleep(0.5 * (2 ** (attempt - 1)))
+                continue
+            suffix = f" after {attempt} attempt(s)" if retryable else ""
+            raise LLMError(f"HTTP {exc.code} from model provider{suffix}: {body[:1000]}") from exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            if attempt < attempts:
+                time.sleep(0.5 * (2 ** (attempt - 1)))
+                continue
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
+            raise LLMError(f"Could not reach model provider after {attempt} attempt(s): {reason}") from exc
+    raise LLMError("Model provider request failed without a response.")
 
 
-def _openai_history(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+def _validate_tool_history(messages: Sequence[dict[str, Any]]) -> None:
+    """Enforce the tool-call ordering shared by native inference APIs."""
+    pending: set[str] = set()
+    for index, message in enumerate(messages):
+        role = str(message.get("role") or "user")
+        if role == "assistant" and message.get("tool_calls"):
+            if pending:
+                raise LLMError(f"Assistant tool calls at message {index} started before prior tool results completed: {sorted(pending)}")
+            pending = {str(call.get("id") or "") for call in message.get("tool_calls") or []}
+            if "" in pending:
+                raise LLMError(f"Assistant tool call at message {index} is missing an id.")
+            continue
+        if role == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            if call_id not in pending:
+                raise LLMError(f"Tool result at message {index} has no pending matching call id: {call_id or '<empty>'}")
+            pending.remove(call_id)
+            continue
+        if pending:
+            raise LLMError(
+                f"Message {index} with role {role!r} interrupted pending tool results: {sorted(pending)}"
+            )
+    if pending:
+        raise LLMError(f"Conversation ended with pending tool results: {sorted(pending)}")
+
+
+def _openai_history(
+    messages: Sequence[dict[str, Any]], *, require_assistant_content: bool = False
+) -> list[dict[str, Any]]:
     history: list[dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role") or "user")
         if role == "assistant":
             calls = message.get("tool_calls") or []
-            entry: dict[str, Any] = {"role": "assistant", "content": message.get("content") or None}
+            content = message.get("content")
+            # Moonshot's Kimi endpoint rejects every null/empty assistant
+            # content field. This can happen both on a native tool-call turn
+            # and when the output budget is consumed by hidden reasoning
+            # before any visible text is emitted. Preserve the turn boundary
+            # with provider-safe text so the next request can continue.
+            if require_assistant_content and not content:
+                content = (
+                    "Tool calls requested."
+                    if calls
+                    else "The previous response reached its output limit before emitting visible text."
+                )
+            entry: dict[str, Any] = {"role": "assistant", "content": content or None}
             if calls:
-                entry["tool_calls"] = [{"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": json.dumps(call.get("arguments") or {}, sort_keys=True)}} for call in calls]
+                entry["tool_calls"] = [{
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": call.get("raw_arguments")
+                        if isinstance(call.get("raw_arguments"), str)
+                        else json.dumps(call.get("arguments") or {}, sort_keys=True),
+                    },
+                } for call in calls]
             history.append(entry)
         elif role == "tool":
             history.append({"role": "tool", "tool_call_id": message["tool_call_id"], "content": json.dumps(message.get("content") or {}, sort_keys=True, default=str)})

@@ -1,15 +1,28 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from challenges.prediction_market import prediction_market_score
 
-from .llm import LLMClient
-from .schemas import ProductAgent, TaskIngestionDecision, TaskMode
+from ...llm import LLMClient
+from ...schemas import ProductAgent, TaskMode, new_id
 
 
 EvaluatorFn = Callable[[str], object]
+
+
+@dataclass
+class TaskIngestionDecision:
+    """Archived router decision shape; not part of production run state."""
+
+    requested_mode: str
+    selected_mode: TaskMode
+    reason: str
+    evaluator_name: Optional[str] = None
+    product_agent: ProductAgent = "research"
+    id: str = field(default_factory=lambda: new_id("decision"))
 
 
 OPTIMIZE_HINTS = {

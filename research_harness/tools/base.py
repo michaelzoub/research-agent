@@ -14,6 +14,9 @@ class ToolResult:
     source_metadata: Sequence[dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
     retryable: bool = False
+    # True only after the registered tool implementation was entered. Schema,
+    # cancellation, and unknown-tool rejections are not executions.
+    executed: bool = True
 
     def as_message(self) -> dict[str, Any]:
         return {
@@ -32,6 +35,7 @@ class ToolResult:
             ],
             "error": self.error,
             "retryable": self.retryable,
+            "executed": self.executed,
         }
 
 
@@ -68,15 +72,15 @@ class ToolRegistry:
 
     async def execute(self, name: str, arguments: Any, context: ToolContext) -> ToolResult:
         if context.cancelled:
-            return ToolResult("cancelled", error="Tool execution was cancelled.")
+            return ToolResult("cancelled", error="Tool execution was cancelled.", executed=False)
         tool = self._tools.get(name)
         if tool is None:
-            return ToolResult("error", error=f"Unknown tool '{name}'. Select only a registered tool.")
+            return ToolResult("error", error=f"Unknown tool '{name}'. Select only a registered tool.", executed=False)
         if not isinstance(arguments, dict):
-            return ToolResult("error", error="Tool arguments must be a JSON object.")
+            return ToolResult("error", error="Tool arguments must be a JSON object.", executed=False)
         validation_error = _validate_arguments(arguments, tool.input_schema)
         if validation_error:
-            return ToolResult("error", error=validation_error)
+            return ToolResult("error", error=validation_error, executed=False)
         try:
             outcome = tool.execute(arguments, context)
             return await outcome if inspect.isawaitable(outcome) else outcome

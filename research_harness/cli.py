@@ -12,14 +12,17 @@ from importlib import metadata
 from pathlib import Path
 from typing import Callable, Optional
 
+from optimization_graders import list_optimization_graders
+
 from .evals.suites import SUITE_CHOICES
 from .model_catalog import format_model_catalog, model_choices, resolve_model_selection
 from .orchestrator import HarnessConfig, Orchestrator
 from .schemas import AgentBudget
 
 
-RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "twitter", "memory", "alchemy")
+RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "twitter", "alchemy")
 LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "kimi", "ollama", "local", "multi")
+OPTIMIZATION_GRADER_CHOICES = list_optimization_graders()
 
 ANSI = {
     "reset": "\033[0m",
@@ -45,7 +48,7 @@ HELP_EPILOG = """
 Examples:
   autore
   autore "Research how multi-agent systems improve literature review quality"
-  autore "optimize pm challenge" --grader prediction_market
+  autore "optimize pm challenge" --grader --grader-loops 6
 
 Useful companions:
   autore --list-llm-models
@@ -104,11 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Wall-clock limit for the run, including source and figure inspection.",
     )
     parser.add_argument(
-        "--evaluator",
         "--grader",
-        dest="evaluator",
-        default=os.environ.get("RESEARCH_HARNESS_EVALUATOR"),
-        help="Optimization grader/evaluator id. --grader is the preferred spelling; --evaluator remains supported.",
+        dest="grader",
+        nargs="?",
+        const="prediction_market",
+        choices=OPTIMIZATION_GRADER_CHOICES,
+        default=os.environ.get("RESEARCH_HARNESS_GRADER"),
+        help="Enable the official prediction-market grader. An explicit registered id is optional.",
     )
     parser.add_argument(
         "--grader-loops",
@@ -495,6 +500,26 @@ def configure_interactive_run(
         input_func=input_func,
         output_func=output_func,
     )
+    args.grader = prompt_choice(
+        "How should this run be evaluated?",
+        [("", "Research only (no official scorer)"), *[
+            (grader, f"{grader.replace('_', ' ')} (official scorer)")
+            for grader in OPTIMIZATION_GRADER_CHOICES
+        ]],
+        default=args.grader or "",
+        input_func=input_func,
+        output_func=output_func,
+        key_reader=key_reader,
+    ) or None
+    if args.grader:
+        args.grader_loops = prompt_int(
+            "Official candidate evaluations",
+            default=args.grader_loops or 4,
+            input_func=input_func,
+            output_func=output_func,
+        )
+    else:
+        args.grader_loops = None
     args.retriever = prompt_choice(
         "Where should research evidence come from?",
         [
@@ -507,7 +532,6 @@ def configure_interactive_run(
             ("web", "General web"),
             ("docs_blogs", "Docs and blogs"),
             ("twitter", "Twitter/X"),
-            ("memory", "Stored run memory"),
             ("alchemy", "Alchemy blockchain data (requires ALCHEMY_API_KEY)"),
         ],
         default=args.retriever or "auto",
@@ -582,14 +606,14 @@ def main() -> None:
         print("")
     if args.preflight:
         run_preflight_evals(args)
-    if args.grader_loops is not None and args.evaluator is None:
-        parser.error("--grader-loops requires --grader (or --evaluator).")
+    if args.grader_loops is not None and args.grader is None:
+        parser.error("--grader-loops requires --grader.")
     if args.grader_loops is not None and args.grader_loops < 1:
         parser.error("--grader-loops must be at least 1.")
     config = HarnessConfig(
         retriever=args.retriever,
         max_iterations=args.max_iterations,
-        evaluator_name=args.evaluator,
+        evaluator_name=args.grader,
         max_grader_calls=args.grader_loops,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,

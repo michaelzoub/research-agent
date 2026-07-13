@@ -108,9 +108,9 @@ champion.
 
 ## Configuration
 
-`HarnessConfig` is a policy object, not a trajectory selector. It contains retriever availability, model/provider selection, iteration/tool/runtime/cost budgets, approved workspace roots, sessions, output location, and optional evaluator availability.
+`HarnessConfig` is a policy object, not a trajectory selector. It contains retriever availability, model/provider selection, iteration/tool/runtime/cost budgets, approved workspace roots, sessions, output location, and optional grader availability.
 
-The public CLI exposes a goal, retriever availability, model selection, and budgets. It does not expose `--mode`, fixed research phases, or an optimizer-routing choice.
+The public CLI exposes a goal, retriever availability, model selection, budgets, and the current `--grader --grader-loops N` contract. It does not expose `--mode`, `--task-mode`, `--evaluator`, fixed research phases, or an optimizer-routing choice. A new run never scans or registers previous output directories as model evidence.
 
 ## Verification
 

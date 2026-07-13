@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import asyncio
+import io
+import socket
 import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest import mock
 from pathlib import Path
 from typing import Any
 
-from research_harness.cli import build_parser
-from research_harness.llm import ModelToolCall, ModelTurn
+from research_harness.cli import build_parser, configure_interactive_run
+from research_harness.llm import LLMClient, LLMError, ModelToolCall, ModelTurn, _post_json, _validate_tool_history
 from research_harness.agents import SpecialistConsultationTool
 from research_harness.orchestrator import HarnessConfig
 from research_harness.research_agent import AgentRunConfig, FinalAnswerValidator, ResearchAgent, _SYSTEM_INSTRUCTIONS, _join_answer_chunks, _partial_synthesis
@@ -33,6 +36,159 @@ class ScriptedDecider:
 
 
 class ResearchAgentTest(unittest.TestCase):
+    def test_shared_inference_transport_retries_a_transient_timeout(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true}'
+        with mock.patch(
+            "research_harness.llm.urllib.request.urlopen",
+            # macOS system Python 3.9 exposes socket.timeout as OSError rather
+            # than TimeoutError; this is the exact failure seen in run 143.
+            side_effect=[socket.timeout("read timed out"), response],
+        ) as urlopen, mock.patch("research_harness.llm.time.sleep") as sleep:
+            result = _post_json("https://provider.test/v1", {"model": "test"}, {}, 1)
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+
+    def test_shared_inference_transport_does_not_retry_a_bad_request(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://provider.test/v1", 400, "bad request", {}, io.BytesIO(b'invalid payload')
+        )
+        with mock.patch("research_harness.llm.urllib.request.urlopen", side_effect=error) as urlopen:
+            with self.assertRaisesRegex(LLMError, "HTTP 400.*invalid payload"):
+                _post_json("https://provider.test/v1", {"model": "test"}, {}, 1)
+
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_kimi_native_tool_turn_forces_temperature_one(self) -> None:
+        client = LLMClient(provider="kimi", model="kimi/kimi-k2.6", api_key="sk-test")
+        response = {
+            "model": "kimi-k2.6",
+            "choices": [{"finish_reason": "stop", "message": {"content": "Done.", "tool_calls": []}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+        with mock.patch("research_harness.llm._post_json", return_value=response) as post_json:
+            turn = client.complete_turn(
+                [{"role": "user", "content": "Use a tool if needed."}],
+                [],
+                temperature=0.35,
+            )
+
+        self.assertEqual(turn.provider, "kimi")
+        self.assertEqual(post_json.call_args.args[1]["temperature"], 1)
+        self.assertEqual(post_json.call_args.args[1]["max_completion_tokens"], 8192)
+
+    def test_kimi_native_tool_turn_serializes_empty_assistant_tool_call_content(self) -> None:
+        client = LLMClient(provider="kimi", model="kimi/kimi-k2.6", api_key="sk-test")
+        response = {
+            "model": "kimi-k2.6",
+            "choices": [{"finish_reason": "stop", "message": {"content": "Done.", "tool_calls": []}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+        messages = [
+            {"role": "user", "content": "Inspect the challenge."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "name": "read_workspace_file", "arguments": {"path": "challenge.py"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "name": "read_workspace_file", "content": {"status": "ok"}},
+        ]
+        with mock.patch("research_harness.llm._post_json", return_value=response) as post_json:
+            client.complete_turn(messages, [])
+
+        serialized = post_json.call_args.args[1]["messages"]
+        self.assertEqual(serialized[1]["content"], "Tool calls requested.")
+
+    def test_kimi_continuation_serializes_empty_assistant_content(self) -> None:
+        client = LLMClient(provider="kimi", model="kimi/kimi-k2.6", api_key="sk-test")
+        response = {
+            "model": "kimi-k2.6",
+            "choices": [{"finish_reason": "stop", "message": {"content": "Finished.", "tool_calls": []}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+        messages = [
+            {"role": "user", "content": "Write the answer."},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "Continue after the output limit."},
+        ]
+        with mock.patch("research_harness.llm._post_json", return_value=response) as post_json:
+            client.complete_turn(messages, [])
+
+        serialized = post_json.call_args.args[1]["messages"]
+        self.assertEqual(
+            serialized[1]["content"],
+            "The previous response reached its output limit before emitting visible text.",
+        )
+
+    def test_openai_history_does_not_invent_empty_assistant_content(self) -> None:
+        client = LLMClient(provider="openai", model="gpt-4o-mini", api_key="sk-test")
+        response = {
+            "model": "gpt-4o-mini",
+            "choices": [{"finish_reason": "stop", "message": {"content": "Finished.", "tool_calls": []}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+        messages = [
+            {"role": "user", "content": "Write the answer."},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "Continue."},
+        ]
+        with mock.patch("research_harness.llm._post_json", return_value=response) as post_json:
+            client.complete_turn(messages, [])
+
+        self.assertIsNone(post_json.call_args.args[1]["messages"][1]["content"])
+        self.assertEqual(post_json.call_args.args[1]["max_completion_tokens"], 1200)
+
+    def test_incomplete_provider_tool_arguments_are_not_silently_coerced_to_empty(self) -> None:
+        client = LLMClient(provider="openai", model="gpt-4o-mini", api_key="sk-test")
+        response = {
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "tool_calls": [{
+                    "id": "grader_1",
+                    "function": {
+                        "name": "evaluate_prediction_market_candidate",
+                        "arguments": '{"code":',
+                    },
+                }]},
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1200},
+        }
+        with mock.patch("research_harness.llm._post_json", return_value=response):
+            turn = client.complete_turn([{"role": "user", "content": "Evaluate code."}], [])
+
+        self.assertEqual(turn.tool_calls[0].raw_arguments, '{"code":')
+        self.assertIn("incomplete or invalid JSON", turn.tool_calls[0].argument_error or "")
+        self.assertEqual(turn.tool_calls[0].arguments, {})
+
+    def test_native_tool_history_rejects_interleaved_non_tool_message(self) -> None:
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "name": "first", "arguments": {}},
+                {"id": "call_2", "name": "second", "arguments": {}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": {"status": "ok"}},
+            {"role": "user", "content": "Continue optimizing."},
+            {"role": "tool", "tool_call_id": "call_2", "content": {"status": "error"}},
+        ]
+
+        with self.assertRaisesRegex(LLMError, "interrupted pending tool results"):
+            _validate_tool_history(messages)
+
+    def test_native_tool_history_accepts_contiguous_success_and_error_results(self) -> None:
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "name": "first", "arguments": {}},
+                {"id": "call_2", "name": "second", "arguments": {}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": {"status": "ok"}},
+            {"role": "tool", "tool_call_id": "call_2", "content": {"status": "error"}},
+            {"role": "user", "content": "Continue optimizing."},
+        ]
+
+        _validate_tool_history(messages)
+
     def _agent(self, decider: ScriptedDecider) -> ResearchAgent:
         backend = LocalCorpusSearch(Path("examples/corpus/research_corpus.json"))
         return ResearchAgent(decider, ToolRegistry([SearchTool(backend)]), AgentRunConfig(max_iterations=4))
@@ -64,6 +220,22 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertIsNotNone(event.completed_at)
         self.assertGreaterEqual(event.runtime_ms or 0, 5)
         self.assertLess(event.started_at or "", event.completed_at or "")
+
+    def test_model_error_progress_exposes_the_actual_error(self) -> None:
+        class BrokenDecider:
+            def decide(self, _messages: Any, _tools: Any) -> ModelTurn:
+                raise LLMError("provider rejected malformed history")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            result = ResearchAgent(
+                BrokenDecider(), ToolRegistry([]), AgentRunConfig(max_iterations=1)
+            ).run("Test error reporting.", workspace=Path.cwd(), store=store, run_id="error-test")
+            progress = store.progress_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.status, "partial")
+        self.assertIn("error — Model error: LLMError: provider rejected malformed history", progress)
+        self.assertNotIn("unknown/unknown", progress)
 
     def test_prediction_market_evaluation_is_a_model_selected_real_grader_call(self) -> None:
         code = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
@@ -282,11 +454,30 @@ class ResearchAgentTest(unittest.TestCase):
     def test_cli_and_config_have_no_execution_mode(self) -> None:
         parser = build_parser()
         self.assertNotIn("--mode", parser.format_help())
+        self.assertNotIn("--task-mode", parser.format_help())
         self.assertFalse(hasattr(HarnessConfig(), "mode"))
 
-    def test_cli_accepts_optimization_grader_alias(self) -> None:
-        args = build_parser().parse_args(["optimize pm challenge", "--grader", "prediction_market"])
-        self.assertEqual(args.evaluator, "prediction_market")
+    def test_cli_grader_flag_defaults_to_prediction_market(self) -> None:
+        args = build_parser().parse_args(["optimize pm challenge", "--grader", "--grader-loops", "6"])
+        self.assertEqual(args.grader, "prediction_market")
+        self.assertEqual(args.grader_loops, 6)
+        self.assertNotIn("--evaluator", build_parser().format_help())
+        retriever_action = next(action for action in build_parser()._actions if action.dest == "retriever")
+        self.assertNotIn("memory", retriever_action.choices or ())
+
+    def test_guided_cli_can_select_an_official_grader(self) -> None:
+        args = build_parser().parse_args([])
+        answers = iter(["Optimize the PM challenge.", "2", "3", "", "", ""])
+
+        configured = configure_interactive_run(
+            args,
+            input_func=lambda _prompt: next(answers),
+            output_func=lambda _text: None,
+            key_reader=None,
+        )
+
+        self.assertEqual(configured.grader, "prediction_market")
+        self.assertEqual(configured.grader_loops, 3)
 
     def test_cli_accepts_a_separate_grader_loop_limit(self) -> None:
         args = build_parser().parse_args(["optimize pm challenge", "--grader", "prediction_market", "--grader-loops", "3"])
@@ -319,6 +510,56 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual([call["status"] for call in result.tool_calls], ["ok", "skipped"])
         self.assertIn("--grader-loops=1", result.tool_calls[1]["error"])
 
+    def test_grader_run_nudges_zero_execution_wandering_after_one_turn(self) -> None:
+        class NoopTool:
+            name = "inspect_context"
+            description = "inspect context"
+            is_read_only = True
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"inspected": True})
+
+        class GraderTool(NoopTool):
+            name = "evaluate_prediction_market_candidate"
+            is_read_only = False
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"official_measured": True, "mean_edge": 1.0})
+
+        decider = ScriptedDecider([
+            {"type": "tool_call", "tool_name": "inspect_context", "arguments": {}},
+            {"type": "tool_call", "tool_name": "evaluate_prediction_market_candidate", "arguments": {}},
+            {"type": "final", "answer": "The candidate was officially measured."},
+        ])
+        result = ResearchAgent(
+            decider,
+            ToolRegistry([NoopTool(), GraderTool()]),
+            AgentRunConfig(max_iterations=3, max_grader_calls=1),
+        ).run("Adapter baseline is already available.", workspace=Path.cwd())
+
+        second_turn_messages = decider.observed_messages[1]
+        nudges = [
+            message["content"] for message in second_turn_messages
+            if message["role"] == "user" and "zero grader attempts" in str(message.get("content"))
+        ]
+        self.assertEqual(len(nudges), 1)
+        self.assertIn("Stop trying to locate challenge files", nudges[0])
+        self.assertTrue(result.tool_calls[1]["official_measured"])
+        self.assertEqual(result.status, "completed")
+
+    def test_non_grader_run_never_receives_a_grader_action_nudge(self) -> None:
+        decider = ScriptedDecider([{"type": "final", "answer": "Done."}])
+        result = ResearchAgent(decider, ToolRegistry([]), AgentRunConfig(max_iterations=1)).run(
+            "Rewrite this.", workspace=Path.cwd()
+        )
+
+        self.assertFalse(any(
+            "zero grader attempts" in str(message.get("content"))
+            for messages in decider.observed_messages for message in messages
+        ))
+        self.assertEqual(result.status, "completed")
+
     def test_requested_grader_trials_keep_the_model_in_the_feedback_loop(self) -> None:
         class NegativeGrader:
             name = "evaluate_prediction_market_candidate"
@@ -344,6 +585,30 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertIn("non-positive (-0.25)", feedback["content"])
         self.assertIn("1 requested official evaluation", feedback["content"])
         self.assertIn("fresh, high-relevance evidence", feedback["content"])
+
+    def test_completed_grader_budget_tells_model_to_finish_without_extra_trials(self) -> None:
+        class Grader:
+            name = "evaluate_prediction_market_candidate"
+            description = "test grader"
+            is_read_only = False
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"official_measured": True, "mean_edge": 1.0})
+
+        decider = ScriptedDecider([
+            {"type": "tool_call", "tool_name": "evaluate_prediction_market_candidate", "arguments": {}},
+            {"type": "final", "answer": "The requested candidate was measured."},
+        ])
+        result = ResearchAgent(
+            decider, ToolRegistry([Grader()]), AgentRunConfig(max_iterations=2, max_grader_calls=1)
+        ).run("Optimize the challenge.", workspace=Path.cwd())
+
+        completion_guidance = decider.observed_messages[1][-1]
+        self.assertEqual(completion_guidance["role"], "user")
+        self.assertIn("All requested official evaluations are complete", completion_guidance["content"])
+        self.assertIn("Do not call evaluate_prediction_market_candidate again", completion_guidance["content"])
+        self.assertEqual(result.status, "completed")
 
     def test_optimizer_system_prompt_requires_fresh_failure_specific_evidence(self) -> None:
         self.assertIn("after every scorer observation", _SYSTEM_INSTRUCTIONS)
@@ -443,7 +708,100 @@ class ResearchAgentTest(unittest.TestCase):
 
         self.assertEqual(result.final_answer, "Measured the requested candidate.")
         self.assertEqual([call["status"] for call in result.tool_calls], ["ok"])
-        self.assertIn("Do not finalize while 1 requested official evaluation", decider.observed_messages[1][-1]["content"])
+        self.assertTrue(any(
+            "Do not finalize while 1 requested official evaluation" in str(message.get("content"))
+            for message in decider.observed_messages[1]
+        ))
+
+    def test_schema_rejected_grader_call_does_not_consume_measured_trial_budget(self) -> None:
+        class Grader:
+            name = "evaluate_prediction_market_candidate"
+            description = "test grader"
+            is_read_only = False
+            input_schema = {
+                "type": "object",
+                "required": ["code"],
+                "properties": {"code": {"type": "string", "minLength": 5}},
+                "additionalProperties": False,
+            }
+
+            def __init__(self) -> None:
+                self.executions = 0
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                self.executions += 1
+                return ToolResult("ok", {"official_measured": True, "mean_edge": 1.0})
+
+        grader = Grader()
+        decider = ScriptedDecider([
+            {"type": "tool_call", "tool_name": grader.name, "arguments": {}},
+            {"type": "tool_call", "tool_name": grader.name, "arguments": {"code": "class Strategy: pass"}},
+            {"type": "final", "answer": "One candidate was officially measured."},
+        ])
+        result = ResearchAgent(
+            decider, ToolRegistry([grader]), AgentRunConfig(max_iterations=3, max_grader_calls=1)
+        ).run("Optimize the challenge.", workspace=Path.cwd())
+
+        self.assertEqual([call["status"] for call in result.tool_calls], ["error", "ok"])
+        self.assertEqual([call["executed"] for call in result.tool_calls], [False, True])
+        self.assertEqual([call["official_measured"] for call in result.tool_calls], [False, True])
+        self.assertEqual(grader.executions, 1)
+        self.assertEqual(result.status, "completed")
+
+    def test_grader_guidance_never_interrupts_a_later_parallel_tool_result_batch(self) -> None:
+        class Tool:
+            description = "test tool"
+            is_read_only = True
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            def __init__(self, name: str):
+                self.name = name
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"tool": self.name})
+
+        class Grader(Tool):
+            is_read_only = False
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"mean_edge": -1.0})
+
+        class NativeScript:
+            def __init__(self) -> None:
+                self.observed_messages: list[list[dict[str, Any]]] = []
+                self.turns = [
+                    ModelTurn("", [ModelToolCall("grader_1", "evaluate_prediction_market_candidate", {})], "tool_calls", "test", "test"),
+                    ModelTurn("", [ModelToolCall("search_1", "search_one", {}), ModelToolCall("search_2", "search_two", {})], "tool_calls", "test", "test"),
+                    ModelTurn("", [ModelToolCall("grader_2", "evaluate_prediction_market_candidate", {})], "tool_calls", "test", "test"),
+                    ModelTurn("Measured both candidates.", [], "stop", "test", "test"),
+                ]
+
+            def decide(self, messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> ModelTurn:
+                self.observed_messages.append(list(messages))
+                return self.turns.pop(0)
+
+        decider = NativeScript()
+        result = ResearchAgent(
+            decider,
+            ToolRegistry([Grader("evaluate_prediction_market_candidate"), Tool("search_one"), Tool("search_two")]),
+            AgentRunConfig(max_iterations=4, max_grader_calls=2),
+        ).run("Optimize the challenge.", workspace=Path.cwd())
+
+        messages_before_second_grader = decider.observed_messages[2]
+        parallel_call_index = next(
+            index for index, message in enumerate(messages_before_second_grader)
+            if [call["id"] for call in message.get("tool_calls") or []] == ["search_1", "search_2"]
+        )
+        self.assertEqual(
+            [message["role"] for message in messages_before_second_grader[parallel_call_index:parallel_call_index + 3]],
+            ["assistant", "tool", "tool"],
+        )
+        followups = [
+            message for message in messages_before_second_grader
+            if message["role"] == "user" and "requested official evaluation(s) remain" in str(message.get("content"))
+        ]
+        self.assertEqual(len(followups), 1)
+        self.assertEqual(result.status, "completed")
 
     def test_multiple_read_only_model_requested_tools_run_concurrently(self) -> None:
         class DelayedTool:

@@ -43,6 +43,7 @@ class AgentRunConfig:
     source_refresh_nudge_after_iterations: int = 5
     max_cost_usd: Optional[float] = None
     max_runtime_seconds: float = 300.0
+    grader_action_nudge_after_iterations: int = 1
 
 
 @dataclass
@@ -124,11 +125,31 @@ class AgentLoop:
         source_urls: set[str] = set()
         turns_without_new_sources = 0
         draft_text: list[str] = []
+        grader_action_nudge_sent = False
         started, cost_before = time.monotonic(), _decider_cost(self.decider)
         for iteration in range(1, self.config.max_iterations + 1):
             termination = self._budget_termination(started, cost_before, context)
             if termination:
                 return self._partial(termination, messages, calls, events, sources, context=context)
+            if (
+                self.config.max_grader_calls
+                and not grader_action_nudge_sent
+                and iteration > self.config.grader_action_nudge_after_iterations
+                and not any(call["tool"] == "evaluate_prediction_market_candidate" for call in calls)
+            ):
+                grader_action_nudge_sent = True
+                nudge = (
+                    f"Runtime observation: --grader-loops requested {self.config.max_grader_calls} official evaluation(s), "
+                    f"but {iteration - 1} model turns completed with zero grader attempts. The CLI already preflighted the "
+                    "official scorer and supplied its adapter-resolved baseline in the objective. Stop trying to locate challenge "
+                    "files or inspect harness internals. Use the evidence gathered so far to author a complete Strategy and call "
+                    "evaluate_prediction_market_candidate now."
+                )
+                messages.append({"role": "user", "content": nudge})
+                self._record_event(events, context, AgentEvent(
+                    len(events) + 1, "grader_action_nudge", "harness",
+                    observation={"turns_without_grader_attempt": iteration - 1, "requested_evaluations": self.config.max_grader_calls},
+                ))
             nudge_interval = max(1, self.config.source_refresh_nudge_after_iterations)
             if turns_without_new_sources and turns_without_new_sources % nudge_interval == 0:
                 nudge = (
@@ -189,7 +210,10 @@ class AgentLoop:
                 selected_calls = turn.tool_calls[:remaining]
                 skipped_calls = turn.tool_calls[remaining:]
                 if self.config.max_grader_calls is not None:
-                    grader_used = sum(call["tool"] == "evaluate_prediction_market_candidate" for call in calls)
+                    grader_used = sum(
+                        call["tool"] == "evaluate_prediction_market_candidate" and call.get("official_measured", False)
+                        for call in calls
+                    )
                     allowed_grader_calls = max(0, self.config.max_grader_calls - grader_used)
                     constrained_calls = []
                     grader_skipped = []
@@ -207,13 +231,22 @@ class AgentLoop:
                 # tool response so the next provider request is valid.
                 assistant = {"role": "assistant", "content": turn.text, "tool_calls": [asdict(call) for call in turn.tool_calls]}
                 messages.append(assistant)
+                post_tool_messages: list[str] = []
                 for call in selected_calls:
                     self._record_event(events, context, AgentEvent(
                         len(events) + 1, "tool_requested", "model", tool_name=call.name,
                         tool_call_id=call.id, arguments=call.arguments,
                         decision_summary=_public_decision_summary(turn),
                     ))
-                results = await self.registry.execute_many([(call.name, call.arguments) for call in selected_calls], context)
+                executable_calls = [call for call in selected_calls if not call.argument_error]
+                executable_results = iter(await self.registry.execute_many(
+                    [(call.name, call.arguments) for call in executable_calls], context
+                ))
+                results = [
+                    ToolResult("error", error=call.argument_error, executed=False)
+                    if call.argument_error else next(executable_results)
+                    for call in selected_calls
+                ]
                 for call, result in zip(selected_calls, results):
                     # Tools are allowed to run in parallel, but store mutation
                     # happens here in deterministic model-call order.  A search
@@ -222,11 +255,22 @@ class AgentLoop:
                     if result.status == "ok" and context.store is not None and committed_sources:
                         committed_sources = context.store.commit_tool_sources([dict(source) for source in committed_sources])
                     recorded_result = ToolResult(
-                        result.status, result.data, committed_sources, result.error, result.retryable
+                        result.status, result.data, committed_sources, result.error, result.retryable, result.executed
                     )
                     observation = recorded_result.as_message()
                     messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": observation})
-                    calls.append({"iteration": iteration, "id": call.id, "tool": call.name, "arguments": call.arguments, "status": result.status, "error": result.error, "retryable": result.retryable, "results": len(committed_sources)})
+                    calls.append({
+                        "iteration": iteration, "id": call.id, "tool": call.name,
+                        "arguments": call.arguments, "status": result.status, "error": result.error,
+                        "retryable": result.retryable, "results": len(committed_sources),
+                        "executed": result.executed,
+                        "official_measured": bool(
+                            call.name == "evaluate_prediction_market_candidate"
+                            and result.status == "ok"
+                            and isinstance(result.data, dict)
+                            and result.data.get("official_measured", True)
+                        ),
+                    })
                     self._record_event(events, context, AgentEvent(len(events) + 1, "tool_result", "tool", tool_name=call.name, tool_call_id=call.id, arguments=call.arguments, result_status=result.status, observation=observation, error=result.error))
                     for source in committed_sources:
                         url = _canonical_citation_url(str(source.get("url") or ""))
@@ -234,14 +278,15 @@ class AgentLoop:
                             source_urls.add(url)
                             iteration_added_source = True
                     sources.extend(committed_sources)
-                    continuation = self._grader_continuation(recorded_result, calls)
-                    if continuation:
-                        # Make the requested evaluation budget visible after
-                        # every real scorer observation.  Without this, a
-                        # model can read a disappointing score and decide to
-                        # finish even though the user explicitly requested
-                        # more optimization trials.
-                        messages.append({"role": "user", "content": continuation})
+                    if call.name == "evaluate_prediction_market_candidate":
+                        continuation = self._grader_continuation(recorded_result, calls)
+                        if continuation:
+                            # Queue harness guidance until every result for
+                            # this assistant tool-call batch has been emitted.
+                            # Native inference APIs require those tool results
+                            # to be contiguous and immediately follow the
+                            # assistant message.
+                            post_tool_messages.append(continuation)
                 for call in skipped_calls:
                     grader_limit = call.name == "evaluate_prediction_market_candidate" and self.config.max_grader_calls is not None
                     observation = ToolResult(
@@ -250,10 +295,12 @@ class AgentLoop:
                             f"Grader call was not executed because --grader-loops={self.config.max_grader_calls} was exhausted."
                             if grader_limit else "Tool call was not executed because the external-tool budget was exhausted."
                         ),
+                        executed=False,
                     ).as_message()
                     messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": observation})
-                    calls.append({"iteration": iteration, "id": call.id, "tool": call.name, "arguments": call.arguments, "status": "skipped", "error": observation["error"], "retryable": False, "results": 0})
+                    calls.append({"iteration": iteration, "id": call.id, "tool": call.name, "arguments": call.arguments, "status": "skipped", "error": observation["error"], "retryable": False, "results": 0, "executed": False, "official_measured": False})
                     self._record_event(events, context, AgentEvent(len(events) + 1, "tool_result", "runtime", tool_name=call.name, tool_call_id=call.id, arguments=call.arguments, result_status="skipped", observation=observation, error=observation["error"]))
+                messages.extend({"role": "user", "content": content} for content in post_tool_messages)
                 if skipped_calls:
                     messages.append({"role": "user", "content": "The successful-evidence tool budget is exhausted. Use only evidence already returned and provide a grounded final answer, or state that evidence is insufficient."})
                 turns_without_new_sources = 0 if iteration_added_source else turns_without_new_sources + 1
@@ -292,11 +339,14 @@ class AgentLoop:
         if context.store is not None:
             context.store.append_agent_event(asdict(event))
             if event.event_type == "model_turn":
-                turn = event.model_turn or {}
-                context.store.append_progress(
-                    f"Model turn {event.sequence}: {turn.get('provider', 'unknown')}/{turn.get('model', 'unknown')} "
-                    f"stop={turn.get('stop_reason', 'unknown')} tool_calls={len(turn.get('tool_calls') or [])}"
-                )
+                if event.result_status == "error":
+                    context.store.append_progress(f"Model turn {event.sequence}: error — {event.error or 'unknown model error'}")
+                else:
+                    turn = event.model_turn or {}
+                    context.store.append_progress(
+                        f"Model turn {event.sequence}: {turn.get('provider', 'unknown')}/{turn.get('model', 'unknown')} "
+                        f"stop={turn.get('stop_reason', 'unknown')} tool_calls={len(turn.get('tool_calls') or [])}"
+                    )
             elif event.event_type == "model_request":
                 context.store.append_progress(
                     f"Model request {event.model_call_id}: messages={event.observation.get('message_count', 0) if event.observation else 0} "
@@ -347,12 +397,19 @@ class AgentLoop:
     def _grader_continuation(self, result: ToolResult, calls: Sequence[dict[str, Any]]) -> Optional[str]:
         if self.config.max_grader_calls is None:
             return None
+        if result.status != "ok":
+            return None
         measured = [call for call in calls if call["tool"] == "evaluate_prediction_market_candidate" and call["status"] == "ok"]
         if not measured:
             return None
         remaining = self.config.max_grader_calls - len(measured)
         if remaining <= 0:
-            return None
+            return (
+                "All requested official evaluations are complete. Do not call evaluate_prediction_market_candidate again: "
+                "the runtime will reject extra attempts. If the user requested external evidence, fetch only the primary source(s) "
+                "still needed to support the conclusion, then synthesize the measured result and finish. Do not inspect harness "
+                "internals or continue broad discovery."
+            )
         data = result.data if isinstance(result.data, dict) else {}
         edge = data.get("mean_edge")
         try:
@@ -379,9 +436,9 @@ class AgentLoop:
         # A scorer error is a genuine blocker, not an invitation to turn an
         # unavailable evaluator into an infinite retry loop.
         grader_calls = [call for call in calls if call["tool"] == "evaluate_prediction_market_candidate"]
-        if any(call["status"] == "error" for call in grader_calls):
+        if any(call["status"] == "error" and call.get("executed", True) for call in grader_calls):
             return 0
-        completed = sum(call["status"] == "ok" for call in grader_calls)
+        completed = sum(call.get("official_measured", call["status"] == "ok") for call in grader_calls)
         return max(0, self.config.max_grader_calls - completed)
 
 

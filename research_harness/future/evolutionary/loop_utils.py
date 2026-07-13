@@ -5,8 +5,8 @@ import re
 import time
 from typing import Optional
 
-from .schemas import AgentTrace, VariantEvaluation
-from .store import ArtifactStore
+from ...schemas import AgentTrace, VariantEvaluation
+from ...store import ArtifactStore
 
 
 CONTEXT_STOPWORDS = {

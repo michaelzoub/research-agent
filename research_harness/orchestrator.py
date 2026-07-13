@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from .llm import LLMClient
+from .loop_routing import EvaluatorRegistry, TaskRouter
 from .research_agent import AgentRunConfig, ResearchAgent
 from .schemas import AgentBudget, CostEvent, RunRecord, now_iso, to_dict
 from .search import AlchemySearch, ArxivSearch, DocsBlogsSearch, GitHubSearch, LocalCorpusSearch, OpenAlexSearch, PriorArtifactMemorySearch, SearchBackend, SemanticScholarSearch, SocialWebSearch, WebSearch, WikipediaSearch
 from .sessions import SessionStore, default_session_projects_dir
 from .store import ArtifactStore
+from .tools import evaluator_context
 from .run_visuals import write_research_run_visuals
 
 
@@ -25,8 +27,10 @@ class HarnessConfig:
     retriever: str = "auto"
     max_iterations: int = 20
     evaluator_name: Optional[str] = None
+    max_grader_calls: Optional[int] = None
     llm_provider: str = "auto"
     llm_model: str = "gpt-5.2"
+    llm_seed: Optional[int] = None
     session_projects_dir: Optional[Path] = None
     resume_session_id: Optional[str] = None
     fork_session_id: Optional[str] = None
@@ -43,7 +47,7 @@ class Orchestrator:
         self.corpus_path = corpus_path
         self.output_root = output_root
         self.config = config or HarnessConfig()
-        self.llm = LLMClient(provider=self.config.llm_provider, model=self.config.llm_model)
+        self.llm = LLMClient(provider=self.config.llm_provider, model=self.config.llm_model, seed=self.config.llm_seed)
         if self.config.llm_provider in {"openai", "anthropic"} and not self.llm.is_live:
             raise ValueError(f"--llm-provider {self.config.llm_provider} requires configured credentials.")
 
@@ -60,13 +64,19 @@ class Orchestrator:
         store.append_progress(f"Starting model-directed run {run.id}")
         store.append_progress(f"Goal: {goal}")
         self._write_run_state(store, run, prior_memory, stage="started")
-        agent = ResearchAgent.with_research_tools(
-            self.llm,
-            [self._retriever_for(name) for name in self._enabled_retrievers()],
-            AgentRunConfig(max_iterations=self.config.max_iterations, max_tool_calls=self.config.default_budget.max_tool_calls, max_runtime_seconds=self.config.default_budget.max_runtime_seconds, max_cost_usd=self.config.max_cost_usd),
-        )
         try:
-            result = await agent.arun(goal, workspace=Path.cwd(), readable_roots=list(self.config.workspace_roots or (Path.cwd(),)), store=store, run_id=run.id)
+            decision = self._optimization_decision(goal)
+            if decision is not None:
+                store.add_task_ingestion_decision(decision)
+                store.append_progress(f"Evaluator configured ({decision.evaluator_name}); retaining the model-directed base loop.")
+            agent_objective = _agent_objective(goal, self.config.evaluator_name)
+            agent = ResearchAgent.with_research_tools(
+                self.llm,
+                [self._retriever_for(name) for name in self._enabled_retrievers()],
+                AgentRunConfig(max_iterations=self.config.max_iterations, max_tool_calls=self.config.default_budget.max_tool_calls, max_grader_calls=self.config.max_grader_calls, max_runtime_seconds=self.config.default_budget.max_runtime_seconds, max_cost_usd=self.config.max_cost_usd),
+                evaluator_name=self.config.evaluator_name,
+            )
+            result = await agent.arun(agent_objective, workspace=Path.cwd(), readable_roots=list(self.config.workspace_roots or (Path.cwd(),)), store=store, run_id=run.id)
             run.status = result.status if result.status in {"completed", "needs_input", "partial", "budget_exhausted", "cancelled", "safety_stopped", "failed"} else "failed"
             write_research_run_visuals(store, result.events)
             store.append_progress(f"Agent termination: {result.termination_reason}")
@@ -87,6 +97,13 @@ class Orchestrator:
             if session_store is not None:
                 session_store.complete_session(status=run.status, summary=f"Run {run.id} {run.status}.")
         return run, store
+
+    def _optimization_decision(self, goal: str):
+        if not self.config.evaluator_name:
+            return None
+        registry = EvaluatorRegistry()
+        decision = TaskRouter(registry, self.llm).decide(goal, evaluator_name=self.config.evaluator_name)
+        return decision if decision.selected_mode in {"optimize", "optimize_query"} and decision.evaluator_name else None
 
     def load_prior_run_memory(self, goal: str, limit: int = 6) -> dict[str, Any]:
         matches: list[dict[str, Any]] = []
@@ -133,7 +150,7 @@ class Orchestrator:
                 transcript = {}
         store.write_run_state({
             "schema_version": "model_directed_run_state_v1", "stage": stage, "run": to_dict(run), "goal": run.user_goal,
-            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal", "consult_specialist"],
+            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal", "consult_specialist"] + (["evaluate_prediction_market_candidate", "spawn_optimization_agents", "run_parameter_sweep", "save_learning"] if self.config.evaluator_name == "prediction_market" else []),
             "prior_relevant_memory": {"checked_run_count": prior_memory.get("checked_run_count", 0), "relevant_run_count": len(prior_memory.get("relevant_trajectories", []))},
             "observed_counts": {"events": len(transcript.get("events", [])), "messages": len(transcript.get("messages", [])), "tool_calls": len(transcript.get("tool_calls", []))},
             "termination": transcript.get("termination_reason"),
@@ -142,6 +159,8 @@ class Orchestrator:
                 "event_log": str(store.agent_event_log_path),
                 "final_report": str(store.report_path),
                 "cost": str(store.cost_path),
+                "learnings": str(store.learnings_path),
+                "learning_log": str(store.learning_log_path),
                 **({"agent_timeline": str(store.agent_timeline_path), "champion_tree": str(store.champion_tree_path)} if store.agent_timeline_path.exists() and store.champion_tree_path.exists() else {}),
             },
             "notes": ["This event history is append-only from actual model turns and tool results.", "No predefined plan, source strategy, or execution mode is recorded or used."],
@@ -166,6 +185,12 @@ class Orchestrator:
         self.output_root.mkdir(parents=True, exist_ok=True)
         numbers = [int(match.group(1)) for path in self.output_root.iterdir() if (match := re.match(r"^(\d+)_run_", path.name))]
         return f"{(max(numbers) + 1 if numbers else 1):03d}_run_{goal_slug(goal)}"
+
+
+def _agent_objective(goal: str, evaluator_name: Optional[str]) -> str:
+    """Expose evaluator identity as context, never as a prescribed trajectory."""
+    context = evaluator_context(evaluator_name)
+    return f"{context}\n\nUser request:\n{goal}" if context else goal
 
 
 def _config_snapshot(config: HarnessConfig) -> dict[str, Any]:

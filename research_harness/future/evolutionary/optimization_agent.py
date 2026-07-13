@@ -6,9 +6,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
-from .llm import LLMClient
-from .schemas import AgentTrace, now_iso
-from .store import ArtifactStore
+from ...llm import LLMClient
+from ...schemas import AgentTrace, now_iso
+from ...store import ArtifactStore
 
 
 @dataclass
@@ -30,6 +30,7 @@ class OptimizerControllerResult:
     reflection: str
     mechanism_change_required: bool
     literature_required: bool
+    continue_running: bool
     prompt_context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -115,6 +116,7 @@ class OptimizationAgent:
             reflection=str(decision.get("failure_reflection") or strategy.get("failure_reflection") or ""),
             mechanism_change_required=bool(decision.get("mechanism_change_required", True)),
             literature_required=bool(decision.get("fetch_literature", False)),
+            continue_running=bool(decision.get("continue_running", False)),
             prompt_context={
                 "controller": "OptimizationAgent",
                 "role_contract": self.ROLE_CONTRACT,
@@ -125,6 +127,7 @@ class OptimizationAgent:
                 "mechanism_change_required": bool(decision.get("mechanism_change_required", True)),
                 "literature_required": bool(decision.get("fetch_literature", False)),
                 "literature_query": str(decision.get("literature_query") or ""),
+                "continue_running": bool(decision.get("continue_running", False)),
                 "state": state,
             },
         )
@@ -163,7 +166,7 @@ class OptimizationAgent:
                 "You are the controller for an optimization agent in a probabilistic, evidence-driven loop. The human defines tools, environment, state, evaluator, budgets, and safety boundaries; you choose which tools to use, what to investigate, the next action, when evidence is insufficient, and when to stop. Your single goal is to choose the next "
                 "optimization direction needed to improve evaluator score. You do not write "
                 "final code, decide correctness, or perform validation as your own judge. Choose actions from this tool menu only: "
-                f"{', '.join(self.TOOL_NAMES)}. Return JSON with fetch_literature, literature_query, "
+                f"{', '.join(self.TOOL_NAMES)}. Return JSON with continue_running, fetch_literature, literature_query, "
                 "failure_reflection, next_mechanism, and mechanism_change_required. "
                 "Use only context relevant to the next mechanism. If recent mean_edge values are non-positive "
                 "or flat, require a foundational mechanism change."
@@ -182,6 +185,9 @@ class OptimizationAgent:
         flat_or_negative = bool(edges) and max(edges) <= 0.0
         summaries = "; ".join(str(row.get("summary", ""))[:160] for row in failures[:3])
         return {
+            # No live model means no controller decision.  Stop rather than
+            # inventing a deterministic trajectory against the evaluator.
+            "continue_running": False,
             "fetch_literature": flat_or_negative or state.get("round_index", 1) > 1,
             "literature_query": f"{self.goal} mechanism evidence after failures {summaries}".strip(),
             "failure_reflection": summaries or "No prior failures yet; establish a concrete mechanism and evaluator-facing baseline.",

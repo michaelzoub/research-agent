@@ -5,6 +5,7 @@ import json
 import re
 
 from ...store import ArtifactStore
+from ...citation_validation import coverage as citation_coverage, validate_claim_citations
 from ..types import EvalTask, GraderResult
 from .common import _result
 from .dag import dag_grader_result, dag_node, right_wrong, verdict_from_score
@@ -119,28 +120,24 @@ def _grade_report_no_fabricated_sources(task: EvalTask, store: ArtifactStore) ->
     tex_path = getattr(store, "report_tex_path", store.root / "final_report.tex")
     tex = tex_path.read_text(encoding="utf-8") if tex_path.exists() else ""
     sources = store.list("sources")
-    known_urls = {str(s.get("url", "")) for s in sources}
-    report_urls = _cited_report_urls(report, tex)
-    fabricated = []
-    is_prediction_market_task = _is_prediction_market_eval_task(task)
-    for url in report_urls:
-        if url not in known_urls:
-            fabricated.append({"url": url, "reason": "not in sources.json"})
-        elif not is_prediction_market_task and _is_prediction_market_report_url(url):
-            fabricated.append({"url": url, "reason": "prediction-market challenge source in non-challenge report"})
-    if not is_prediction_market_task and _references_prediction_market_challenge(report + "\n" + tex):
-        fabricated.append({"url": "report text", "reason": "prediction-market challenge reference in non-challenge report"})
-    passed = not fabricated
-    score = max(0.0, 1.0 - len(fabricated) * 0.25)
+    checks = validate_claim_citations(report, sources)
+    support_coverage = citation_coverage(checks)
+    unsupported = [check for check in checks if not check.passed]
+    # Report URLs are still checked incidentally by the claim validator, but a
+    # bare URL no longer counts as success: every substantive claim needs a
+    # fetched-document citation with measurable text support.
+    passed = bool(checks) and not unsupported
+    score = support_coverage if checks else 0.0
     return _result(
         "report_no_fabricated_sources",
         "code",
-        "source URL verification",
+        "claim-level citation support and coverage",
         score,
         passed,
         1.0,
-        f"Found {len(fabricated)} fabricated source URL(s) in report out of {len(report_urls)} cited.",
-        [{"check": "no_fabricated_sources", "passed": passed, "fabricated_urls": fabricated}],
+        f"{sum(check.passed for check in checks)}/{len(checks)} substantive report claims have supported fetched-document citations.",
+        [{"check": "claim_citation_coverage", "passed": passed, "coverage": support_coverage,
+          "claims": [{"claim": check.claim, "support": check.support, "passed": check.passed, "reason": check.reason, "locators": check.locators} for check in checks]}],
     )
 
 

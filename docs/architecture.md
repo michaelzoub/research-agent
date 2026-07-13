@@ -1,6 +1,6 @@
 # Research Harness Architecture
 
-`autore` has one production execution architecture: a model-directed agent loop. The model chooses whether to answer, use tools, revise after an observation, request user input, or finish. The harness controls only safety, capability boundaries, budgets, persistence, validation, and deterministic evaluation.
+`autore` has a model-directed research path and a registered-grader optimization path. The model chooses whether to answer, use tools, revise after an observation, request user input, or finish; an optimization grader instead owns candidate scoring and promotion eligibility. The harness controls safety, capability boundaries, budgets, persistence, validation, and deterministic evaluation.
 
 There is no execution-mode flag, plan builder, task router, phase dispatcher, or fixed research sequence in the production path.
 
@@ -22,7 +22,7 @@ flowchart TD
   validator -->|pass| artifacts["Report, state, transcript, cost"]
 ```
 
-`Orchestrator.run(goal)` initializes the run, creates one `ResearchAgent`, awaits it, and persists its actual trajectory. It does not create a research plan or select a runtime architecture.
+`Orchestrator.run(goal)` initializes the run and persists its actual trajectory. It always creates one `ResearchAgent`; a registered optimization grader is exposed as a controlled tool, not a second orchestration path. It does not create a research plan.
 
 ## Model and provider boundary
 
@@ -66,7 +66,7 @@ Every run directory contains:
 
 | Artifact | Meaning |
 | --- | --- |
-| `agent_events.jsonl` | Append-only event stream: model turn, tool request, tool result, validation, and termination. |
+| `agent_events.jsonl` | Append-only event stream: model request/start, model response/end, tool request, tool result, validation, and termination. |
 | `agent_messages.json` | Full provider-neutral conversation and final event snapshot. |
 | `run_state.json` | Current authoritative trajectory snapshot derived from actual events. |
 | `failed_paths.json` | Tool/provider/runtime failures and budget/safety rejections. |
@@ -79,6 +79,32 @@ Every run directory contains:
 ## Deterministic capabilities outside the production path
 
 The repository still contains evaluator, optimization, prediction-market, benchmark, and experiment utilities. They are deterministic capabilities and test fixtures; they are not alternative top-level execution paths. A future agent-facing experiment adapter must preserve the separation: the model may propose or inspect an experiment, but deterministic evaluator and promotion policy own execution and promotion.
+
+## Optimization grader adapters
+
+Candidate-code graders live in `optimization_graders/`; they are separate from
+`research_harness/evals/graders/`, which grades the harness itself. Each
+adapter renders a candidate, invokes the official scorer in a bounded sandbox,
+and normalizes the result. Vendored sources under `challenges/` are read-only:
+the adapter never reimplements their scoring logic.
+
+```mermaid
+flowchart LR
+  preflight["Official sandbox preflight"] -->|unavailable| rejected["Score 0; never promote"]
+  preflight -->|available| candidate["Candidate code"]
+  candidate --> adapter["optimization_graders/<br/>challenge adapter"]
+  adapter --> sandbox["Network-isolated Docker sandbox"]
+  sandbox --> upstream["Read-only vendored upstream scorer"]
+  upstream --> trial["optimization_trials/<br/>code, command, identity, stdout/stderr, score"]
+  trial --> promotion{"official measured<br/>and score eligible?"}
+  promotion -->|yes| champion["Promote candidate"]
+  promotion -->|no| rejected["Score 0; never promote"]
+```
+
+The prediction-market adapter runs official-sandbox preflight before retrieval,
+then invokes the upstream `orderbook-pm` CLI on a fixed seed range. A failure
+or skipped official scorer is recorded with score zero and cannot become a
+champion.
 
 ## Configuration
 

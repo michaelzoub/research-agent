@@ -53,6 +53,10 @@ def _event_row(event: Any) -> dict[str, Any]:
     return {
         "event_type": getattr(event, "event_type", ""),
         "timestamp": getattr(event, "timestamp", ""),
+        "started_at": getattr(event, "started_at", None),
+        "completed_at": getattr(event, "completed_at", None),
+        "runtime_ms": getattr(event, "runtime_ms", None),
+        "model_call_id": getattr(event, "model_call_id", None),
         "tool_call_id": getattr(event, "tool_call_id", None),
         "tool_name": getattr(event, "tool_name", None),
         "result_status": getattr(event, "result_status", None),
@@ -64,7 +68,12 @@ def _event_row(event: Any) -> dict[str, Any]:
 def _timeline_data(store: ArtifactStore, events: list[dict[str, Any]]) -> dict[str, Any]:
     controller_count = max(1, len({str(trace.get("agent_name")) for trace in store.list("agent_traces") if trace.get("agent_name")}))
     timestamped = [(row, _timestamp(row.get("timestamp"))) for row in events]
-    points = [point for _, point in timestamped if point is not None]
+    points = [
+        point
+        for row, point in timestamped
+        for point in (_timestamp(row.get("started_at")), point, _timestamp(row.get("completed_at")))
+        if point is not None
+    ]
     origin = min(points) if points else 0.0
     current_batch = 0
     starts: dict[str, tuple[int, float, str]] = {}
@@ -79,7 +88,15 @@ def _timeline_data(store: ArtifactStore, events: list[dict[str, Any]]) -> dict[s
         if kind == "model_turn":
             current_batch += 1
             model_turn_count += 1
-            controller_spans.append({"label": f"Model turn {model_turn_count}", "start": point, "end": point + 0.18, "kind": "controller"})
+            started_at = _timestamp(row.get("started_at")) or point
+            completed_at = _timestamp(row.get("completed_at")) or point
+            controller_spans.append({
+                "label": f"Model turn {model_turn_count}",
+                "start": started_at,
+                "end": max(started_at + 0.02, completed_at),
+                "kind": "controller",
+                "detail": f"Model request · {int(row.get('runtime_ms') or 0)} ms",
+            })
         elif kind == "tool_requested":
             tool_id = str(row.get("tool_call_id") or f"request_{len(starts)}")
             starts[tool_id] = (current_batch, point, str(row.get("tool_name") or "tool"))

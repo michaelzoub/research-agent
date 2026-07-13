@@ -12,12 +12,16 @@ from html.parser import HTMLParser
 from typing import Any
 
 from ..schemas import Source
+from ..document_ingestion import ingest_document
 from .base import ToolContext, ToolResult
 
 
 class SearchTool:
     """Read-only evidence discovery from one registered backend."""
     is_read_only = True
+    # A discovery hit must be more than a generic-word coincidence before it
+    # becomes persisted evidence that can shape an optimization round.
+    MINIMUM_RETAINED_RELEVANCE = 0.50
 
     def __init__(self, backend: Any):
         self.backend = backend
@@ -28,11 +32,18 @@ class SearchTool:
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         query = str(arguments["query"]).strip()
         documents = await asyncio.to_thread(self.backend.search, query, limit=min(10, max(1, int(arguments.get("limit", 4)))))
-        sources = [self.backend.to_source(document, relevance) for document, relevance in documents]
-        if context.store is not None:
-            sources = [context.store.add_source(source) for source in sources]
+        retained = [
+            (document, relevance)
+            for document, relevance in documents
+            if relevance >= self.MINIMUM_RETAINED_RELEVANCE
+        ]
+        # Search returns discovery leads.  The loop serially commits these after
+        # all parallel calls complete; tools themselves never mutate the store.
+        sources = [self.backend.to_source(document, relevance) for document, relevance in retained]
+        for source in sources:
+            source.evidence_kind = "lead"
         metadata = [asdict(source) for source in sources]
-        return ToolResult("ok", {"query": query, "result_count": len(metadata), "results": [{"title": row["title"], "url": row["url"], "summary": row["summary"]} for row in metadata]}, source_metadata=metadata)
+        return ToolResult("ok", {"query": query, "result_count": len(metadata), "discarded_low_relevance_count": len(documents) - len(retained), "minimum_retained_relevance": self.MINIMUM_RETAINED_RELEVANCE, "results": [{"title": row["title"], "url": row["url"], "summary": row["summary"]} for row in metadata]}, source_metadata=metadata)
 
 
 class WebFetchTool:
@@ -51,6 +62,12 @@ class WebFetchTool:
         if result.status != "ok":
             return result
         data = result.data if isinstance(result.data, dict) else {}
+        ingestion = ingest_document(
+            bytes(data.pop("raw_content", b"")), str(data.get("content_type") or ""), max_characters=self.max_characters
+        )
+        if ingestion.get("error"):
+            return ToolResult("error", error=str(ingestion["error"]))
+        data.update(ingestion)
         source = Source(
             url=str(data.get("url") or requested_url),
             title=f"Fetched document: {str(data.get('url') or requested_url)[:240]}",
@@ -60,9 +77,10 @@ class WebFetchTool:
             summary=str(data.get("content") or "")[:800],
             relevance_score=1.0,
             credibility_score=0.70,
+            evidence_kind="verified_document",
+            evidence_sections=dict(data.get("evidence_sections") or {}),
+            evidence_locators=dict(data.get("evidence_locators") or {}),
         )
-        if context.store is not None:
-            source = context.store.add_source(source)
         return ToolResult("ok", data, source_metadata=[asdict(source)])
 
     def _fetch(self, url: str, prefer_markdown: bool) -> ToolResult:
@@ -85,15 +103,17 @@ class WebFetchTool:
                 return ToolResult("error", error=f"Network error: {exc}", retryable=True)
             with response:
                 content_type = str(response.headers.get("Content-Type") or "")
-                if content_type and not any(kind in content_type.lower() for kind in ("text", "json", "pdf")):
+                if content_type and not any(kind in content_type.lower() for kind in ("text", "json", "pdf", "wordprocessingml", "msword")):
                     return ToolResult("error", error="URL did not return a supported document content type.")
                 raw = response.read(self.max_characters + 1)
+            if "pdf" in content_type.lower() or "wordprocessingml" in content_type.lower() or raw.startswith(b"PK"):
+                return ToolResult("ok", {"url": url, "content_type": content_type, "raw_content": raw, "truncated": len(raw) > self.max_characters, "renderer": "document_parser"})
             text = raw.decode("utf-8", errors="replace")
             if prefer_markdown and "html" in content_type.lower():
                 rendered = self._fetch_curl_markdown(url)
                 if rendered is not None:
-                    return ToolResult("ok", {"url": url, "content_type": "text/markdown", "content": rendered[: self.max_characters], "truncated": len(rendered) > self.max_characters, "renderer": "curl.md"})
-            return ToolResult("ok", {"url": url, "content_type": content_type, "content": text[: self.max_characters], "truncated": len(raw) > self.max_characters, "renderer": "direct"})
+                    return ToolResult("ok", {"url": url, "content_type": "text/markdown", "raw_content": rendered.encode("utf-8"), "truncated": len(rendered) > self.max_characters, "renderer": "curl.md"})
+            return ToolResult("ok", {"url": url, "content_type": content_type, "raw_content": raw, "truncated": len(raw) > self.max_characters, "renderer": "direct"})
         return ToolResult("error", error="Too many redirects.")
 
     def _fetch_curl_markdown(self, url: str) -> str | None:
@@ -150,9 +170,8 @@ class DocumentFigureTool:
             summary="; ".join(str(item.get("caption") or "") for item in data.get("figures", [])[:3])[:800],
             relevance_score=1.0,
             credibility_score=0.72,
+            evidence_kind="verified_document",
         )
-        if context.store is not None:
-            source = context.store.add_source(source)
         sources = [source]
         for index, figure in enumerate(data.get("figures", []), start=1):
             image_url = str(figure.get("image_url") or "")
@@ -168,9 +187,8 @@ class DocumentFigureTool:
                 relevance_score=1.0,
                 credibility_score=0.72,
                 evidence_sections={"source_document": source_url},
+                evidence_kind="verified_document",
             )
-            if context.store is not None:
-                figure_source = context.store.add_source(figure_source)
             sources.append(figure_source)
         return ToolResult("ok", data, source_metadata=[asdict(item) for item in sources])
 

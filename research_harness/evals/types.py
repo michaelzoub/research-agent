@@ -29,6 +29,8 @@ class EvalTask:
     threshold: float = 0.8
     metadata: dict[str, Any] = field(default_factory=dict)
     trials: Optional[int] = None
+    seeds: Optional[list[int]] = None
+    models: Optional[list[str]] = None
 
 
 @dataclass
@@ -45,6 +47,8 @@ class EvalTrial:
     grader_results: list[dict[str, Any]]
     aggregate_score: float
     passed: bool
+    seed: int = 1
+    model: str = "local"
     completed_at: str = field(default_factory=now_iso)
 
 
@@ -57,6 +61,8 @@ class EvalSuite:
     description: str
     tasks: list[EvalTask]
     trials_per_task: int = 1
+    seeds: list[int] = field(default_factory=lambda: [1])
+    models: list[str] = field(default_factory=lambda: ["local"])
 
 
 @dataclass
@@ -71,6 +77,7 @@ class EvalRunSummary:
     passed_trials: int
     aggregate_score: float
     trials: list[dict[str, Any]]
+    comparisons: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

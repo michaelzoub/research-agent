@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 from dataclasses import is_dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -75,6 +76,7 @@ class ArtifactStore:
         sqlite_path: Optional[Path] = None,
     ):
         self.root = root
+        self._write_lock = threading.RLock()
         self.echo_progress = echo_progress
         self.session_store = session_store
         self.root.mkdir(parents=True, exist_ok=True)
@@ -101,6 +103,7 @@ class ArtifactStore:
         self.champion_tree_mermaid_path = self.root / "champion_tree.mmd"
         self.current_champion_path = self.root / "current_champion.json"
         self.optimization_result_path = self.root / "optimization_result.json"
+        self.optimization_trials_dir = self.root / "optimization_trials"
         self.solution_path = self.root / "solution.py"
         self.run_benchmark_path = self.root / "run_benchmark.html"
         self.decision_dag_path = self.root / "decision_dag.png"
@@ -116,13 +119,33 @@ class ArtifactStore:
         self.user_steering_inbox_path = self.root / "user_steering_inbox.jsonl"
         self.user_steering_state_path = self.root / "user_steering_state.json"
         self.progress_path = self.root / "progress.txt"
+        self.learnings_path = self.root / "learnings.md"
+        self.learning_log_path = self.root / "learnings.jsonl"
         if not self.progress_path.exists():
             self.progress_path.write_text("", encoding="utf-8")
         if not self.agent_event_log_path.exists():
             self.agent_event_log_path.write_text("", encoding="utf-8")
+        if not self.learning_log_path.exists():
+            self.learning_log_path.write_text("", encoding="utf-8")
         self._migrate_sqlite()
 
+    def append_learning(self, *, title: str, finding: str, evidence: str, status: str, run_id: str) -> Path:
+        """Persist a controller-selected learning in readable and replayable forms."""
+        payload = {"run_id": run_id, "title": title, "finding": finding, "evidence": evidence, "status": status, "created_at": now_iso()}
+        with self._write_lock:
+            with self.learnings_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"## {title}\n\n{finding}\n\nEvidence: {evidence}\n\nStatus: {status}\n\n")
+            with self.learning_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        self._record_artifact_write(self.learnings_path, "learnings")
+        self._record_artifact_write(self.learning_log_path, "learning_log")
+        return self.learnings_path
+
     def add_source(self, source: Source) -> Source:
+        with self._write_lock:
+            return self._add_source_locked(source)
+
+    def _add_source_locked(self, source: Source) -> Source:
         # Primary dedup: exact URL match.
         existing = self.find_by("sources", "url", source.url)
         if existing:
@@ -137,6 +160,21 @@ class ArtifactStore:
         self._annotate_dedup("sources", source, _canonical_key("sources", to_dict(source)))
         self._append("sources", source)
         return source
+
+    def commit_tool_sources(self, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Commit one completed tool result as an ordered, atomic source batch.
+
+        Network tools may run concurrently, but their completed observations are
+        committed in model call order.  The lock prevents a future background
+        producer from turning read-modify-write JSON collections into lost
+        updates; SQLite mirrors are committed in the same critical section.
+        """
+        committed: list[dict[str, Any]] = []
+        with self._write_lock:
+            for raw in sources:
+                source = Source(**raw)
+                committed.append(to_dict(self._add_source_locked(source)))
+        return committed
 
     def add_claim(self, claim: Claim) -> Claim:
         self._annotate_dedup("claims", claim, _canonical_key("claims", to_dict(claim)))
@@ -478,6 +516,26 @@ class ArtifactStore:
         self._record_artifact_write(self.optimization_result_path, "optimization_result")
         return self.optimization_result_path
 
+    def write_optimization_trial(self, trial_id: str, payload: dict[str, Any]) -> Path:
+        """Persist one immutable candidate-evaluation record for audit and replay."""
+        self.optimization_trials_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", trial_id).strip("._") or "trial"
+        path = self.optimization_trials_dir / f"{safe_id}.json"
+        self._snapshot_before_write(path, "before writing optimization trial")
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+        self._record_artifact_write(path, "optimization_trial")
+        return path
+
+    def write_optimization_trial_code(self, trial_id: str, code: str) -> Path:
+        """Write the evaluator-ready Python artifact beside its trial record."""
+        self.optimization_trials_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", trial_id).strip("._") or "trial"
+        path = self.optimization_trials_dir / f"{safe_id}.py"
+        self._snapshot_before_write(path, "before writing optimization trial code")
+        path.write_text(code, encoding="utf-8")
+        self._record_artifact_write(path, "optimization_trial_code")
+        return path
+
     def write_round_champion(self, round_index: int, payload: dict[str, Any]) -> Path:
         self.champions_dir.mkdir(parents=True, exist_ok=True)
         path = self.champions_dir / f"round_{round_index:03d}_champion.json"
@@ -513,11 +571,12 @@ class ArtifactStore:
         return next((row for row in self.list(entity) if row.get(key) == value), None)
 
     def _append(self, entity: str, value: Any) -> None:
-        rows = self.list(entity)
-        row = to_dict(value) if is_dataclass(value) else value
-        rows.append(row)
-        self._write(entity, rows)
-        self._mirror_to_sqlite(entity, row)
+        with self._write_lock:
+            rows = self.list(entity)
+            row = to_dict(value) if is_dataclass(value) else value
+            rows.append(row)
+            self._write(entity, rows)
+            self._mirror_to_sqlite(entity, row)
 
     def _write(self, entity: str, rows: list[dict[str, Any]]) -> None:
         path = self.root / ENTITY_FILES[entity]

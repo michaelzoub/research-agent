@@ -6,11 +6,10 @@ from typing import Callable, Optional
 from challenges.prediction_market import prediction_market_score
 
 from .llm import LLMClient
-from .loop_evaluators import EvaluatorPayload
 from .schemas import ProductAgent, TaskIngestionDecision, TaskMode
 
 
-EvaluatorFn = Callable[[str], EvaluatorPayload]
+EvaluatorFn = Callable[[str], object]
 
 
 OPTIMIZE_HINTS = {
@@ -58,6 +57,11 @@ class TaskRouter:
     def decide(self, goal: str, requested_mode: str = "auto", evaluator_name: Optional[str] = None) -> TaskIngestionDecision:
         requested = requested_mode.lower()
         evaluator = self.evaluator_registry.get(evaluator_name)
+
+        # This challenge must be optimized against its official adapter, never
+        # the lightweight legacy proxy evaluator in the generic optimize path.
+        if evaluator_name == "prediction_market" and evaluator:
+            return self._decide_explicit(goal, "optimize", evaluator_name, evaluator)
 
         # Explicit mode flags bypass LLM routing because the user already decided.
         if requested != "auto":

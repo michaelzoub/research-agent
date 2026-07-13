@@ -14,10 +14,11 @@ from research_harness.cli import build_parser
 from research_harness.llm import ModelToolCall, ModelTurn
 from research_harness.agents import SpecialistConsultationTool
 from research_harness.orchestrator import HarnessConfig
-from research_harness.research_agent import AgentRunConfig, FinalAnswerValidator, ResearchAgent, _join_answer_chunks, _partial_synthesis
+from research_harness.research_agent import AgentRunConfig, FinalAnswerValidator, ResearchAgent, _SYSTEM_INSTRUCTIONS, _join_answer_chunks, _partial_synthesis
 from research_harness.search import ArxivSearch, LocalCorpusSearch, WebSearch, _arxiv_identifier, _arxiv_query, _retrieval_query
 from research_harness.store import ArtifactStore
-from research_harness.tools import DocumentFigureTool, SearchTool, TerminalExecutionTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
+from research_harness.tools import DocumentFigureTool, OptimizationSwarmTool, ParameterSweepTool, PredictionMarketEvaluationTool, SaveLearningTool, SearchTool, TerminalExecutionTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
+from research_harness.llm import LLMResponse
 from research_harness.tools.research import _FigureHTMLParser, _image_dimensions, _inspection_urls
 
 
@@ -44,6 +45,131 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(result.termination_reason, "completed")
         self.assertEqual(result.final_answer, "No external evidence is needed.")
         self.assertEqual(result.tool_calls, [])
+
+    def test_model_turn_records_request_start_response_end_and_duration(self) -> None:
+        class DelayedDecider:
+            async def decide(self, _messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> dict[str, Any]:
+                await asyncio.sleep(0.01)
+                return {"type": "final", "answer": "Done."}
+
+        result = ResearchAgent(DelayedDecider(), ToolRegistry([]), AgentRunConfig(max_iterations=1)).run(
+            "Rewrite this sentence.", workspace=Path.cwd()
+        )
+        self.assertEqual(result.events[0].event_type, "model_request")
+        event = result.events[1]
+
+        self.assertEqual(event.event_type, "model_turn")
+        self.assertEqual(result.events[0].model_call_id, event.model_call_id)
+        self.assertIsNotNone(event.started_at)
+        self.assertIsNotNone(event.completed_at)
+        self.assertGreaterEqual(event.runtime_ms or 0, 5)
+        self.assertLess(event.started_at or "", event.completed_at or "")
+
+    def test_prediction_market_evaluation_is_a_model_selected_real_grader_call(self) -> None:
+        code = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
+        decider = ScriptedDecider([
+            {"type": "tool_call", "tool_name": "evaluate_prediction_market_candidate", "arguments": {"code": code, "rationale": "measure this candidate"}},
+            {"type": "final", "answer": "The official grader measured the candidate."},
+        ])
+        agent = ResearchAgent(decider, ToolRegistry([PredictionMarketEvaluationTool()]), AgentRunConfig(max_iterations=3))
+        measured = {
+            "official_measured": True, "score_eligible": True, "mean_edge": 1.25,
+            "mean_arb_edge": 0.5, "mean_retail_edge": 0.75, "score_source": "upstream_orderbook_pm_challenge",
+            "stdout": "{}", "stderr": "", "upstream": {"command": ["docker", "run"]},
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.graders.get_optimization_grader") as get_grader:
+            get_grader.return_value.evaluate.return_value = measured
+            store = ArtifactStore(Path(directory) / "run")
+            result = agent.run("Evaluate the configured PM challenge.", workspace=Path.cwd(), store=store, run_id="run_pm")
+
+            self.assertEqual(result.tool_calls[0]["status"], "ok")
+            trial_path = next(store.optimization_trials_dir.glob("*.json"))
+            trial = json.loads(trial_path.read_text(encoding="utf-8"))
+            self.assertEqual(trial["score"], 1.25)
+            self.assertEqual(trial["round_index"], 1)
+            trial_code_path = Path(trial["trial_code_path"])
+            self.assertEqual(trial_code_path.suffix, ".py")
+            self.assertEqual(trial_code_path.read_text(encoding="utf-8"), code)
+            champion = json.loads(store.current_champion_path.read_text(encoding="utf-8"))
+            self.assertEqual(champion["global_champion"]["variant_id"], trial["trial_id"])
+            self.assertTrue(champion["global_champion"]["promoted_this_round"])
+
+    def test_prediction_market_tool_rejects_non_candidate_without_a_trial(self) -> None:
+        tool = PredictionMarketEvaluationTool()
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            result = asyncio.run(tool.execute({"code": "not a strategy candidate"}, ToolContext(workspace=Path.cwd(), store=store)))
+
+            self.assertEqual(result.status, "error")
+            self.assertFalse(store.optimization_trials_dir.exists())
+
+    def test_grader_tools_save_learnings_and_sweep_official_variants(self) -> None:
+        base = "from orderbook_pm_challenge.strategy import BaseStrategy\nPARAM = 1\nclass Strategy(BaseStrategy):\n    pass\n"
+        measured = {"official_measured": True, "score_eligible": True, "mean_edge": 1.5}
+        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.swarm.get_optimization_grader") as get_grader:
+            root, store = Path(directory), ArtifactStore(Path(directory) / "run")
+            (root / "base.py").write_text(base, encoding="utf-8")
+            get_grader.return_value.evaluate.return_value = measured
+            context = ToolContext(workspace=root, readable_roots=[root], store=store, run_id="run_pm")
+            learning = asyncio.run(SaveLearningTool().execute({"title": "Parameter stable", "finding": "PARAM=2 matched the best score.", "evidence": "official mean_edge=1.5", "status": "confirmed"}, context))
+            sweep = asyncio.run(ParameterSweepTool().execute({"base_strategy_path": "base.py", "old_value": "PARAM = 1", "values": ["PARAM = 2", "PARAM = 3"], "seed_start": 4, "simulations": 8}, context))
+            self.assertEqual(learning.status, "ok")
+            self.assertIn("Parameter stable", store.learnings_path.read_text(encoding="utf-8"))
+            self.assertEqual(sweep.status, "ok")
+            self.assertTrue(Path(sweep.data["winner"]["winner_path"]).is_file())
+            get_grader.return_value.evaluate.assert_called_with(mock.ANY, simulations="8", seed_start="4")
+
+    def test_grader_swarm_runs_independent_model_workers_and_persists_results(self) -> None:
+        base = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
+        class WorkerLLM:
+            def complete(self, *_args, **_kwargs):
+                return LLMResponse(base, "test-model", "test", 3, 4, 0.01)
+        measured = {"official_measured": True, "score_eligible": True, "mean_edge": 2.0}
+        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.swarm.get_optimization_grader") as get_grader:
+            root, store = Path(directory), ArtifactStore(Path(directory) / "run")
+            (root / "base.py").write_text(base, encoding="utf-8")
+            get_grader.return_value.evaluate.return_value = measured
+            result = asyncio.run(OptimizationSwarmTool(WorkerLLM()).execute({"base_strategy_path": "base.py", "agents": [
+                {"hypothesis": "Reduce stale quote risk.", "evaluation_protocol": "8 fixed seeds", "target_to_beat": 1.0},
+                {"hypothesis": "Improve inventory skew.", "evaluation_protocol": "8 fixed seeds", "target_to_beat": 1.0},
+            ]}, ToolContext(workspace=root, readable_roots=[root], store=store, run_id="run_pm")))
+            self.assertEqual(result.status, "ok")
+            self.assertEqual(len(result.data["workers"]), 2)
+            self.assertTrue((store.root / "swarm_results.json").is_file())
+            self.assertEqual(len(store.list("agent_traces")), 2)
+
+    def test_grader_swarm_allows_a_from_scratch_worker_without_a_base_file(self) -> None:
+        code = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
+        class WorkerLLM:
+            def __init__(self): self.prompt = ""
+            def complete(self, _system, prompt, **_kwargs):
+                self.prompt = prompt
+                return LLMResponse(code, "test-model", "test")
+        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.swarm.get_optimization_grader") as get_grader:
+            llm, store = WorkerLLM(), ArtifactStore(Path(directory) / "run")
+            get_grader.return_value.evaluate.return_value = {"official_measured": True, "score_eligible": True, "mean_edge": 2.0}
+            result = asyncio.run(OptimizationSwarmTool(llm).execute({"agents": [{"hypothesis": "Build an inventory-aware strategy from first principles.", "evaluation_protocol": "8 fixed seeds", "target_to_beat": 1.0, "strategy_mode": "from_scratch"}]}, ToolContext(workspace=Path(directory), readable_roots=[Path(directory)], store=store, run_id="run_pm")))
+            self.assertEqual(result.status, "ok")
+            self.assertNotIn("Base strategy", llm.prompt)
+
+    def test_prediction_market_promotion_keeps_the_best_measured_candidate(self) -> None:
+        first = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
+        second = first + "# lower-scoring revision\n"
+        measured = [
+            {"official_measured": True, "score_eligible": True, "mean_edge": 2.0, "mean_arb_edge": 1.0, "mean_retail_edge": 1.0},
+            {"official_measured": True, "score_eligible": True, "mean_edge": 1.0, "mean_arb_edge": 0.4, "mean_retail_edge": 0.6},
+        ]
+        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.graders.get_optimization_grader") as get_grader:
+            get_grader.return_value.evaluate.side_effect = measured
+            store = ArtifactStore(Path(directory) / "run")
+            tool = PredictionMarketEvaluationTool()
+            first_result = asyncio.run(tool.execute({"code": first}, ToolContext(workspace=Path.cwd(), store=store, run_id="run_pm")))
+            second_result = asyncio.run(tool.execute({"code": second}, ToolContext(workspace=Path.cwd(), store=store, run_id="run_pm")))
+
+            self.assertTrue(first_result.data["promotion"]["promoted_this_round"])
+            self.assertFalse(second_result.data["promotion"]["promoted_this_round"])
+            self.assertEqual(second_result.data["promotion"]["global_champion"]["score"], 2.0)
+            self.assertEqual(len(second_result.data["promotion"]["measured_history"]), 2)
 
     def test_agent_recovers_after_bad_tool_selection_using_observation(self) -> None:
         decider = ScriptedDecider([
@@ -79,16 +205,22 @@ class ResearchAgentTest(unittest.TestCase):
             store = ArtifactStore(Path(directory) / "run")
             result = self._agent(decider).run("Research multi-agent systems.", workspace=Path.cwd(), store=store, run_id="run_agent")
 
-            self.assertEqual(result.termination_reason, "completed")
+            self.assertEqual(result.termination_reason, "partial")
             self.assertGreater(len(store.list("sources")), 0)
+            self.assertEqual(store.list("sources")[0]["evidence_kind"], "lead")
             transcript = json.loads(store.agent_transcript_path.read_text(encoding="utf-8"))
-            self.assertEqual(transcript["termination_reason"], "completed")
+            self.assertEqual(transcript["termination_reason"], "partial")
             self.assertEqual(transcript["tool_calls"][0]["tool"], "local_corpus_search")
             trace = store.list("agent_traces")[0]
             self.assertEqual(trace["tools_used"], ["local_corpus_search"])
             self.assertEqual(trace["tool_calls"][0]["results"], len(store.list("sources")))
             event_rows = [json.loads(line) for line in store.agent_event_log_path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([event["event_type"] for event in event_rows], ["model_turn", "tool_requested", "tool_result", "model_turn", "final_validation"])
+            self.assertEqual(
+                [event["event_type"] for event in event_rows][:7],
+                ["model_request", "model_turn", "tool_requested", "tool_result", "model_request", "model_turn", "final_validation"],
+            )
+            self.assertEqual(event_rows[0]["model_call_id"], event_rows[1]["model_call_id"])
+            self.assertEqual(event_rows[4]["model_call_id"], event_rows[5]["model_call_id"])
 
     def test_iteration_limit_is_not_reported_as_a_final_answer(self) -> None:
         decider = ScriptedDecider([{"type": "tool_call", "tool_name": "not_registered", "arguments": {}}] * 3)
@@ -152,6 +284,167 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertNotIn("--mode", parser.format_help())
         self.assertFalse(hasattr(HarnessConfig(), "mode"))
 
+    def test_cli_accepts_optimization_grader_alias(self) -> None:
+        args = build_parser().parse_args(["optimize pm challenge", "--grader", "prediction_market"])
+        self.assertEqual(args.evaluator, "prediction_market")
+
+    def test_cli_accepts_a_separate_grader_loop_limit(self) -> None:
+        args = build_parser().parse_args(["optimize pm challenge", "--grader", "prediction_market", "--grader-loops", "3"])
+        self.assertEqual(args.grader_loops, 3)
+
+    def test_grader_loop_limit_blocks_a_second_official_candidate_attempt(self) -> None:
+        class CountingGrader:
+            name = "evaluate_prediction_market_candidate"
+            description = "test grader"
+            is_read_only = False
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                self.calls += 1
+                return ToolResult("ok", {"measured": True})
+
+        tool = CountingGrader()
+        decider = ScriptedDecider([
+            {"type": "tool_call", "tool_name": tool.name, "arguments": {}},
+            {"type": "tool_call", "tool_name": tool.name, "arguments": {}},
+            {"type": "final", "answer": "One official evaluation was used."},
+        ])
+        agent = ResearchAgent(decider, ToolRegistry([tool]), AgentRunConfig(max_iterations=3, max_grader_calls=1))
+        result = agent.run("Optimize the challenge.", workspace=Path.cwd())
+
+        self.assertEqual(tool.calls, 1)
+        self.assertEqual([call["status"] for call in result.tool_calls], ["ok", "skipped"])
+        self.assertIn("--grader-loops=1", result.tool_calls[1]["error"])
+
+    def test_requested_grader_trials_keep_the_model_in_the_feedback_loop(self) -> None:
+        class NegativeGrader:
+            name = "evaluate_prediction_market_candidate"
+            description = "test grader"
+            is_read_only = False
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"mean_edge": -0.25, "mean_arb_edge": -0.5})
+
+        decider = ScriptedDecider([
+            {"type": "tool_call", "tool_name": "evaluate_prediction_market_candidate", "arguments": {}},
+            {"type": "tool_call", "tool_name": "evaluate_prediction_market_candidate", "arguments": {}},
+            {"type": "final", "answer": "Both requested candidates were measured."},
+        ])
+        result = ResearchAgent(
+            decider, ToolRegistry([NegativeGrader()]), AgentRunConfig(max_iterations=3, max_grader_calls=2)
+        ).run("Optimize the challenge.", workspace=Path.cwd())
+
+        self.assertEqual([call["status"] for call in result.tool_calls], ["ok", "ok"])
+        feedback = decider.observed_messages[1][-1]
+        self.assertEqual(feedback["role"], "user")
+        self.assertIn("non-positive (-0.25)", feedback["content"])
+        self.assertIn("1 requested official evaluation", feedback["content"])
+        self.assertIn("fresh, high-relevance evidence", feedback["content"])
+
+    def test_optimizer_system_prompt_requires_fresh_failure_specific_evidence(self) -> None:
+        self.assertIn("after every scorer observation", _SYSTEM_INSTRUCTIONS)
+        self.assertIn("score delta, component metric, failure trace", _SYSTEM_INSTRUCTIONS)
+        self.assertIn("never broaden into an unrelated domain", _SYSTEM_INSTRUCTIONS)
+
+    def test_harness_nudges_after_five_source_free_iterations(self) -> None:
+        class NoSourceTool:
+            name = "analyze"
+            description = "analysis only"
+            is_read_only = True
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"result": "no source"})
+
+        decider = ScriptedDecider([
+            *[{"type": "tool_call", "tool_name": "analyze", "arguments": {}} for _ in range(5)],
+            {"type": "final", "answer": "Existing evidence is sufficient."},
+        ])
+        result = ResearchAgent(decider, ToolRegistry([NoSourceTool()]), AgentRunConfig(max_iterations=6)).run(
+            "Optimize the challenge.", workspace=Path.cwd()
+        )
+
+        self.assertEqual(result.status, "completed")
+        nudge_events = [event for event in result.events if event.event_type == "source_refresh_nudge"]
+        self.assertEqual(len(nudge_events), 1)
+        self.assertEqual(nudge_events[0].observation["iterations_without_new_sources"], 5)
+        self.assertIn("Harness nudge", decider.observed_messages[5][-1]["content"])
+
+    def test_harness_does_not_nudge_when_a_new_source_resets_the_counter(self) -> None:
+        class AlternatingTool:
+            name = "inspect"
+            description = "returns a source only on its first call"
+            is_read_only = True
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                self.calls += 1
+                metadata = [{"url": "https://example.org/new", "title": "new"}] if self.calls == 1 else []
+                return ToolResult("ok", {"result": self.calls}, source_metadata=metadata)
+
+        decider = ScriptedDecider([
+            *[{"type": "tool_call", "tool_name": "inspect", "arguments": {}} for _ in range(5)],
+            {"type": "final", "answer": "Existing evidence is sufficient. https://example.org/new"},
+        ])
+        result = ResearchAgent(decider, ToolRegistry([AlternatingTool()]), AgentRunConfig(max_iterations=6)).run(
+            "Optimize the challenge.", workspace=Path.cwd()
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertFalse(any(event.event_type == "source_refresh_nudge" for event in result.events))
+
+    def test_search_tool_discards_low_relevance_discovery_hits(self) -> None:
+        class MixedRelevanceBackend:
+            tool_name = "mixed_search"
+
+            def search(self, _query: str, limit: int = 4):
+                return [("relevant", 0.75), ("noise", 0.45)][:limit]
+
+            def to_source(self, document: str, relevance: float):
+                from research_harness.schemas import Source
+
+                return Source(
+                    url=f"https://example.org/{document}", title=document, author="test", date="",
+                    source_type="test", summary=document, relevance_score=relevance, credibility_score=0.8,
+                )
+
+        result = asyncio.run(SearchTool(MixedRelevanceBackend()).execute({"query": "prediction market", "limit": 4}, ToolContext(workspace=Path.cwd())))
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.data["result_count"], 1)
+        self.assertEqual(result.data["discarded_low_relevance_count"], 1)
+        self.assertEqual([source["title"] for source in result.source_metadata], ["relevant"])
+
+    def test_final_answer_is_deferred_until_requested_grader_trials_are_used(self) -> None:
+        class Grader:
+            name = "evaluate_prediction_market_candidate"
+            description = "test grader"
+            is_read_only = False
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"mean_edge": 0.1})
+
+        decider = ScriptedDecider([
+            {"type": "final", "answer": "Stopping too soon."},
+            {"type": "tool_call", "tool_name": "evaluate_prediction_market_candidate", "arguments": {}},
+            {"type": "final", "answer": "Measured the requested candidate."},
+        ])
+        result = ResearchAgent(
+            decider, ToolRegistry([Grader()]), AgentRunConfig(max_iterations=3, max_grader_calls=1)
+        ).run("Optimize the challenge.", workspace=Path.cwd())
+
+        self.assertEqual(result.final_answer, "Measured the requested candidate.")
+        self.assertEqual([call["status"] for call in result.tool_calls], ["ok"])
+        self.assertIn("Do not finalize while 1 requested official evaluation", decider.observed_messages[1][-1]["content"])
+
     def test_multiple_read_only_model_requested_tools_run_concurrently(self) -> None:
         class DelayedTool:
             is_read_only = True
@@ -188,7 +481,7 @@ class ResearchAgentTest(unittest.TestCase):
             {"type": "final", "answer": "Supported claim https://example.org/single-agent-baseline-limitations"},
         ])
         result = self._agent(decider).run("Find evidence.", workspace=Path.cwd())
-        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.status, "partial")
         feedback = [event for event in result.events if event.event_type == "final_validation"]
         self.assertEqual(feedback[0].observation["status"], "REVISE")
 

@@ -143,6 +143,12 @@ class Source:
     relevance_score: float
     credibility_score: float
     evidence_sections: dict[str, str] = field(default_factory=dict)
+    # Discovery results are leads, not grounding.  Only a fetched/parsed
+    # document is eligible to support a final claim.
+    evidence_kind: str = "lead"
+    # Maps section names to stable, human-readable locations such as
+    # {"kind": "pdf_page", "page": 4} or {"kind": "docx_heading", "section": "Methods"}.
+    evidence_locators: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     id: str = field(default_factory=lambda: new_id("src"))
     retrieved_at: str = field(default_factory=now_iso)
     canonical_id: Optional[str] = None
@@ -157,6 +163,9 @@ class Claim:
     support_level: str
     created_by_agent: str
     run_id: str
+    citation_support: float = 0.0
+    citation_coverage: float = 0.0
+    citation_locators: list[dict[str, Any]] = field(default_factory=list)
     contradicted_by: list[str] = field(default_factory=list)
     id: str = field(default_factory=lambda: new_id("claim"))
     canonical_id: Optional[str] = None

@@ -20,7 +20,7 @@ autore "Analyze this repository's public architecture" --retriever local
 autore --help
 ```
 
-All tasks start the same `ResearchAgent`; tools are optional capabilities selected by the model. Registered capabilities include source search, public document fetching, figure inspection (caption, image URL, and aspect-ratio metadata), approved-workspace reads, sandboxed Python analysis, and bounded host-terminal inspection (`curl`, `npm`, `git`, and `rg`). The terminal tool runs direct argv only—never a shell—uses an ephemeral home with no inherited credentials, and is limited to read-only subcommands and public HTTP(S) GET/HEAD requests. A failed or empty discovery call stays in the audit trail but does not consume the successful-evidence allowance, so the agent can recover through another source. Before using a tool, the model records a concise public decision summary. This is an auditable rationale for the action, not hidden chain-of-thought.
+All tasks start the same `ResearchAgent`; tools are optional capabilities selected by the model. With `--grader prediction_market`, the controller can launch a bounded swarm of independent model workers (each with a hypothesis, base strategy, multi-seed protocol, and target), run exact-replacement parameter sweeps, and save evidence-backed learnings. Workers and sweeps write isolated candidates and use the existing official upstream grader; no score is fabricated and no candidate is promoted without an eligible official measurement. `learnings.md` and `learnings.jsonl` preserve confirmed findings and dead ends for later agents. Registered capabilities include source search, public document fetching, figure inspection (caption, image URL, and aspect-ratio metadata), approved-workspace reads, sandboxed Python analysis, and bounded host-terminal inspection (`curl`, `npm`, `git`, and `rg`). The terminal tool runs direct argv only—never a shell—uses an ephemeral home with no inherited credentials, and is limited to read-only subcommands and public HTTP(S) GET/HEAD requests. A failed or empty discovery call stays in the audit trail but does not consume the successful-evidence allowance, so the agent can recover through another source. Before using a tool, the model records a concise public decision summary. This is an auditable rationale for the action, not hidden chain-of-thought.
 
 ## Artifacts
 
@@ -32,6 +32,7 @@ Each run writes `outputs/<run>/`:
 - `agent_events.jsonl` — append-only model-turn, tool-request, and tool-result events, written as they occur.
 - `failed_paths.json` — provider, tool, budget, and runtime failures with retryability metadata; successful calls do not appear here.
 - `cost.json` — model usage and estimated cost.
+- `swarm_results.json`, `sweeps/`, and `learnings.md` — created when the controller uses the grader swarm, sweep, or learning tools.
 
 Workspace reads are deny-by-default for sensitive files such as `.env` and `.git`. Document retrieval validates every DNS-resolved host and redirect against private, loopback, link-local, and reserved addresses. HTML documents may be rendered into compact Markdown through curl.md after the target URL passes those checks; direct fetch remains available as the fallback.
 

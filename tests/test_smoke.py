@@ -20,7 +20,7 @@ class OrchestratorSmokeTest(unittest.TestCase):
             )
             run, store = asyncio.run(orchestrator.run("Rewrite this sentence more clearly."))
 
-            self.assertEqual(run.status, "completed")
+            self.assertEqual(run.status, "partial")
             state = json.loads(store.run_state_path.read_text(encoding="utf-8"))
             self.assertEqual(state["schema_version"], "model_directed_run_state_v1")
             self.assertNotIn("execution_mode", state)
@@ -41,6 +41,23 @@ class OrchestratorSmokeTest(unittest.TestCase):
 
     def test_goal_slug_is_stable(self) -> None:
         self.assertEqual(goal_slug("Please research new agent paradigms"), "please-research-new-agent-paradigms")
+
+    def test_configured_grader_retains_the_base_agent_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = Orchestrator(
+                Path("examples/corpus/research_corpus.json"),
+                Path(directory),
+                HarnessConfig(
+                    retriever="local", llm_provider="local", evaluator_name="prediction_market",
+                    echo_progress=False, enable_sessions=False,
+                ),
+            )
+            _run, store = asyncio.run(orchestrator.run("Optimize PM challenge."))
+
+            self.assertTrue(store.agent_transcript_path.exists())
+            self.assertFalse(store.optimization_result_path.exists())
+            state = json.loads(store.run_state_path.read_text(encoding="utf-8"))
+            self.assertIn("evaluate_prediction_market_candidate", state["available_tools"])
 
     def test_auto_retrieval_excludes_the_fixture_corpus(self) -> None:
         orchestrator = Orchestrator(

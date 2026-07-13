@@ -15,6 +15,7 @@ class SandboxExecutionResult:
     stderr: str
     exit_code: int
     timed_out: bool = False
+    command: tuple[str, ...] = ()
 
     @property
     def returncode(self) -> int:
@@ -116,6 +117,7 @@ class DockerSandboxRunner:
                 seed_start,
                 "--workers",
                 workers,
+                "--sandbox",
                 "--json",
             ]
             try:
@@ -127,10 +129,10 @@ class DockerSandboxRunner:
                     timeout=self.timeout_seconds,
                 )
             except subprocess.TimeoutExpired as exc:
-                return SandboxExecutionResult(exc.stdout or "", exc.stderr or "docker execution timed out", 124, timed_out=True)
+                return SandboxExecutionResult(exc.stdout or "", exc.stderr or "docker execution timed out", 124, timed_out=True, command=tuple(command))
             except Exception as exc:
-                return SandboxExecutionResult("", f"{type(exc).__name__}: {exc}", 1)
-        return SandboxExecutionResult(completed.stdout, completed.stderr, completed.returncode)
+                return SandboxExecutionResult("", f"{type(exc).__name__}: {exc}", 1, command=tuple(command))
+        return SandboxExecutionResult(completed.stdout, completed.stderr, completed.returncode, command=tuple(command))
 
     def execute_python(self, code: str, *, timeout_seconds: Optional[float] = None) -> SandboxExecutionResult:
         """Execute a short analysis script in the same network-isolated boundary."""
@@ -156,7 +158,7 @@ class DockerSandboxRunner:
                     timeout=timeout_seconds or min(self.timeout_seconds, 60.0),
                 )
             except subprocess.TimeoutExpired as exc:
-                return SandboxExecutionResult(exc.stdout or "", exc.stderr or "analysis execution timed out", 124, timed_out=True)
+                return SandboxExecutionResult(exc.stdout or "", exc.stderr or "analysis execution timed out", 124, timed_out=True, command=tuple(command))
             except Exception as exc:
-                return SandboxExecutionResult("", "%s: %s" % (type(exc).__name__, exc), 1)
-        return SandboxExecutionResult(completed.stdout, completed.stderr, completed.returncode)
+                return SandboxExecutionResult("", "%s: %s" % (type(exc).__name__, exc), 1, command=tuple(command))
+        return SandboxExecutionResult(completed.stdout, completed.stderr, completed.returncode, command=tuple(command))

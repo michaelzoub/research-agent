@@ -18,7 +18,7 @@ from pathlib import Path
 from statistics import median
 from typing import Callable, Optional, Protocol
 
-from .llm import LLMClient
+from ...llm import LLMClient
 from .loop_evaluators import (
     EvaluatorResult,
     evaluator_json_response as _evaluator_json_response,
@@ -39,9 +39,10 @@ from .loop_utils import (
     strip_run_artifacts as _strip_run_artifacts,
     support_level as _support_level,
 )
-from .loop_routing import EvaluatorFn, EvaluatorRegistry, TaskRouter
+from ...loop_routing import EvaluatorFn, EvaluatorRegistry, TaskRouter
 from .optimization_agent import OptimizationAgent, OptimizerToolbox
-from .schemas import (
+from optimization_graders import get_optimization_grader
+from ...schemas import (
     Claim,
     EvolutionRound,
     FailedPath,
@@ -54,9 +55,9 @@ from .schemas import (
     new_id,
     now_iso,
 )
-from .search import SearchBackend
-from .sandbox import DockerSandboxRunner
-from .store import ArtifactStore
+from ...search import SearchBackend
+from ...sandbox import DockerSandboxRunner
+from ...store import ArtifactStore
 
 SearchFactory = Callable[[str], SearchBackend]
 
@@ -123,54 +124,13 @@ def _prediction_market_official_preflight() -> PredictionMarketPreflightResult:
     calls may still return an unmeasured debug payload, but optimizer runs need a
     real upstream scorer available before candidates are generated.
     """
-    upstream_path = _find_pm_upstream_path()
-    if upstream_path is None:
-        return PredictionMarketPreflightResult(
-            ok=False,
-            reason=(
-                "prediction-market upstream scorer not found; set "
-                "PREDICTION_MARKET_CHALLENGE_PATH or keep the vendored challenge present"
-            ),
-        )
-    if os.environ.get("PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM") == "1":
-        if shutil.which("uv") is None:
-            return PredictionMarketPreflightResult(
-                ok=False,
-                reason="PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM=1 but `uv` is not on PATH",
-                upstream_path=str(upstream_path),
-                execution_mode="host",
-                docker_sandbox=False,
-            )
-        return PredictionMarketPreflightResult(
-            ok=True,
-            reason="official upstream scorer available via host `uv run`",
-            upstream_path=str(upstream_path),
-            execution_mode="host",
-            docker_sandbox=False,
-        )
-    runner = DockerSandboxRunner()
-    if not runner.available:
-        return PredictionMarketPreflightResult(
-            ok=False,
-            reason="docker executable not found; start Docker or set PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM=1",
-            upstream_path=str(upstream_path),
-            execution_mode="docker",
-            docker_sandbox=True,
-        )
-    if not runner.daemon_available:
-        return PredictionMarketPreflightResult(
-            ok=False,
-            reason="docker daemon is not reachable; start Docker Desktop or set PREDICTION_MARKET_ALLOW_UNSANDBOXED_UPSTREAM=1",
-            upstream_path=str(upstream_path),
-            execution_mode="docker",
-            docker_sandbox=True,
-        )
+    result = get_optimization_grader("prediction_market").preflight()
     return PredictionMarketPreflightResult(
-        ok=True,
-        reason="official upstream scorer available through Docker sandbox",
-        upstream_path=str(upstream_path),
-        execution_mode="docker",
-        docker_sandbox=True,
+        ok=result.ok,
+        reason=result.reason,
+        upstream_path=result.upstream_path,
+        execution_mode=result.execution_mode,
+        docker_sandbox=result.docker_sandbox,
     )
 
 
@@ -726,6 +686,8 @@ class EvolutionaryOuterLoop:
 
     async def run(self, store: ArtifactStore) -> None:
         store.ingest_pending_user_steering(self.run_id)
+        if self.evaluator_name == "prediction_market" and self.task_mode in {"optimize", "optimize_query"}:
+            self._require_prediction_market_official_scorer(store)
         if self.task_mode in {"optimize", "optimize_query"}:
             await self._record_literature_grounding(store, "initial")
         if self.task_mode == "optimize_query":
@@ -1018,27 +980,31 @@ class EvolutionaryOuterLoop:
         else:
             self.population_size = optimizer_population_size
         if self.evaluator_name == "prediction_market":
-            preflight = _prediction_market_official_preflight()
-            store.append_progress(
-                f"Prediction-market official evaluator preflight: ok={preflight.ok} "
-                f"mode={preflight.execution_mode} reason={preflight.reason}"
-            )
-            if not preflight.ok:
-                store.add_failed_path(
-                    FailedPath(
-                        description="Prediction-market optimizer preflight failed before candidate generation",
-                        reason=preflight.reason,
-                        created_by_agent="prediction_market_preflight",
-                        run_id=self.run_id,
-                        retryable=True,
-                    )
-                )
-                self._write_prediction_market_preflight_failure(store, preflight)
-                raise RuntimeError(f"Prediction-market official evaluator preflight failed: {preflight.reason}")
             await self._run_prediction_market_optimizer(store, seed_parents, seed_context)
             return
         optimize_loop = OptimizeLoop(self.run_id, self.evaluator, parallel_evaluator_cap=self.parallel_evaluator_cap)
         await self._run_generic_optimizer_rounds(store, optimize_loop, seed_parents, seed_context)
+
+    def _require_prediction_market_official_scorer(self, store: ArtifactStore) -> None:
+        """Fail before retrieval: no sandbox means no meaningful PM optimization run."""
+        preflight = _prediction_market_official_preflight()
+        store.append_progress(
+            f"Prediction-market official evaluator preflight: ok={preflight.ok} "
+            f"mode={preflight.execution_mode} reason={preflight.reason}"
+        )
+        if preflight.ok:
+            return
+        store.add_failed_path(
+            FailedPath(
+                description="Prediction-market optimizer preflight failed before retrieval or candidate generation",
+                reason=preflight.reason,
+                created_by_agent="prediction_market_preflight",
+                run_id=self.run_id,
+                retryable=True,
+            )
+        )
+        self._write_prediction_market_preflight_failure(store, preflight)
+        raise RuntimeError(f"Prediction-market official evaluator preflight failed: {preflight.reason}")
 
     async def _run_generic_optimizer_rounds(
         self,
@@ -1055,6 +1021,9 @@ class EvolutionaryOuterLoop:
             propose_started = time.perf_counter()
             propose_started_at = now_iso()
             code_variants = self._propose_code_variants(round_index, parents, store)
+            if not code_variants:
+                store.append_progress("Optimizer stopped: the model did not supply candidate code.")
+                break
             _record_timing_trace(
                 store,
                 self.run_id,
@@ -1166,6 +1135,15 @@ class EvolutionaryOuterLoop:
         for round_index in range(1, self.max_outer_iterations + 1):
             store.ingest_pending_user_steering(self.run_id)
             controller_result = await self._plan_prediction_market_optimizer_round(store, round_index)
+            if not controller_result.continue_running:
+                store.append_progress("Prediction-market optimizer stopped by the model controller before proposing a new candidate.")
+                self._record_continuation_decision(
+                    store, loop_name="challenge_optimizer_loop", iteration=round_index,
+                    mode="optimize", should_continue=False, termination_signal="model_stop",
+                    best_score=best_eval.score if best_eval else 0.0, plateau_count=plateau.plateau_count,
+                    reason="The model controller declined another optimization round.",
+                )
+                break
             propose_started = time.perf_counter()
             propose_started_at = now_iso()
             if "controller_context" in inspect.signature(self._propose_prediction_market_variants).parameters:
@@ -1177,6 +1155,9 @@ class EvolutionaryOuterLoop:
                 )
             else:
                 code_variants = self._propose_prediction_market_variants(round_index, parents, store)
+            if not code_variants:
+                store.append_progress("Prediction-market optimizer stopped: the model did not supply candidate code.")
+                break
             _record_timing_trace(
                 store,
                 self.run_id,
@@ -1415,18 +1396,11 @@ class EvolutionaryOuterLoop:
         parents: list[Variant],
         store: Optional[ArtifactStore],
     ) -> list[DirectionSpec]:
-        if not self.force_direction_entropy:
-            return []
-        return _forced_direction_specs(
-            goal=self.goal,
-            task_mode=self.task_mode,
-            population_size=self.population_size,
-            outer_iteration=outer_iteration,
-            novelty_fraction=self.novelty_fraction,
-            champion_payload=self._champion_payload,
-            parents=parents,
-            store=store,
-        )
+        # Directions must be chosen by the model from the prompt, observed
+        # artifacts, and evaluator feedback.  In particular, do not turn the
+        # evaluator into a fixed slot-by-slot search space via generated
+        # "uncertainty", "ablation", or regime templates.
+        return []
 
     def _apply_direction_specs(self, variants: list[Variant], directions: list[DirectionSpec], *, kind: str) -> None:
         if not directions:
@@ -1532,6 +1506,8 @@ class EvolutionaryOuterLoop:
         best_eval: Optional[VariantEvaluation],
         outer_iteration: int,
     ) -> bool:
+        if self.task_mode == "optimize":
+            return not self._model_continue_optimizer(best_eval, termination_signal, outer_iteration)
         if self.task_mode == "optimize" and termination_signal == "score_plateau" and self.continue_on_optimize_plateau:
             return outer_iteration >= self.max_outer_iterations
         if termination_signal in {"score_plateau", "coverage_plateau"} and self.objective.no_stop_until_target:
@@ -1559,13 +1535,48 @@ class EvolutionaryOuterLoop:
         best_eval: Optional[VariantEvaluation],
         round_index: int,
     ) -> bool:
-        if self.objective.has_explicit_target:
-            if termination_signal in {"profit_target", "score_threshold"}:
-                return self._objective_met(best_eval)
-            return round_index >= self.max_outer_iterations
-        if termination_signal == "score_plateau" and self.objective.no_stop_until_target:
-            return round_index >= self.max_outer_iterations
-        return termination_signal in {"score_threshold", "profit_target"}
+        # Scores, plateaus, and fixed round counts are observations for the
+        # controller, not a hidden continuation policy.  The configured
+        # iteration limit is enforced by the caller as a safety budget.
+        return not self._model_continue_optimizer(best_eval, termination_signal, round_index)
+
+    def _model_continue_optimizer(
+        self,
+        best_eval: Optional[VariantEvaluation],
+        termination_signal: str,
+        round_index: int,
+    ) -> bool:
+        if not self.llm.is_live:
+            return False
+        state = {
+            "goal": self.goal,
+            "round_index": round_index,
+            "safety_iteration_limit": self.max_outer_iterations,
+            "termination_signal": termination_signal,
+            "objective": _objective_metadata(self.evaluator_name),
+            "best_evaluation": {
+                "variant_id": best_eval.variant_id if best_eval else None,
+                "score": best_eval.score if best_eval else None,
+                "metrics": best_eval.metrics if best_eval else {},
+                "summary": best_eval.summary if best_eval else "No candidate was evaluated.",
+            },
+        }
+        try:
+            decision = self.llm.complete_json(
+                "You control whether an optimization run should take another round. "
+                "The evaluator measures candidates but does not decide continuation. "
+                "Return JSON only: {\"continue_running\": boolean, \"reason\": string}. "
+                "Continue only if another model-authored proposal has a concrete, evidence-backed reason to improve; "
+                "otherwise stop. Never infer a fixed strategy family from the score.",
+                json.dumps(state, sort_keys=True, default=str),
+                max_output_tokens=300,
+                temperature=0.2,
+            )
+            return bool(decision.get("continue_running", False))
+        except Exception:
+            # A controller failure must stop safely; it must never trigger a
+            # deterministic retry path against the grader.
+            return False
 
     def _objective_met(self, best_eval: Optional[VariantEvaluation]) -> bool:
         if self.evaluator_name == "prediction_market":
@@ -1907,12 +1918,35 @@ class EvolutionaryOuterLoop:
             candidate_path = store.candidates_dir / f"{_safe_filename(variant.id)}.py"
         else:
             candidate_path = store.candidates_dir / f"round_{round_index:02d}_{_safe_filename(variant.id)}.py"
+        code = ""
         try:
             code = self._render_optimal_code(variant.payload)
+            candidate_path.parent.mkdir(parents=True, exist_ok=True)
             candidate_path.write_text(code, encoding="utf-8")
             store.append_progress(f"  Candidate eval start {variant.id}: {candidate_path}")
             result = await asyncio.to_thread(_run_prediction_market_official, candidate_path)
         except Exception as exc:
+            trial_code_path = store.write_optimization_trial_code(variant.id, code)
+            store.write_optimization_trial(
+                variant.id,
+                {
+                    "trial_id": variant.id,
+                    "run_id": self.run_id,
+                    "round_index": round_index,
+                    "grader_id": "prediction_market",
+                    "candidate_path": str(candidate_path),
+                    "trial_code_path": str(trial_code_path),
+                    "rendered_code": code,
+                    "command": [],
+                    "upstream": {"upstream_url": "https://github.com/danrobinson/prediction-market-challenge"},
+                    "score": 0.0,
+                    "score_eligible": False,
+                    "official_measured": False,
+                    "stdout": "",
+                    "stderr": "",
+                    "failure": f"{type(exc).__name__}: {exc}",
+                },
+            )
             _record_timing_trace(
                 store,
                 self.run_id,
@@ -1938,6 +1972,29 @@ class EvolutionaryOuterLoop:
         result["score_eligible"] = score_eligible
         result["no_trade_baseline"] = no_trade_baseline
         result["direction"] = _variant_direction_metadata(variant)
+        trial_code_path = store.write_optimization_trial_code(variant.id, code)
+        trial_path = store.write_optimization_trial(
+            variant.id,
+            {
+                "trial_id": variant.id,
+                "run_id": self.run_id,
+                "round_index": round_index,
+                "grader_id": "prediction_market",
+                "candidate_path": str(candidate_path),
+                "trial_code_path": str(trial_code_path),
+                "rendered_code": code,
+                "command": (result.get("upstream") or {}).get("command", []),
+                "upstream": result.get("upstream", {}),
+                "score": score,
+                "score_eligible": score_eligible,
+                "official_measured": bool(result.get("official_measured", False)),
+                "stdout": result.get("stdout", ""),
+                "stderr": result.get("stderr", ""),
+                "failure": result.get("error") or result.get("loss_reason"),
+                "metrics": result,
+            },
+        )
+        result["trial_path"] = str(trial_path)
         store.append_progress(f"  Candidate eval done {variant.id}: mean_edge={edge:.3f} score={score:.3f} eligible={score_eligible}")
         score_source = str(result.get("score_source", "unknown"))
         measured_label = "upstream orderbook-pm" if result.get("official_measured") else "local challenge fallback"
@@ -2320,86 +2377,9 @@ class EvolutionaryOuterLoop:
                 for variant in llm_variants:
                     variant.metadata["meaningful_entropy_intent"] = entropy_intent
             return llm_variants
-
-        # Fallback (no live LLM): build variants from source strategy or parent mutations.
-        if not parents:
-            variants = []
-            source_items = self.source_strategy or [
-                SourceStrategyItem(
-                    name="forced_direction_fallback",
-                    retriever="local",
-                    purpose="forced direction fallback",
-                    queries=[self.goal],
-                    limit=6,
-                )
-            ]
-            for index, direction in enumerate(directions[: self.population_size]):
-                item = source_items[index % len(source_items)]
-                retriever = forced_retriever or item.retriever
-                variants.append(
-                    Variant(
-                        run_id=self.run_id,
-                        outer_iteration=outer_iteration,
-                        kind="query",
-                        payload=_directional_query_payload(item.queries[0], direction),
-                        parent_ids=[],
-                        metadata={
-                            "retriever": retriever,
-                            "purpose": item.purpose,
-                            "limit": item.limit,
-                            "research_role": "parallel_research_subagent",
-                            "search_phase": "broad" if outer_iteration == 1 else "narrow",
-                            **({"recovery": "fresh_search_context"} if forced_retriever else {}),
-                            **({"meaningful_entropy_intent": entropy_intent} if entropy_intent else {}),
-                        },
-                    )
-                )
-            self._apply_direction_specs(variants, directions, kind="query")
-            return variants
-
-        suffixes = _contextual_query_suffixes(self.goal, parents, self.population_size)
-        unresolved = [
-            str(item)
-            for item in self.prior_run_memory.get("unresolved_directions", [])
-            if str(item).strip()
-        ]
-        user_steering = _recent_user_steering_notes(store, limit=4)
-        if user_steering:
-            steering_suffixes = [" ".join(_context_terms(note, limit=6)) for note in user_steering]
-            suffixes = [suffix for suffix in steering_suffixes if suffix] + suffixes
-        if unresolved:
-            memory_suffixes = [_context_terms(item, limit=4) for item in unresolved]
-            suffixes = [
-                " ".join(terms)
-                for terms in memory_suffixes
-                if terms
-            ] + suffixes
-        variants = []
-        for index, direction in enumerate(directions[: self.population_size]):
-            suffix = suffixes[index % len(suffixes)] if suffixes else direction.strategy_family
-            parent_pool = [] if direction.parent_policy == "ignore_parents" else parents
-            parent = parent_pool[index % len(parent_pool)] if parent_pool else parents[index % len(parents)]
-            retriever = forced_retriever or str(parent.metadata.get("retriever", "local"))
-            variants.append(
-                Variant(
-                    run_id=self.run_id,
-                    outer_iteration=outer_iteration,
-                    kind="query",
-                    payload=_directional_query_payload(f"{parent.payload} {suffix}", direction),
-                    parent_ids=[] if direction.parent_policy == "ignore_parents" else [parent.id],
-                    metadata={
-                        **parent.metadata,
-                        "retriever": retriever,
-                        "search_phase": "narrow",
-                        "narrowing_suffix": suffix,
-                        "suffix_provenance": "context-derived from goal and parent variants",
-                        **({"recovery": "fresh_search_context"} if forced_retriever else {}),
-                        **({"meaningful_entropy_intent": entropy_intent} if entropy_intent else {}),
-                    },
-                )
-            )
-        self._apply_direction_specs(variants, directions, kind="query")
-        return variants
+        if store:
+            store.append_progress("No model-generated query proposals; stopping instead of using a deterministic fallback.")
+        return []
 
     def _propose_code_variants(
         self,
@@ -2426,68 +2406,9 @@ class EvolutionaryOuterLoop:
                     variant.payload = f"{variant.payload} {suffix}"
                     variant.metadata["meaningful_entropy_intent"] = entropy_intent
             return llm_variants
-
-        # Fallback seeds (no live LLM).
-        if not parents:
-            seeds = [
-                _directional_code_seed("baseline direct implementation", direction)
-                for direction in directions
-            ]
-        else:
-            if all(parent.kind == "query" for parent in parents):
-                challenge_context = self._optimizer_seed_prefix()
-                seeds = [
-                    _directional_code_seed(
-                        f"{challenge_context} Optimization variant informed by query finding: {parents[index % len(parents)].payload} refined pass {outer_iteration}",
-                        direction,
-                    )
-                    for index, direction in enumerate(directions)
-                ]
-            else:
-                seeds = []
-                for index, direction in enumerate(directions):
-                    parent_pool = [] if direction.parent_policy == "ignore_parents" else parents
-                    parent = parent_pool[index % len(parent_pool)] if parent_pool else parents[index % len(parents)]
-                    base = f"{parent.payload} refined pass {outer_iteration}" if direction.parent_policy != "ignore_parents" else f"fresh non-descendant implementation for {self.goal}"
-                    seeds.append(_directional_code_seed(base, direction))
-        if self._champion_payload:
-            champion_prefix = (
-                f"diff_against_champion champion_score={self._champion_score:.3f} "
-                f"champion_variant={self._champion_variant_id} champion_payload='{self._champion_payload[:300]}'"
-            )
-            seeds = [
-                payload if directions[index % len(directions)].parent_policy == "ignore_champion"
-                else f"{champion_prefix} mutation={payload}"
-                for index, payload in enumerate(seeds)
-            ]
-
-        if entropy_intent:
-            suffix = _entropy_payload_suffix(entropy_intent)
-            seeds = [f"{payload} {suffix}" for payload in seeds]
-        user_steering = _recent_user_steering_notes(store, limit=2)
-        if user_steering:
-            seeds = [f"{payload} user_steering='{user_steering[index % len(user_steering)]}'" for index, payload in enumerate(seeds)]
-
-        variants = [
-            Variant(
-                run_id=self.run_id,
-                outer_iteration=outer_iteration,
-                kind="code",
-                payload=payload,
-                parent_ids=[parent.id for parent in parents],
-                metadata={
-                    "goal": self.goal,
-                    **({"meaningful_entropy_intent": entropy_intent} if entropy_intent else {}),
-                },
-            )
-            for payload in seeds[: self.population_size]
-        ]
-
-        if inject_mutation:
-            variants = [_randomly_mutate_variant(v, outer_iteration) for v in variants]
-
-        self._apply_direction_specs(variants, directions, kind="code")
-        return variants
+        if store:
+            store.append_progress("No model-generated code proposals; stopping instead of using a deterministic fallback.")
+        return []
 
     def _optimizer_seed_prefix(self) -> str:
         return "Optimization sketch derived only from the user goal, retrieved evidence, parent variants, and score feedback:"
@@ -2507,6 +2428,36 @@ class EvolutionaryOuterLoop:
         self._recovery_inject_mutation = False
         self._recovery_entropy_intent = None
         directions = self._direction_specs(outer_iteration, parents, store)
+
+        # Candidate code is model-authored only.  Do not populate the grader
+        # with parameter sweeps, structural templates, or hash mutations when
+        # a proposal fails or is unavailable.
+        if not self.llm.is_live:
+            if store:
+                store.append_progress("No live model is available for prediction-market proposals; stopping without fallback candidates.")
+            return []
+        if parents and getattr(self.llm, "provider", "") == "multi":
+            llm_variants = self._llm_prediction_market_lane_code_variants(
+                outer_iteration, parents, temperature=temperature, directions=directions,
+                store=store, entropy_intent=entropy_intent, controller_context=controller_context,
+            )
+        else:
+            llm_variants = self._llm_prediction_market_code_variants(
+                outer_iteration, parents, temperature=temperature, directions=directions,
+                store=store, entropy_intent=entropy_intent, controller_context=controller_context,
+            )
+        if entropy_intent:
+            suffix = _entropy_payload_suffix(entropy_intent)
+            for variant in llm_variants:
+                variant.payload = f"{variant.payload}\n# {suffix}"
+                variant.metadata["meaningful_entropy_intent"] = entropy_intent
+        if not llm_variants and store:
+            store.append_progress("No model-generated prediction-market proposals; stopping instead of using a deterministic fallback.")
+        if not llm_variants:
+            return []
+        return _dedupe_prediction_market_variants(
+            llm_variants, store=store, population_size=self.population_size, outer_iteration=outer_iteration,
+        )
 
         score_history = _score_history(store, mode="optimize") if store else []
         literature_notes = _recent_literature_grounding_notes(store) if store else []
@@ -4327,6 +4278,11 @@ def _prediction_market_no_trade_baseline(code: str, result: dict[str, object], v
 
 
 def _run_prediction_market_official(strategy_path: Path) -> dict[str, object]:
+    return get_optimization_grader("prediction_market").evaluate(strategy_path)
+
+
+def _legacy_run_prediction_market_official(strategy_path: Path) -> dict[str, object]:
+    """Deprecated and not used by the optimization grader path."""
     upstream_path = _find_pm_upstream_path()
     if upstream_path is None:
         if os.environ.get("PREDICTION_MARKET_ALLOW_LOCAL_FALLBACK") == "1":

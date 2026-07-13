@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import statistics
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -35,8 +36,12 @@ class EvaluationHarness:
         trials: list[EvalTrial] = []
         for task in suite.tasks:
             task_trials = task.trials or suite.trials_per_task
-            for trial_index in range(1, task_trials + 1):
-                trials.append(await self._run_trial(task, trial_index))
+            seeds = task.seeds or suite.seeds
+            models = task.models or suite.models
+            for model in models:
+                for seed in seeds:
+                    for trial_index in range(1, task_trials + 1):
+                        trials.append(await self._run_trial(task, trial_index, model, seed))
         self._apply_cross_trial_graders(suite, trials)
         passed_trials = sum(1 for trial in trials if trial.passed)
         aggregate_score = sum(trial.aggregate_score for trial in trials) / max(len(trials), 1)
@@ -51,6 +56,7 @@ class EvaluationHarness:
             passed_trials=passed_trials,
             aggregate_score=round(aggregate_score, 3),
             trials=[asdict(trial) for trial in trials],
+            comparisons=self._comparison_summary(trials),
         )
         (self.output_root / f"{suite.id}_summary.json").write_text(
             json.dumps(asdict(summary), indent=2, sort_keys=True) + "\n",
@@ -74,8 +80,22 @@ class EvaluationHarness:
                 trial.aggregate_score = aggregate_score
                 trial.passed = passed
 
-    async def _run_trial(self, task: EvalTask, trial_index: int) -> EvalTrial:
-        trial_root = self._prepare_trial_root(task, trial_index)
+    def _comparison_summary(self, trials: list[EvalTrial]) -> dict[str, object]:
+        grouped: dict[str, list[EvalTrial]] = {}
+        for trial in trials:
+            grouped.setdefault(f"{trial.task_id}|{trial.model}", []).append(trial)
+        return {
+            key: {
+                "attempts": len(group), "pass_rate": round(sum(item.passed for item in group) / len(group), 3),
+                "mean_score": round(statistics.mean(item.aggregate_score for item in group), 3),
+                "score_stdev": round(statistics.pstdev(item.aggregate_score for item in group), 3) if len(group) > 1 else 0.0,
+                "seeds": sorted({item.seed for item in group}),
+            }
+            for key, group in grouped.items()
+        }
+
+    async def _run_trial(self, task: EvalTask, trial_index: int, model: str, seed: int) -> EvalTrial:
+        trial_root = self._prepare_trial_root(task, trial_index, model, seed)
         # Run artifacts land directly in trial_root (mirroring the outputs/ folder layout).
         trial_output_root = trial_root
         trial_tmp = trial_root / "tmp"
@@ -85,7 +105,9 @@ class EvaluationHarness:
             max_iterations=task.max_iterations,
             evaluator_name=task.evaluator_name,
             echo_progress=False,
-            llm_provider="local",
+            llm_provider=_provider_for_model(model),
+            llm_model=_model_name(model),
+            llm_seed=seed,
         )
         orchestrator = Orchestrator(self.corpus_path, trial_output_root, config)
         previous_tmpdir = os.environ.get("TMPDIR")
@@ -120,16 +142,26 @@ class EvaluationHarness:
             grader_results=[asdict(result) for result in grader_results],
             aggregate_score=aggregate_score,
             passed=passed,
+            seed=seed,
+            model=model,
         )
 
     def _prepare_eval_root(self) -> None:
         self.output_root.mkdir(parents=True, exist_ok=True)
 
-    def _prepare_trial_root(self, task: EvalTask, trial_index: int) -> Path:
+    def _prepare_trial_root(self, task: EvalTask, trial_index: int, model: str, seed: int) -> Path:
         # eval_outputs/<task_id>/trial_001/ — mirrors outputs/ structure per task.
-        trial_root = self.output_root / task.id / f"trial_{trial_index:03d}"
+        safe_model = model.replace("/", "_").replace(":", "_")
+        trial_root = self.output_root / task.id / f"{safe_model}_seed_{seed:04d}" / f"trial_{trial_index:03d}"
         if trial_root.exists():
             shutil.rmtree(trial_root)
         trial_root.mkdir(parents=True, exist_ok=True)
         return trial_root
 
+
+def _provider_for_model(model: str) -> str:
+    return model.split("/", 1)[0] if "/" in model else model
+
+
+def _model_name(model: str) -> str:
+    return model.split("/", 1)[1] if "/" in model else "gpt-5.2"

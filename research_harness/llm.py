@@ -91,6 +91,7 @@ class LLMClient:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout_seconds: float = 60.0,
+        seed: Optional[int] = None,
     ):
         _load_local_env_defaults()
         raw_provider = provider or os.environ.get("RESEARCH_HARNESS_LLM_PROVIDER") or "auto"
@@ -109,6 +110,7 @@ class LLMClient:
         else:
             self.api_key = self.openai_api_key if self.provider in {"auto", "openai"} else self.anthropic_api_key
         self.timeout_seconds = timeout_seconds
+        self.seed = seed
         # Accumulated real token counts across all calls on this client instance.
         self.total_prompt_tokens: int = 0
         self.total_completion_tokens: int = 0
@@ -178,6 +180,7 @@ class LLMClient:
                     "max_output_tokens": max_output_tokens,
                     "configured_provider": stored_provider,
                     "configured_model": stored_model,
+                    "seed": self.seed,
                 }
             )
             return response
@@ -255,6 +258,7 @@ class LLMClient:
             "tool_choice": "auto",
             "max_completion_tokens": max_output_tokens,
             "temperature": temperature,
+            **({"seed": self.seed} if self.seed is not None and self.provider in {"openai", "kimi"} else {}),
         }
         endpoint = "https://api.moonshot.ai/v1/chat/completions" if self.provider == "kimi" else "https://api.openai.com/v1/chat/completions"
         api_key = self.kimi_api_key if self.provider == "kimi" else self.openai_api_key

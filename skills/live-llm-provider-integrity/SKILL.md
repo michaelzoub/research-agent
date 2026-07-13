@@ -1,12 +1,12 @@
 ---
 name: live-llm-provider-integrity
-description: Use when changing LLM provider selection, model catalogs, API-key loading, Kimi/Moonshot support, live model fallbacks, optimizer/controller proposal calls, or traces/costs that depend on whether a real model call succeeded. Prevents accidentally treating local deterministic fallback or failed provider calls as live LLM-generated strategy work.
+description: Use when changing LLM provider selection, model catalogs, API-key loading, Kimi/Moonshot support, live model fallbacks, tool-call traces, or costs that depend on whether a real model call succeeded.
 ---
 
 # Live LLM Provider Integrity
 
 Use this skill whenever a change touches `LLMClient`, model selection, Kimi,
-environment loading, optimizer proposal/controller calls, or traces that claim
+environment loading, tool proposal calls, or traces that claim
 which model generated an artifact.
 
 ## Required Checks
@@ -29,21 +29,18 @@ which model generated an artifact.
 - Kimi keys may be `MOONSHOT_API_KEY` or `KIMI_API_KEY`.
 - Do not print key values. Only report booleans such as `has_kimi_key=True`.
 
-## Optimizer/Challenge Rule
+## Challenge Tool Rule
 
 For optimization challenge runs, distinguish these cases:
 
-- **Live LLM-generated code**: `llm_propose_*` trace completed and candidate
-  payload contains complete generated strategy code.
-- **Controller fallback**: `optimization_agent:*` trace failed or used fallback
-  decision logic.
-- **Template/fallback candidates**: payloads such as `pm_strategy=...`,
-  `champion_diff`, `contextual_parent_mutation`, or
-  `deterministic_structural`.
+- **Live LLM-generated code**: a completed `model_turn` contains the native
+  tool-call arguments with complete strategy code.
+- **Provider failure**: the matching `model_request` / `model_turn` pair ends
+  with an error status.
+- **No generated candidate**: no evaluation tool call occurred; do not imply a
+  deterministic fallback candidate was evaluated.
 
-If the LLM proposal trace failed, do not describe the next candidates as
-literature-derived LLM solutions. Say they are fallback/template candidates with
-literature/controller context attached.
+If the model request failed, do not describe an evaluation as LLM-generated.
 
 ## Regression Tests
 

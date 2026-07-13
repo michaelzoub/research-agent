@@ -45,7 +45,7 @@ HELP_EPILOG = """
 Examples:
   autore
   autore "Research how multi-agent systems improve literature review quality"
-  autore "Compare a proposed strategy with the registered evaluator" --evaluator length_score
+  autore "optimize pm challenge" --grader prediction_market
 
 Useful companions:
   autore --list-llm-models
@@ -105,8 +105,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--evaluator",
+        "--grader",
+        dest="evaluator",
         default=os.environ.get("RESEARCH_HARNESS_EVALUATOR"),
-        help="Optional registered evaluator made available to the agent as a controlled capability.",
+        help="Optimization grader/evaluator id. --grader is the preferred spelling; --evaluator remains supported.",
+    )
+    parser.add_argument(
+        "--grader-loops",
+        type=int,
+        default=int(os.environ["RESEARCH_HARNESS_GRADER_LOOPS"]) if os.environ.get("RESEARCH_HARNESS_GRADER_LOOPS") else None,
+        help="Requested number of official candidate evaluations for --grader; the run continues its feedback loop until used or genuinely blocked. Separate from --max-iterations (model turns).",
     )
     parser.add_argument(
         "--llm-provider",
@@ -261,7 +269,7 @@ def _banner_right_lines(width: int) -> list[str]:
         "Use --llm-model ollama/qwen3.5:latest locally.",
         "",
         "What's new",
-        "Claude-style startup panel and guided flow.",
+        "New startup panel and guided flow.",
         "Ollama provider support for local models.",
         "Install command: python3 -m pip install -e .",
     ]
@@ -574,10 +582,15 @@ def main() -> None:
         print("")
     if args.preflight:
         run_preflight_evals(args)
+    if args.grader_loops is not None and args.evaluator is None:
+        parser.error("--grader-loops requires --grader (or --evaluator).")
+    if args.grader_loops is not None and args.grader_loops < 1:
+        parser.error("--grader-loops must be at least 1.")
     config = HarnessConfig(
         retriever=args.retriever,
         max_iterations=args.max_iterations,
         evaluator_name=args.evaluator,
+        max_grader_calls=args.grader_loops,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
         session_projects_dir=args.session_projects_dir,
@@ -591,7 +604,10 @@ def main() -> None:
         ),
     )
     orchestrator = Orchestrator(args.corpus, args.output, config)
-    run, store = asyncio.run(orchestrator.run(args.goal))
+    try:
+        run, store = asyncio.run(orchestrator.run(args.goal))
+    except RuntimeError as exc:
+        raise SystemExit(f"Optimization run stopped: {exc}") from exc
     _print_run_summary(run, store)
 
 

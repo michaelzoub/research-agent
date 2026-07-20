@@ -23,6 +23,9 @@ from .schemas import AgentBudget
 RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "github", "web", "docs_blogs", "twitter", "alchemy")
 LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "kimi", "ollama", "local", "multi")
 OPTIMIZATION_GRADER_CHOICES = list_optimization_graders()
+DEFAULT_GRADER_LOOPS = 8
+MODEL_TURNS_PER_GRADER_LOOP = 3
+SECONDS_PER_GRADER_LOOP = 120
 
 ANSI = {
     "reset": "\033[0m",
@@ -48,7 +51,7 @@ HELP_EPILOG = """
 Examples:
   autore
   autore "Research how multi-agent systems improve literature review quality"
-  autore "optimize pm challenge" --grader --grader-loops 6
+  autore "optimize pm challenge" --grader --grader-loops 8
 
 Useful companions:
   autore --list-llm-models
@@ -119,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--grader-loops",
         type=int,
         default=int(os.environ["RESEARCH_HARNESS_GRADER_LOOPS"]) if os.environ.get("RESEARCH_HARNESS_GRADER_LOOPS") else None,
-        help="Requested number of official candidate evaluations for --grader; the run continues its feedback loop until used or genuinely blocked. Separate from --max-iterations (model turns).",
+        help="Requested number of official candidate evaluations for --grader; implicit turn and runtime defaults scale to fit, while explicit budget flags remain hard limits.",
     )
     parser.add_argument(
         "--llm-provider",
@@ -514,7 +517,7 @@ def configure_interactive_run(
     if args.grader:
         args.grader_loops = prompt_int(
             "Official candidate evaluations",
-            default=args.grader_loops or 4,
+            default=args.grader_loops or DEFAULT_GRADER_LOOPS,
             input_func=input_func,
             output_func=output_func,
         )
@@ -539,9 +542,10 @@ def configure_interactive_run(
         output_func=output_func,
         key_reader=key_reader,
     )
+    suggested_iterations = _recommended_model_turns(args.grader_loops) if args.grader else args.max_iterations
     args.max_iterations = prompt_int(
         "Maximum model turns",
-        default=args.max_iterations,
+        default=max(args.max_iterations, suggested_iterations),
         input_func=input_func,
         output_func=output_func,
     )
@@ -586,6 +590,10 @@ def main() -> None:
         item == "--max-iterations" or item.startswith("--max-iterations=")
         for item in sys.argv[1:]
     )
+    args.max_runtime_seconds_explicit = any(
+        item == "--max-runtime-seconds" or item.startswith("--max-runtime-seconds=")
+        for item in sys.argv[1:]
+    )
     if args.list_llm_models:
         _print_cli_banner(compact=True)
         print(format_model_catalog())
@@ -610,6 +618,7 @@ def main() -> None:
         parser.error("--grader-loops requires --grader.")
     if args.grader_loops is not None and args.grader_loops < 1:
         parser.error("--grader-loops must be at least 1.")
+    _apply_grader_budget_defaults(args)
     config = HarnessConfig(
         retriever=args.retriever,
         max_iterations=args.max_iterations,
@@ -633,6 +642,26 @@ def main() -> None:
     except RuntimeError as exc:
         raise SystemExit(f"Optimization run stopped: {exc}") from exc
     _print_run_summary(run, store)
+
+
+def _recommended_model_turns(grader_loops: Optional[int]) -> int:
+    return 20 if not grader_loops else grader_loops * MODEL_TURNS_PER_GRADER_LOOP + 4
+
+
+def _apply_grader_budget_defaults(args: argparse.Namespace) -> None:
+    """Reserve enough turns and wall time for requested official rounds.
+
+    Explicit user budgets remain hard limits. Only implicit CLI defaults scale.
+    """
+    if not args.grader or not args.grader_loops:
+        return
+    if not getattr(args, "max_iterations_explicit", False):
+        args.max_iterations = max(args.max_iterations, _recommended_model_turns(args.grader_loops))
+    if not getattr(args, "max_runtime_seconds_explicit", False):
+        args.max_runtime_seconds = max(
+            args.max_runtime_seconds,
+            float(args.grader_loops * SECONDS_PER_GRADER_LOOP),
+        )
 
 
 def run_preflight_evals(args: argparse.Namespace) -> None:

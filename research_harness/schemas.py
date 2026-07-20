@@ -139,6 +139,9 @@ class Source:
     # Maps section names to stable, human-readable locations such as
     # {"kind": "pdf_page", "page": 4} or {"kind": "docx_heading", "section": "Methods"}.
     evidence_locators: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Normalized tables found during ingestion.  Values are retained as strings
+    # here; the extraction tool owns numeric coercion and dataset persistence.
+    structured_tables: list[dict[str, Any]] = field(default_factory=list)
     id: str = field(default_factory=lambda: new_id("src"))
     retrieved_at: str = field(default_factory=now_iso)
     canonical_id: Optional[str] = None

@@ -36,6 +36,7 @@ Avoid these services when:
 | [mpp.dev / Tempo](mpp-dev.md) | MPP service discovery and paid requests, including Tako, market data, scraping, live odds, and other service marketplace endpoints. | Tempo CLI installed and wallet ready. |
 | [AgentCash](agentcash.md) | x402/MPP APIs, Stable* services, enrichment, social data, search, file upload, email, and other pay-per-call APIs. | Onboarded; balance available. Invite code was already redeemed. |
 | [Orthogonal](orthogonal.md) | Curated skills first, then API marketplace search and paid integrations. | CLI installed; requires `orth login` with an API key before use. |
+| [Firecrawl](firecrawl.md) | Live web search and clean Markdown scraping through the runtime external-service registry. | Keyless fallback available; set `FIRECRAWL_API_KEY` for authenticated limits. |
 
 ## Notable Research Uses
 
@@ -61,4 +62,3 @@ Avoid these services when:
   request metadata, timestamps, prices when available, and citations.
 - If a paid call fails because of balance, auth, or spending limits, report the
   blocker and continue with cheaper sources when possible.
-

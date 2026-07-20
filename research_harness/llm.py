@@ -93,7 +93,7 @@ class LLMClient:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         api_key: Optional[str] = None,
-        timeout_seconds: float = 60.0,
+        timeout_seconds: Optional[float] = None,
         seed: Optional[int] = None,
     ):
         _load_local_env_defaults()
@@ -112,7 +112,16 @@ class LLMClient:
             self.api_key = None
         else:
             self.api_key = self.openai_api_key if self.provider in {"auto", "openai"} else self.anthropic_api_key
-        self.timeout_seconds = timeout_seconds
+        configured_timeout = os.environ.get("RESEARCH_HARNESS_LLM_TIMEOUT_SECONDS")
+        if timeout_seconds is not None:
+            self.timeout_seconds = float(timeout_seconds)
+        elif configured_timeout:
+            self.timeout_seconds = float(configured_timeout)
+        else:
+            # Kimi reasoning turns with a large native tool schema can exceed
+            # 60 seconds.  A longer single request is more useful than three
+            # identical 60-second requests that all terminate mid-generation.
+            self.timeout_seconds = 120.0 if self.provider == "kimi" else 60.0
         self.seed = seed
         # Accumulated real token counts across all calls on this client instance.
         self.total_prompt_tokens: int = 0

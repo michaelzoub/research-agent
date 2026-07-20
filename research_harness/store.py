@@ -120,6 +120,9 @@ class ArtifactStore:
         self.progress_path = self.root / "progress.txt"
         self.learnings_path = self.root / "learnings.md"
         self.learning_log_path = self.root / "learnings.jsonl"
+        self.datasets_dir = self.root / "datasets"
+        self.document_analyses_dir = self.root / "document_analyses"
+        self.charts_dir = self.root / "charts"
         if not self.progress_path.exists():
             self.progress_path.write_text("", encoding="utf-8")
         if not self.agent_event_log_path.exists():
@@ -480,6 +483,39 @@ class ArtifactStore:
         self.agent_transcript_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
         self._record_artifact_write(self.agent_transcript_path, "agent_messages")
         return self.agent_transcript_path
+
+    def write_dataset(self, dataset_id: str, payload: dict[str, Any]) -> Path:
+        path = self._artifact_path(self.datasets_dir, dataset_id, ".json")
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(path, "extracted_dataset")
+        return path
+
+    def read_dataset(self, dataset_id: str) -> Optional[dict[str, Any]]:
+        path = self._artifact_path(self.datasets_dir, dataset_id, ".json", create=False)
+        if not path.is_file(): return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def write_document_analysis(self, analysis_id: str, payload: dict[str, Any]) -> Path:
+        path = self._artifact_path(self.document_analyses_dir, analysis_id, ".json")
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(path, "document_analysis")
+        return path
+
+    def write_chart(self, chart_id: str, svg: str, payload: dict[str, Any]) -> tuple[Path, Path]:
+        svg_path = self._artifact_path(self.charts_dir, chart_id, ".svg")
+        config_path = self._artifact_path(self.charts_dir, chart_id, ".json")
+        svg_path.write_text(svg, encoding="utf-8")
+        config_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(svg_path, "svg_chart")
+        self._record_artifact_write(config_path, "svg_chart_config")
+        return svg_path, config_path
+
+    @staticmethod
+    def _artifact_path(directory: Path, artifact_id: str, suffix: str, *, create: bool = True) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", artifact_id):
+            raise ValueError("Artifact IDs may contain only letters, digits, dots, underscores, and hyphens.")
+        if create: directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{artifact_id}{suffix}"
 
     def append_agent_event(self, event: dict[str, Any]) -> None:
         """Durably record each observed model turn and tool result as it occurs."""

@@ -13,6 +13,7 @@ from .experiments import (
     WorkerPool,
 )
 from .research_agent import AgentLoop, AgentRunConfig, AgentRunResult, ResearchAgent
+from .agent_state import AgentState
 
 __all__ = [
     "__version__",
@@ -29,6 +30,7 @@ __all__ = [
     "AgentLoop",
     "AgentRunConfig",
     "AgentRunResult",
+    "AgentState",
     "ResearchAgent",
 ]
 

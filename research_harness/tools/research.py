@@ -43,7 +43,7 @@ class SearchTool:
         for source in sources:
             source.evidence_kind = "lead"
         metadata = [asdict(source) for source in sources]
-        return ToolResult("ok", {"query": query, "result_count": len(metadata), "discarded_low_relevance_count": len(documents) - len(retained), "minimum_retained_relevance": self.MINIMUM_RETAINED_RELEVANCE, "results": [{"title": row["title"], "url": row["url"], "summary": row["summary"]} for row in metadata]}, source_metadata=metadata)
+        return ToolResult("ok", {"query": query, "result_count": len(metadata), "discarded_low_relevance_count": len(documents) - len(retained), "minimum_retained_relevance": self.MINIMUM_RETAINED_RELEVANCE, "results": [{"title": row["title"], "url": row["url"], "summary": str(row["summary"])[:600]} for row in metadata]}, source_metadata=metadata)
 
 
 class WebFetchTool:
@@ -53,11 +53,35 @@ class WebFetchTool:
     description = "Fetch a known public HTTP(S) document after discovery. Rejects private, local, and unsafe redirect destinations."
     input_schema = {"type": "object", "required": ["url"], "properties": {"url": {"type": "string", "minLength": 8}, "prefer_markdown": {"type": "boolean"}}, "additionalProperties": False}
 
-    def __init__(self, timeout_seconds: float = 15.0, max_characters: int = 20000, max_redirects: int = 5):
-        self.timeout_seconds, self.max_characters, self.max_redirects = timeout_seconds, max_characters, max_redirects
+    def __init__(
+        self,
+        timeout_seconds: float = 15.0,
+        max_characters: int = 20000,
+        max_redirects: int = 5,
+        max_document_bytes: int = 25_000_000,
+    ):
+        self.timeout_seconds = timeout_seconds
+        self.max_characters = max_characters
+        self.max_redirects = max_redirects
+        self.max_document_bytes = max_document_bytes
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         requested_url = str(arguments["url"]).strip()
+        cached = _cached_verified_document(context.store, requested_url)
+        if cached is not None:
+            sections = dict(cached.get("evidence_sections") or {})
+            data = {
+                "url": str(cached.get("url") or requested_url),
+                "content_type": "cached/verified-document",
+                "document_type": str(cached.get("source_type") or "fetched_document"),
+                "evidence_sections": sections,
+                "evidence_locators": dict(cached.get("evidence_locators") or {}),
+                "content": "\n\n".join(f"[{name}]\n{value}" for name, value in sections.items()),
+                "truncated": False,
+                "renderer": "artifact_cache",
+                "cached": True,
+            }
+            return ToolResult("ok", data, source_metadata=[cached])
         result = await asyncio.to_thread(self._fetch, requested_url, bool(arguments.get("prefer_markdown", True)))
         if result.status != "ok":
             return result
@@ -80,10 +104,15 @@ class WebFetchTool:
             evidence_kind="verified_document",
             evidence_sections=dict(data.get("evidence_sections") or {}),
             evidence_locators=dict(data.get("evidence_locators") or {}),
+            structured_tables=list(data.get("structured_tables") or []),
         )
         return ToolResult("ok", data, source_metadata=[asdict(source)])
 
     def _fetch(self, url: str, prefer_markdown: bool) -> ToolResult:
+        # An arXiv abstract page contains metadata, not the paper body. Fetch the
+        # corresponding PDF so literature grounding is based on extracted paper
+        # text with page locators.
+        url = _arxiv_pdf_url(url) or url
         for _ in range(self.max_redirects + 1):
             error = _public_url_error(url)
             if error:
@@ -103,11 +132,25 @@ class WebFetchTool:
                 return ToolResult("error", error=f"Network error: {exc}", retryable=True)
             with response:
                 content_type = str(response.headers.get("Content-Type") or "")
-                if content_type and not any(kind in content_type.lower() for kind in ("text", "json", "pdf", "wordprocessingml", "msword")):
+                response_path = urllib.parse.urlsplit(url).path.lower()
+                expected_document = response_path.endswith((".pdf", ".docx", ".doc")) or "/pdf/" in response_path
+                if content_type and not expected_document and not any(kind in content_type.lower() for kind in ("text", "json", "pdf", "wordprocessingml", "msword")):
                     return ToolResult("error", error="URL did not return a supported document content type.")
-                raw = response.read(self.max_characters + 1)
-            if "pdf" in content_type.lower() or "wordprocessingml" in content_type.lower() or raw.startswith(b"PK"):
-                return ToolResult("ok", {"url": url, "content_type": content_type, "raw_content": raw, "truncated": len(raw) > self.max_characters, "renderer": "document_parser"})
+                # max_characters bounds the model-facing extract, not the HTTP
+                # response.  Real HTML pages routinely exceed 20 KB before
+                # boilerplate removal (the Paradigm PM-AMM article is ~285 KB).
+                # Apply the bounded document download limit to every supported
+                # response, then let ingest_document truncate extracted text.
+                byte_limit = self.max_document_bytes
+                raw = response.read(byte_limit + 1)
+                if len(raw) > byte_limit:
+                    return ToolResult(
+                        "error",
+                        error=f"Document exceeded the {byte_limit}-byte fetch limit.",
+                        retryable=False,
+                    )
+            if "pdf" in content_type.lower() or "wordprocessingml" in content_type.lower() or raw.startswith((b"%PDF", b"PK")):
+                return ToolResult("ok", {"url": url, "content_type": content_type, "raw_content": raw, "truncated": False, "renderer": "document_parser"})
             text = raw.decode("utf-8", errors="replace")
             if prefer_markdown and "html" in content_type.lower():
                 rendered = self._fetch_curl_markdown(url)
@@ -126,6 +169,35 @@ class WebFetchTool:
                 return response.read(self.max_characters + 1).decode("utf-8", errors="replace")
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
             return None
+
+
+def _arxiv_pdf_url(url: str) -> str | None:
+    parsed = urllib.parse.urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"arxiv.org", "www.arxiv.org"} or not parsed.path.startswith("/abs/"):
+        return None
+    identifier = parsed.path.removeprefix("/abs/").strip("/")
+    if not identifier:
+        return None
+    return urllib.parse.urlunsplit(("https", "arxiv.org", f"/pdf/{identifier}", "", ""))
+
+
+def _document_identity(url: str) -> str:
+    normalized = _arxiv_pdf_url(url) or url
+    parsed = urllib.parse.urlsplit(normalized.rstrip("/"))
+    return urllib.parse.urlunsplit(("", (parsed.hostname or "").lower(), parsed.path.rstrip("/"), parsed.query, ""))
+
+
+def _cached_verified_document(store: Any, requested_url: str) -> dict[str, Any] | None:
+    if store is None or not hasattr(store, "list"):
+        return None
+    identity = _document_identity(requested_url)
+    for source in store.list("sources"):
+        if source.get("evidence_kind") != "verified_document":
+            continue
+        if _document_identity(str(source.get("url") or "")) == identity:
+            return dict(source)
+    return None
 
 
 class DocumentFigureTool:

@@ -31,16 +31,19 @@ def _ingest_pdf(payload: bytes, max_characters: int) -> dict[str, Any]:
     try:
         from pypdf import PdfReader  # type: ignore[import-not-found]
         reader = PdfReader(io.BytesIO(payload))
-        sections, locators = {}, {}
+        sections, locators, tables = {}, {}, []
         for index, page in enumerate(reader.pages, start=1):
             text = _clean(page.extract_text() or "")
             if text:
                 key = f"page_{index}"
                 sections[key] = text[:max_characters]
                 locators[key] = [{"kind": "pdf_page", "page": index}]
+                tables.extend(_delimited_tables(text, {"kind": "pdf_table", "page": index}))
         if not sections:
             return {"error": "PDF contained no extractable text (it may be scanned).", "document_type": "pdf"}
-        return _bounded_sections(sections, locators, max_characters, "pdf")
+        result = _bounded_sections(sections, locators, max_characters, "pdf")
+        result["structured_tables"] = tables
+        return result
     except Exception as exc:
         return {"error": f"PDF parsing failed: {type(exc).__name__}: {exc}", "document_type": "pdf"}
 
@@ -74,7 +77,18 @@ def _ingest_docx(payload: bytes, max_characters: int) -> dict[str, Any]:
                 sections.setdefault(current, "")
             sections[current] = (sections.get(current, "") + "\n" + text).strip()
             locators[current].append({"kind": "docx_paragraph", "section": current, "paragraph": ordinal})
-        return _bounded_sections(sections, dict(locators), max_characters, "docx")
+        result = _bounded_sections(sections, dict(locators), max_characters, "docx")
+        tables = []
+        for number, table in enumerate(root.findall(".//w:tbl", ns), start=1):
+            rows = []
+            for row in table.findall("w:tr", ns):
+                cells = [_clean("".join(cell.itertext())) for cell in row.findall("w:tc", ns)]
+                if any(cells):
+                    rows.append(cells)
+            if rows:
+                tables.append({"name": f"table_{number}", "headers": rows[0], "rows": rows[1:], "locator": {"kind": "docx_table", "table": number}})
+        result["structured_tables"] = tables
+        return result
     except Exception as exc:
         return {"error": f"DOCX parsing failed: {type(exc).__name__}: {exc}", "document_type": "docx"}
 
@@ -85,18 +99,37 @@ class _HTMLSections(HTMLParser):
         self.sections: dict[str, str] = defaultdict(str)
         self.locators: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.current, self.ordinal, self._heading = "document", 0, False
+        self.tables: list[dict[str, Any]] = []
+        self._table_rows: list[list[str]] | None = None
+        self._table_row: list[str] | None = None
+        self._table_cell: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self._heading = tag in {"h1", "h2", "h3", "h4", "h5", "h6"}
+        if tag == "table": self._table_rows = []
+        elif tag == "tr" and self._table_rows is not None: self._table_row = []
+        elif tag in {"td", "th"} and self._table_row is not None: self._table_cell = []
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             self._heading = False
+        if tag in {"td", "th"} and self._table_cell is not None and self._table_row is not None:
+            self._table_row.append(_clean(" ".join(self._table_cell))); self._table_cell = None
+        elif tag == "tr" and self._table_row is not None and self._table_rows is not None:
+            if any(self._table_row): self._table_rows.append(self._table_row)
+            self._table_row = None
+        elif tag == "table" and self._table_rows is not None:
+            if self._table_rows:
+                number = len(self.tables) + 1
+                self.tables.append({"name": f"table_{number}", "headers": self._table_rows[0], "rows": self._table_rows[1:], "locator": {"kind": "html_table", "table": number, "section": self.current}})
+            self._table_rows = None
 
     def handle_data(self, data: str) -> None:
         text = _clean(data)
         if not text:
             return
+        if self._table_cell is not None:
+            self._table_cell.append(text)
         self.ordinal += 1
         if self._heading:
             self.current = _unique_section_key(text, self.sections)
@@ -107,7 +140,21 @@ class _HTMLSections(HTMLParser):
 def _ingest_html(text: str, max_characters: int) -> dict[str, Any]:
     parser = _HTMLSections()
     parser.feed(text)
-    return _bounded_sections(dict(parser.sections), dict(parser.locators), max_characters, "html")
+    result = _bounded_sections(dict(parser.sections), dict(parser.locators), max_characters, "html")
+    result["structured_tables"] = parser.tables
+    return result
+
+
+def _delimited_tables(text: str, locator: dict[str, Any]) -> list[dict[str, Any]]:
+    """Conservatively retain PDF text tables with tabs or pipe delimiters."""
+    rows = []
+    for line in text.splitlines():
+        delimiter = "\t" if "\t" in line else "|" if "|" in line else ""
+        if not delimiter:
+            continue
+        values = [_clean(value) for value in line.strip(" |\t").split(delimiter)]
+        if len(values) >= 2 and any(values): rows.append(values)
+    return [{"name": "table_1", "headers": rows[0], "rows": rows[1:], "locator": locator}] if len(rows) >= 2 else []
 
 
 def _single_section(text: str, name: str, locator: dict[str, Any], max_characters: int, *, document_type: str) -> dict[str, Any]:

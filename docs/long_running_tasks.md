@@ -17,7 +17,16 @@ outputs/<run>/agent_events.jsonl
 outputs/<run>/failed_paths.json
 outputs/<run>/sources.json
 outputs/<run>/final_report.md
+outputs/<run>/datasets/
+outputs/<run>/document_analyses/
+outputs/<run>/charts/
 ```
+
+When useful, the model can extract traceable tables and measurements from a
+verified fetched HTML, PDF, or DOCX document into `datasets/<id>.json`, request
+a grounded LLM reading that separates source-stated material from inferences,
+and generate a deterministic SVG from a dataset ID. These are optional tool
+calls within the same trajectory; they are never a mandatory document pipeline.
 
 ## Prediction-market optimization
 
@@ -26,11 +35,10 @@ Enable the official prediction-market challenge grader with `--grader`; `--grade
 ```bash
 ./autore "Optimize the prediction-market challenge with literature-guided market making." \
   --grader \
-  --grader-loops 6 \
-  --max-iterations 20
+  --grader-loops 8
 ```
 
-The model controls research and candidate revisions. The registered grader is the only scoring authority, and an unavailable grader produces an error rather than a fabricated score.
+The model controls research and candidate revisions. The registered grader is the only scoring authority, and an unavailable grader produces an error rather than a fabricated score. Unless explicitly overridden, model-turn and wall-clock budgets scale with the requested grader rounds; explicit budget flags remain hard limits. Between rounds, the model receives a compact working-state checkpoint rather than the full transcript: exact champion/latest code, all trial scores, fetched literature extracts, remaining evaluation count, and the newest unresolved tool exchange.
 
 ## Resuming work
 

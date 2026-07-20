@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from .llm import LLMClient
+from .external_services import default_external_service_registry
 from .research_agent import AgentRunConfig, ResearchAgent
 from .schemas import AgentBudget, CostEvent, RunRecord, now_iso, to_dict
 from .search import AlchemySearch, ArxivSearch, DocsBlogsSearch, GitHubSearch, LocalCorpusSearch, OpenAlexSearch, SearchBackend, SemanticScholarSearch, SocialWebSearch, WebSearch, WikipediaSearch
@@ -135,7 +136,7 @@ class Orchestrator:
                 transcript = {}
         store.write_run_state({
             "schema_version": "model_directed_run_state_v1", "stage": stage, "run": to_dict(run), "goal": run.user_goal,
-            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal", "consult_specialist"] + (["evaluate_prediction_market_candidate", "spawn_optimization_agents", "run_parameter_sweep", "save_learning"] if self.config.evaluator_name == "prediction_market" else []),
+            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal"] + [tool.name for tool in default_external_service_registry().tools()] + ["consult_specialist"] + (["evaluate_prediction_market_candidate", "spawn_optimization_agents", "run_parameter_sweep", "save_learning"] if self.config.evaluator_name == "prediction_market" else []),
             "observed_counts": {"events": len(transcript.get("events", [])), "messages": len(transcript.get("messages", [])), "tool_calls": len(transcript.get("tool_calls", []))},
             "termination": transcript.get("termination_reason"),
             "artifacts": {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import asyncio
 import io
+import os
 import socket
 import subprocess
 import tempfile
@@ -13,16 +14,20 @@ from unittest import mock
 from pathlib import Path
 from typing import Any
 
-from research_harness.cli import build_parser, configure_interactive_run
+from research_harness.cli import _apply_grader_budget_defaults, build_parser, configure_interactive_run
 from research_harness.llm import LLMClient, LLMError, ModelToolCall, ModelTurn, _post_json, _validate_tool_history
 from research_harness.agents import SpecialistConsultationTool
 from research_harness.orchestrator import HarnessConfig
+from research_harness.agent_loop import AgentLoop, AgentMiddleware, MiddlewareStack
+from research_harness.agent_state import AgentState
+from research_harness.context_projection import WorkingStateProjector
 from research_harness.research_agent import AgentRunConfig, FinalAnswerValidator, ResearchAgent, _SYSTEM_INSTRUCTIONS, _join_answer_chunks, _partial_synthesis
 from research_harness.search import ArxivSearch, LocalCorpusSearch, WebSearch, _arxiv_identifier, _arxiv_query, _retrieval_query
+from research_harness.schemas import Source
 from research_harness.store import ArtifactStore
 from research_harness.tools import DocumentFigureTool, OptimizationSwarmTool, ParameterSweepTool, PredictionMarketEvaluationTool, SaveLearningTool, SearchTool, TerminalExecutionTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
 from research_harness.llm import LLMResponse
-from research_harness.tools.research import _FigureHTMLParser, _image_dimensions, _inspection_urls
+from research_harness.tools.research import _FigureHTMLParser, _arxiv_pdf_url, _image_dimensions, _inspection_urls
 
 
 class ScriptedDecider:
@@ -61,6 +66,16 @@ class ResearchAgentTest(unittest.TestCase):
                 _post_json("https://provider.test/v1", {"model": "test"}, {}, 1)
 
         self.assertEqual(urlopen.call_count, 1)
+
+    def test_kimi_uses_longer_default_timeout_and_allows_override(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RESEARCH_HARNESS_LLM_TIMEOUT_SECONDS", None)
+            client = LLMClient(provider="kimi", model="kimi/kimi-k2.6", api_key="sk-test")
+        self.assertEqual(client.timeout_seconds, 120.0)
+
+        with mock.patch.dict(os.environ, {"RESEARCH_HARNESS_LLM_TIMEOUT_SECONDS": "45"}):
+            overridden = LLMClient(provider="kimi", model="kimi/k2.6", api_key="sk-test")
+        self.assertEqual(overridden.timeout_seconds, 45.0)
 
     def test_kimi_native_tool_turn_forces_temperature_one(self) -> None:
         client = LLMClient(provider="kimi", model="kimi/kimi-k2.6", api_key="sk-test")
@@ -202,6 +217,77 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(result.final_answer, "No external evidence is needed.")
         self.assertEqual(result.tool_calls, [])
 
+    def test_agent_state_initializes_the_provider_neutral_trajectory(self) -> None:
+        context = ToolContext(workspace=Path.cwd(), run_id="state-test")
+        state = AgentState.initialize(
+            objective="Investigate.", context=context, initial_cost=0.25,
+            system_messages=["system one", "system two"],
+        )
+
+        self.assertEqual(state.objective, "Investigate.")
+        self.assertEqual([message["role"] for message in state.messages], ["system", "system", "user"])
+        self.assertEqual(state.initial_cost, 0.25)
+        self.assertEqual(state.current_iteration, 0)
+        self.assertEqual(state.tool_calls, [])
+
+    def test_middleware_stack_composes_forward_before_and_reverse_after(self) -> None:
+        calls: list[str] = []
+
+        class RecordingMiddleware(AgentMiddleware):
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            async def before_agent(self, _state: AgentState) -> None:
+                calls.append(f"before:{self.name}")
+
+            async def after_agent(self, _state: AgentState) -> None:
+                calls.append(f"after:{self.name}")
+
+        state = AgentState.initialize(
+            objective="Investigate.", context=ToolContext(workspace=Path.cwd()),
+            initial_cost=0.0, system_messages=[],
+        )
+        stack = MiddlewareStack([RecordingMiddleware("first"), RecordingMiddleware("second")])
+
+        async def exercise() -> None:
+            await stack.before_agent(state)
+            await stack.after_agent(state)
+
+        asyncio.run(exercise())
+        self.assertEqual(calls, ["before:first", "before:second", "after:second", "after:first"])
+
+    def test_runtime_policy_terminates_before_a_model_call(self) -> None:
+        class UncalledDecider:
+            def __init__(self) -> None:
+                self.called = False
+
+            def decide(self, _messages: Any, _tools: Any) -> ModelTurn:
+                self.called = True
+                raise AssertionError("runtime policy should stop before the model")
+
+        decider = UncalledDecider()
+        result = asyncio.run(AgentLoop(
+            decider, ToolRegistry([]), AgentRunConfig(max_runtime_seconds=-1)
+        ).run("Do work.", ToolContext(workspace=Path.cwd())))
+
+        self.assertFalse(decider.called)
+        self.assertEqual(result.termination_reason, "budget_exhausted")
+        self.assertIn("Wall-clock runtime budget exhausted", result.final_answer)
+        self.assertEqual([event.event_type for event in result.events], ["termination"])
+
+    def test_cost_policy_terminates_before_a_model_call(self) -> None:
+        class CostLLM:
+            def total_cost(self) -> float:
+                return 1.0
+
+        decider = mock.Mock(llm=CostLLM())
+        result = asyncio.run(AgentLoop(
+            decider, ToolRegistry([]), AgentRunConfig(max_cost_usd=0.0)
+        ).run("Do work.", ToolContext(workspace=Path.cwd())))
+
+        decider.decide.assert_not_called()
+        self.assertEqual(result.termination_reason, "budget_exhausted")
+
     def test_model_turn_records_request_start_response_end_and_duration(self) -> None:
         class DelayedDecider:
             async def decide(self, _messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> dict[str, Any]:
@@ -236,6 +322,47 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(result.status, "partial")
         self.assertIn("error — Model error: LLMError: provider rejected malformed history", progress)
         self.assertNotIn("unknown/unknown", progress)
+
+    def test_agent_retries_transport_exhaustion_without_losing_state(self) -> None:
+        class TimeoutThenAnswer:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.observed_messages: list[list[dict[str, Any]]] = []
+
+            def decide(self, messages: list[dict[str, Any]], _tools: Any) -> ModelTurn:
+                self.calls += 1
+                self.observed_messages.append(list(messages))
+                if self.calls == 1:
+                    raise LLMError("Could not reach model provider after 3 attempt(s): read timed out")
+                return ModelTurn("Recovered.", [], "stop", "test", "test")
+
+        decider = TimeoutThenAnswer()
+        result = ResearchAgent(
+            decider, ToolRegistry([]), AgentRunConfig(max_iterations=3, max_consecutive_model_failures=2)
+        ).run("Recover from a transient provider failure.", workspace=Path.cwd())
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(decider.calls, 2)
+        self.assertEqual(decider.observed_messages[0], decider.observed_messages[1])
+        retries = [event for event in result.events if event.event_type == "model_retry"]
+        self.assertEqual(len(retries), 1)
+
+    def test_agent_does_not_retry_non_transport_model_error(self) -> None:
+        class RejectedRequest:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def decide(self, _messages: Any, _tools: Any) -> ModelTurn:
+                self.calls += 1
+                raise LLMError("provider rejected malformed history")
+
+        decider = RejectedRequest()
+        result = ResearchAgent(
+            decider, ToolRegistry([]), AgentRunConfig(max_iterations=3, max_consecutive_model_failures=2)
+        ).run("Do not hide a deterministic provider rejection.", workspace=Path.cwd())
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(decider.calls, 1)
 
     def test_prediction_market_evaluation_is_a_model_selected_real_grader_call(self) -> None:
         code = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
@@ -483,6 +610,29 @@ class ResearchAgentTest(unittest.TestCase):
         args = build_parser().parse_args(["optimize pm challenge", "--grader", "prediction_market", "--grader-loops", "3"])
         self.assertEqual(args.grader_loops, 3)
 
+    def test_cli_scales_implicit_budgets_for_more_grader_rounds(self) -> None:
+        args = build_parser().parse_args(["optimize pm challenge", "--grader", "--grader-loops", "8"])
+        args.max_iterations_explicit = False
+        args.max_runtime_seconds_explicit = False
+
+        _apply_grader_budget_defaults(args)
+
+        self.assertEqual(args.max_iterations, 28)
+        self.assertEqual(args.max_runtime_seconds, 960.0)
+
+    def test_cli_preserves_explicit_tight_grader_budgets(self) -> None:
+        args = build_parser().parse_args([
+            "optimize pm challenge", "--grader", "--grader-loops", "8",
+            "--max-iterations", "12", "--max-runtime-seconds", "240",
+        ])
+        args.max_iterations_explicit = True
+        args.max_runtime_seconds_explicit = True
+
+        _apply_grader_budget_defaults(args)
+
+        self.assertEqual(args.max_iterations, 12)
+        self.assertEqual(args.max_runtime_seconds, 240.0)
+
     def test_grader_loop_limit_blocks_a_second_official_candidate_attempt(self) -> None:
         class CountingGrader:
             name = "evaluate_prediction_market_candidate"
@@ -585,6 +735,90 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertIn("non-positive (-0.25)", feedback["content"])
         self.assertIn("1 requested official evaluation", feedback["content"])
         self.assertIn("fresh, high-relevance evidence", feedback["content"])
+
+    def test_grader_context_projects_state_without_replaying_old_tool_calls(self) -> None:
+        code = "class Strategy(BaseStrategy):\n    def on_step(self, state):\n        return []\n"
+
+        class Grader:
+            name, description, is_read_only = "evaluate_prediction_market_candidate", "grader", False
+            input_schema = {"type": "object", "required": ["code"], "properties": {"code": {"type": "string"}}, "additionalProperties": False}
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {
+                    "candidate_id": "candidate_a", "official_measured": True, "score_eligible": True,
+                    "mean_edge": 1.25, "mean_arb_edge": 0.75, "mean_retail_edge": 0.5,
+                    "trial_path": "optimization_trials/candidate_a.json",
+                    "promotion": {"promoted_this_round": True},
+                })
+
+        class Fetch:
+            name, description, is_read_only = "fetch_document", "fetch", True
+            input_schema = {"type": "object", "required": [], "properties": {}, "additionalProperties": False}
+
+            async def execute(self, _arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+                return ToolResult("ok", {"content": "paper"}, source_metadata=[{
+                    "id": "paper", "url": "https://arxiv.org/pdf/1009.1446v1", "title": "Prediction market paper",
+                    "source_type": "fetched_document", "summary": "Inventory risk evidence.",
+                    "relevance_score": 1.0, "credibility_score": 0.8, "evidence_kind": "verified_document",
+                    "evidence_sections": {"page_1": "Inventory risk changes optimal market-making quotes."},
+                    "evidence_locators": {"page_1": [{"kind": "pdf_page", "page": 1}]},
+                }])
+
+        decider = ScriptedDecider([
+            {"type": "tool_call", "tool_name": "evaluate_prediction_market_candidate", "arguments": {"code": code}},
+            {"type": "tool_call", "tool_name": "fetch_document", "arguments": {}},
+            {"type": "final", "answer": "The official candidate and fetched paper were retained. https://arxiv.org/pdf/1009.1446v1"},
+        ])
+        result = ResearchAgent(
+            decider, ToolRegistry([Grader(), Fetch()]), AgentRunConfig(max_iterations=3, max_grader_calls=1)
+        ).run("Optimize with literature.", workspace=Path.cwd())
+
+        third_context = decider.observed_messages[2]
+        _validate_tool_history(third_context)
+        checkpoint = next(message["content"] for message in third_context if "Harness working-state checkpoint" in str(message.get("content")))
+        self.assertIn(code, checkpoint)
+        self.assertIn("1.250000", checkpoint)
+        self.assertIn("Inventory risk changes optimal market-making quotes", checkpoint)
+        self.assertFalse(any(
+            call.get("name") == "evaluate_prediction_market_candidate"
+            for message in third_context for call in message.get("tool_calls") or []
+        ))
+        self.assertTrue(any(
+            call.get("name") == "fetch_document"
+            for message in third_context for call in message.get("tool_calls") or []
+        ))
+        self.assertTrue(any(
+            call.get("name") == "evaluate_prediction_market_candidate"
+            for message in result.messages for call in message.get("tool_calls") or []
+        ))
+
+    def test_context_projection_does_not_promote_failed_trials_or_search_leads(self) -> None:
+        state = AgentState.initialize(
+            objective="Optimize.", context=ToolContext(workspace=Path.cwd()), initial_cost=0.0,
+            system_messages=["system"],
+        )
+        state.begin_iteration(3)
+        code = "class Strategy(BaseStrategy):\n    pass\n"
+        state.messages.extend([
+            {"role": "assistant", "content": "try", "tool_calls": [{"id": "failed", "name": "evaluate_prediction_market_candidate", "arguments": {"code": code}}]},
+            {"role": "tool", "tool_call_id": "failed", "name": "evaluate_prediction_market_candidate", "content": {"status": "error", "data": {"mean_edge": 99.0}, "error": "scorer failed"}},
+        ])
+        state.tool_calls.append({
+            "id": "failed", "tool": "evaluate_prediction_market_candidate", "status": "error",
+            "official_measured": False, "error": "scorer failed",
+        })
+        state.sources.append({
+            "url": "https://example.org/lead", "title": "Search lead", "summary": "Unfetched snippet",
+            "evidence_kind": "lead", "relevance_score": 1.0,
+        })
+
+        projection = WorkingStateProjector().project(state, max_grader_calls=2)
+        checkpoint = next(message["content"] for message in projection.messages if "Harness working-state checkpoint" in str(message.get("content")))
+
+        self.assertIn("error (not eligible)", checkpoint)
+        self.assertNotIn("Current champion strategy", checkpoint)
+        self.assertNotIn("Unfetched snippet", checkpoint)
+        self.assertEqual(projection.fetched_document_count, 0)
 
     def test_completed_grader_budget_tells_model_to_finish_without_extra_trials(self) -> None:
         class Grader:
@@ -831,6 +1065,14 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.14)
         self.assertEqual(result.status, "completed")
         self.assertEqual([call["id"] for call in result.tool_calls], ["a", "b"])
+        self.assertEqual(
+            [message["tool_call_id"] for message in result.messages if message["role"] == "tool"],
+            ["a", "b"],
+        )
+        self.assertEqual(
+            [event.tool_call_id for event in result.events if event.event_type == "tool_result"],
+            ["a", "b"],
+        )
 
     def test_unsupported_citation_is_returned_for_revision(self) -> None:
         decider = ScriptedDecider([
@@ -991,6 +1233,134 @@ class ResearchAgentTest(unittest.TestCase):
             "funsearch algorithm discovery",
         )
 
+    def test_arxiv_abstract_fetch_resolves_to_pdf(self) -> None:
+        self.assertEqual(
+            _arxiv_pdf_url("http://arxiv.org/abs/1009.1446v1"),
+            "https://arxiv.org/pdf/1009.1446v1",
+        )
+        self.assertIsNone(_arxiv_pdf_url("https://example.org/abs/1009.1446v1"))
+
+    def test_pdf_fetch_uses_document_byte_limit_not_text_character_limit(self) -> None:
+        payload = b"%PDF-1.7\n" + b"x" * 50_000
+
+        class Response:
+            headers = {"Content-Type": "application/octet-stream"}
+            status = 200
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+            def read(self, limit: int) -> bytes:
+                self.limit = limit
+                return payload
+
+        response = Response()
+        opener = mock.Mock()
+        opener.open.return_value = response
+        tool = WebFetchTool(max_characters=20_000, max_document_bytes=100_000)
+        with mock.patch("research_harness.tools.research._public_url_error", return_value=None), mock.patch(
+            "research_harness.tools.research.urllib.request.build_opener", return_value=opener
+        ):
+            result = tool._fetch("http://arxiv.org/abs/1009.1446v1", prefer_markdown=True)
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.data["url"], "https://arxiv.org/pdf/1009.1446v1")
+        self.assertEqual(result.data["raw_content"], payload)
+        self.assertEqual(response.limit, 100_001)
+
+    def test_html_fetch_uses_download_limit_then_truncates_extracted_text(self) -> None:
+        payload = b"<html><body>" + b"useful evidence " * 3_000 + b"</body></html>"
+
+        class Response:
+            headers = {"Content-Type": "text/html; charset=utf-8"}
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+            def read(self, limit: int) -> bytes:
+                self.limit = limit
+                return payload
+
+        response = Response()
+        opener = mock.Mock()
+        opener.open.return_value = response
+        tool = WebFetchTool(max_characters=20_000, max_document_bytes=100_000)
+        with mock.patch("research_harness.tools.research._public_url_error", return_value=None), mock.patch(
+            "research_harness.tools.research.urllib.request.build_opener", return_value=opener
+        ), mock.patch.object(tool, "_fetch_curl_markdown", return_value=None):
+            fetched = tool._fetch("https://www.paradigm.xyz/writing/pm-amm", prefer_markdown=True)
+
+        self.assertEqual(fetched.status, "ok")
+        self.assertEqual(response.limit, 100_001)
+        with mock.patch.object(tool, "_fetch", return_value=ToolResult("ok", {
+            "url": "https://www.paradigm.xyz/writing/pm-amm",
+            "content_type": "text/html; charset=utf-8",
+            "raw_content": payload,
+            "truncated": False,
+            "renderer": "direct",
+        })):
+            ingested = asyncio.run(tool.execute(
+                {"url": "https://www.paradigm.xyz/writing/pm-amm", "prefer_markdown": True},
+                ToolContext(workspace=Path.cwd()),
+            ))
+        self.assertEqual(ingested.status, "ok")
+        retained_characters = sum(len(value) for value in ingested.data["evidence_sections"].values())
+        self.assertLessEqual(retained_characters, 20_000)
+        self.assertTrue(ingested.data["truncated"])
+
+    def test_pdf_fetch_rejects_oversized_document_instead_of_parsing_a_prefix(self) -> None:
+        class Response:
+            headers = {"Content-Type": "application/pdf"}
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                return b"%PDF" + b"x" * 101
+
+        opener = mock.Mock()
+        opener.open.return_value = Response()
+        tool = WebFetchTool(max_document_bytes=100)
+        with mock.patch("research_harness.tools.research._public_url_error", return_value=None), mock.patch(
+            "research_harness.tools.research.urllib.request.build_opener", return_value=opener
+        ):
+            result = tool._fetch("https://arxiv.org/abs/1009.1446v1", prefer_markdown=True)
+
+        self.assertEqual(result.status, "error")
+        self.assertIn("exceeded", result.error or "")
+
+    def test_fetch_document_reuses_cached_verified_arxiv_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory) / "run")
+            source = Source(
+                url="https://arxiv.org/pdf/1009.1446v1", title="Fetched paper", author="arxiv.org", date="",
+                source_type="fetched_document", summary="Extracted paper text.", relevance_score=1.0,
+                credibility_score=0.8, evidence_kind="verified_document",
+                evidence_sections={"page_1": "Exact extracted PDF evidence."},
+                evidence_locators={"page_1": [{"kind": "pdf_page", "page": 1}]},
+            )
+            store.commit_tool_sources([source.__dict__])
+            tool = WebFetchTool()
+            with mock.patch.object(tool, "_fetch", side_effect=AssertionError("network fetch should not run")):
+                result = asyncio.run(tool.execute(
+                    {"url": "http://arxiv.org/abs/1009.1446v1", "prefer_markdown": True},
+                    ToolContext(workspace=Path.cwd(), store=store),
+                ))
+
+        self.assertEqual(result.status, "ok")
+        self.assertTrue(result.data["cached"])
+        self.assertEqual(result.data["renderer"], "artifact_cache")
+        self.assertIn("Exact extracted PDF evidence", result.data["content"])
+
     def test_figure_inspection_uses_arxiv_pdf_when_html_is_unavailable(self) -> None:
         self.assertEqual(
             _inspection_urls("https://arxiv.org/abs/2304.03442v2"),
@@ -1010,26 +1380,26 @@ class ResearchAgentTest(unittest.TestCase):
                 WebSearch().search("AI safety")
 
     def test_external_source_objective_cannot_pass_without_sources(self) -> None:
-        status, feedback = FinalAnswerValidator().validate("A confident but uncited answer.", "Use external sources to explain AGI limitations.", [])
-        self.assertEqual(status, "REVISE")
-        self.assertIn("external evidence", feedback)
+        validation = FinalAnswerValidator().validate("A confident but uncited answer.", "Use external sources to explain AGI limitations.", [])
+        self.assertEqual(validation.status, "revise")
+        self.assertIn("external evidence", validation.feedback)
 
     def test_generic_source_handoff_is_not_accepted_as_final_research_answer(self) -> None:
-        status, feedback = FinalAnswerValidator().validate(
+        validation = FinalAnswerValidator().validate(
             "Pick one: Option A: send 5 candidate URLs. Option B: give permission to use another discovery source.",
             "Use external sources to find figures.",
             [],
         )
-        self.assertEqual(status, "REVISE")
-        self.assertIn("generic request", feedback)
+        self.assertEqual(validation.status, "revise")
+        self.assertIn("generic request", validation.feedback)
 
     def test_citation_validation_normalizes_http_and_https(self) -> None:
-        status, _feedback = FinalAnswerValidator().validate(
+        validation = FinalAnswerValidator().validate(
             "See https://arxiv.org/abs/1606.06565v2.",
             "Use external sources.",
             [{"url": "http://arxiv.org/abs/1606.06565v2"}],
         )
-        self.assertEqual(status, "PASS")
+        self.assertEqual(validation.status, "pass")
 
     def test_length_continuation_does_not_break_url(self) -> None:
         self.assertEqual(
@@ -1046,6 +1416,32 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertIn("Incomplete evidence packet", report)
         self.assertIn("directly retrieved result", report)
         self.assertIn("https://example.org/result", report)
+
+    def test_incomplete_report_ranks_verified_sources_and_retains_relevant_late_leads(self) -> None:
+        sources = [
+            {
+                "title": f"Early lead {index}", "url": f"https://example.org/{index}",
+                "summary": "Generic result.", "evidence_kind": "lead", "relevance_score": 0.5,
+            }
+            for index in range(15)
+        ]
+        sources.extend([
+            {
+                "title": "Market Making in Prediction Markets", "url": "https://www.quantvps.com/market-making",
+                "summary": "Inventory risk and optimal quotes.", "evidence_kind": "lead", "relevance_score": 0.7,
+            },
+            {
+                "title": "Fetched paper", "url": "https://arxiv.org/pdf/1009.1446v1",
+                "summary": "Extracted paper text.", "evidence_kind": "verified_document", "relevance_score": 1.0,
+            },
+        ])
+
+        report = _partial_synthesis(sources, "Wall-clock runtime budget exhausted.")
+
+        self.assertLess(report.index("Fetched paper"), report.index("Market Making in Prediction Markets"))
+        self.assertIn("**verified document:**", report)
+        self.assertIn("**discovery lead:**", report)
+        self.assertIn("quantvps.com", report)
 
     def test_controller_can_consult_a_model_chosen_specialist(self) -> None:
         class SpecialistLLM:

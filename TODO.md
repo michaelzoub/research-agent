@@ -10,6 +10,9 @@ The production runtime is now one model-directed loop. These plans extend curren
 - [x] Final-answer validation, partial-result termination, and output-limit continuation.
 - [x] Workspace/SSRF/sandbox boundaries and compact source context.
 - [x] Retrieval safeguards for DuckDuckGo blocking and arXiv relevance/exact IDs.
+- [x] Grader context compaction with exact strategy/score retention and append-only audit history.
+- [x] Canonical fetched-document cache with retained evidence extracts and locators.
+- [x] Optional verified-document structured extraction, grounded analysis, and deterministic SVG dataset visualization with persisted provenance.
 
 ## Next: document and source quality
 
@@ -41,5 +44,6 @@ The production runtime is now one model-directed loop. These plans extend curren
 ## Long-running research
 
 - [ ] Add resumable runs with explicit user checkpoints and cancellation semantics.
-- [ ] Add periodic context compaction that preserves citations, evaluator outputs, exact experiment configurations, and unresolved questions.
+- [ ] Generalize the grader working-state projector to non-grader research and experiment trajectories.
+- [ ] Optionally add model-assisted compression for long literature prose only; keep code, scores, identifiers, and locators deterministic.
 - [ ] Add independent replay tests for native tool-call transcripts and deterministic experiment artifacts.

@@ -97,6 +97,13 @@ class EventRecorder:
     """Own event ordering plus durable event/progress/failure persistence."""
 
     def record(self, state: AgentState, event_type: str, actor: str, **fields: Any) -> AgentEvent:
+        fields.setdefault("run_id", state.context.run_id or None)
+        fields.setdefault("parent_run_id", state.context.parent_run_id or None)
+        fields.setdefault("worker_run_id", state.context.worker_run_id or None)
+        call_id = fields.get("tool_call_id")
+        model_id = fields.get("model_call_id") or state.model_call_id
+        fields.setdefault("span_id", f"tool:{call_id}" if call_id else (f"model:{model_id}" if model_id else f"event:{len(state.events) + 1}"))
+        fields.setdefault("parent_span_id", f"model:{model_id}" if call_id and model_id else None)
         event = AgentEvent(len(state.events) + 1, event_type, actor, fields.pop("timestamp", now_iso()), **fields)
         state.events.append(event)
         store = state.context.store

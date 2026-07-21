@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -26,10 +27,9 @@ from .store import ArtifactStore
 from .tools import (
     CodeExecutionTool,
     DocumentAnalysisTool,
+    CompareCandidateToChampionTool,
     DocumentFigureTool,
     FileReadTool,
-    OptimizationSwarmTool,
-    ParameterSweepTool,
     PredictionMarketEvaluationTool,
     SaveLearningTool,
     SearchTool,
@@ -70,10 +70,7 @@ class ResearchAgent:
         config: Optional[AgentRunConfig] = None,
         evaluator_name: Optional[str] = None,
     ) -> "ResearchAgent":
-        evaluator_tools = [
-            PredictionMarketEvaluationTool(), OptimizationSwarmTool(llm),
-            ParameterSweepTool(), SaveLearningTool(),
-        ] if evaluator_name == "prediction_market" else []
+        evaluator_tools = [PredictionMarketEvaluationTool(), CompareCandidateToChampionTool(), SaveLearningTool()] if evaluator_name == "prediction_market" else []
         external_service_tools = default_external_service_registry().tools()
         tools = [
             *(SearchTool(backend) for backend in backends), WebFetchTool(),
@@ -83,9 +80,7 @@ class ResearchAgent:
             SpecialistConsultationTool(llm),
         ]
         base_registry = ToolRegistry(tools)
-        safe_worker_tools = tuple(tool.name for tool in tools if tool.name not in {
-            "spawn_optimization_agents", "run_parameter_sweep", "save_learning"
-        })
+        safe_worker_tools = tuple(tool.name for tool in tools if tool.name != "save_learning")
         workers = WorkerRegistry([
             WorkerProfile("researcher", "You are a focused research worker. Investigate the assignment and return concise evidence-backed findings.", safe_worker_tools),
             WorkerProfile("critic", "You are a critical review worker. Stress-test the assignment, identify gaps, and return actionable findings.", safe_worker_tools, budget=WorkerBudget(max_iterations=3, max_tokens=3000, max_tool_calls=6, max_runtime_seconds=90.0)),
@@ -115,6 +110,7 @@ class ResearchAgent:
             ),
         )
         if store is not None:
+            result = _finalize_measured_optimization(store, result, run_id=run_id)
             store.write_agent_transcript({
                 "objective": objective,
                 "termination_reason": result.termination_reason,
@@ -179,6 +175,106 @@ class ResearchAgent:
             run_id=run_id,
             readable_roots=readable_roots,
         ))
+
+
+def _finalize_measured_optimization(store: ArtifactStore, result: AgentRunResult, *, run_id: str) -> AgentRunResult:
+    """Materialize the best eligible trial and a complete best-so-far report.
+
+    This is deterministic run finalization, not an additional model turn. It
+    therefore still runs when the configured model-iteration budget is spent.
+    """
+    trials: list[dict[str, Any]] = []
+    for path in sorted(store.optimization_trials_dir.glob("*.json")):
+        try:
+            trial = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if trial.get("official_measured") and trial.get("score_eligible") and str(trial.get("rendered_code") or "").strip():
+            trial["_trial_path"] = str(path)
+            trials.append(trial)
+    if not trials:
+        return result
+
+    best = max(trials, key=lambda trial: float(trial.get("score") or 0.0))
+    code = str(best["rendered_code"]).rstrip() + "\n"
+    candidate_path = store.write_optimized_candidate(code)
+    optimal_code_path = store.write_optimal_code(code)
+    solution_path = store.write_solution(code)
+    metrics = dict(best.get("metrics") or {})
+    payload = {
+        "run_id": run_id,
+        "status": "best_at_iteration_limit" if result.termination_reason == "budget_exhausted" else "completed",
+        "termination_reason": result.termination_reason,
+        "best_candidate_id": best.get("trial_id"),
+        "best_candidate_path": str(candidate_path),
+        "optimal_code_path": str(optimal_code_path),
+        "solution_path": str(solution_path),
+        "trial_path": str(best["_trial_path"]),
+        "score": float(best.get("score") or 0.0),
+        "metrics": metrics,
+        "official_measured": True,
+        "score_eligible": True,
+        "evaluated_candidates": len(trials),
+        "official_result": {
+            "measured": True,
+            "score_eligible": True,
+            "score": float(best.get("score") or 0.0),
+            "score_source": metrics.get("score_source"),
+            "candidate_path": str(best.get("candidate_path") or ""),
+            "trial_path": str(best["_trial_path"]),
+            "metrics": metrics,
+        },
+    }
+    store.write_optimization_result(payload)
+
+    prior_learning_titles = {
+        str(item.get("title") or "")
+        for line in store.learning_log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+        for item in [json.loads(line)]
+    }
+    if "Best officially measured candidate" not in prior_learning_titles:
+        score_rows = sorted(
+            ((str(trial.get("trial_id") or "candidate"), float(trial.get("score") or 0.0)) for trial in trials),
+            key=lambda row: row[1], reverse=True,
+        )
+        evidence = ", ".join(f"{candidate_id}={score:g}" for candidate_id, score in score_rows[:8])
+        store.append_learning(
+            title="Best officially measured candidate",
+            finding=f"{best.get('trial_id')} ranked first among {len(trials)} eligible candidate(s) with mean edge {float(best.get('score') or 0.0):g}.",
+            evidence=f"Official eligible measurements: {evidence}.",
+            status="confirmed",
+            run_id=run_id,
+        )
+
+    learnings = store.learnings_path.read_text(encoding="utf-8").strip() if store.learnings_path.exists() else "No additional learnings were recorded."
+    limit_note = (
+        "The configured model-iteration limit was reached. The artifacts below are the complete, officially measured best-so-far result."
+        if result.termination_reason == "budget_exhausted"
+        else "The run completed with the officially measured best candidate below."
+    )
+    report = "\n".join([
+        "# Optimization result",
+        "",
+        limit_note,
+        "",
+        "## Best candidate",
+        "",
+        f"- Candidate: `{best.get('trial_id')}`",
+        f"- Official mean edge: `{float(best.get('score') or 0.0):g}`",
+        f"- Eligible candidates evaluated: `{len(trials)}`",
+        f"- Optimal code artifact: `{optimal_code_path}`",
+        "",
+        "```python",
+        code.rstrip(),
+        "```",
+        "",
+        "## Learnings",
+        "",
+        learnings,
+    ])
+    result.final_answer = report
+    return result
 
 
 __all__ = [

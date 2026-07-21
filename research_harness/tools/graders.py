@@ -105,6 +105,95 @@ class PredictionMarketEvaluationTool:
         return ToolResult("ok", data)
 
 
+class CompareCandidateToChampionTool:
+    """Deterministically compare immutable official evaluation records."""
+
+    name = "compare_candidate_to_champion"
+    is_read_only = False
+    description = "Compare one officially evaluated candidate with an explicit or current eligible champion. This writes an audit artifact and never promotes a candidate."
+    input_schema = {"type": "object", "required": ["candidate_id"], "properties": {
+        "candidate_id": {"type": "string", "minLength": 1, "maxLength": 160},
+        "champion_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    }, "additionalProperties": False}
+
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.store is None:
+            return ToolResult("error", error="Candidate comparison requires an artifact store.")
+        candidate = _official_trial(context.store, str(arguments["candidate_id"]))
+        if candidate is None:
+            return ToolResult("error", error=f"Candidate '{arguments['candidate_id']}' has no immutable official evaluation.", retryable=False)
+        champion_id = str(arguments.get("champion_id") or _eligible_champion_id(context.store) or "")
+        if not champion_id:
+            return ToolResult("error", error="No eligible champion is available.", retryable=False)
+        champion = _official_trial(context.store, champion_id)
+        if champion is None:
+            return ToolResult("error", error=f"Champion '{champion_id}' has no immutable official evaluation.", retryable=False)
+        def basis(trial: dict[str, Any]) -> dict[str, Any]:
+            metrics = trial.get("metrics") if isinstance(trial.get("metrics"), dict) else {}
+            upstream = trial.get("upstream") if isinstance(trial.get("upstream"), dict) else {}
+            metric_upstream = metrics.get("upstream") if isinstance(metrics.get("upstream"), dict) else {}
+            provenance = {**upstream, **metric_upstream}
+            return {
+                "grader_id": trial.get("grader_id") or provenance.get("grader_id"),
+                "grader_version": trial.get("grader_version") or provenance.get("upstream_revision"),
+                "seeds": trial.get("seeds", metrics.get("seeds", metrics.get("seed_start"))),
+                "configuration": trial.get("configuration") or {key: metrics.get(key) for key in ("simulations", "steps", "eval_protocol")},
+                "environment": trial.get("environment") or {key: provenance.get(key) for key in ("execution_mode", "upstream_path")},
+            }
+        candidate_basis, champion_basis = basis(candidate), basis(champion)
+        compatible = candidate_basis == champion_basis
+        metric_names = sorted(set(_numeric_metrics(candidate)) | set(_numeric_metrics(champion)))
+        deltas = {name: _numeric_metrics(candidate).get(name, 0.0) - _numeric_metrics(champion).get(name, 0.0) for name in metric_names}
+        eligible = {"candidate": bool(candidate.get("official_measured") and candidate.get("score_eligible")), "champion": bool(champion.get("official_measured") and champion.get("score_eligible"))}
+        payload = {
+            "candidate_id": candidate["trial_id"], "champion_id": champion["trial_id"], "compatible": compatible,
+            "comparison_basis": {"candidate": candidate_basis, "champion": champion_basis},
+            "overall_delta": float(candidate.get("score") or 0.0) - float(champion.get("score") or 0.0) if compatible else None,
+            "component_deltas": deltas if compatible else {},
+            "improvements": [name for name, delta in deltas.items() if delta > 0] if compatible else [],
+            "regressions": [name for name, delta in deltas.items() if delta < 0] if compatible else [],
+            "eligibility": eligible,
+            "runtime": {"candidate": _runtime(candidate), "champion": _runtime(champion)},
+            "failure_modes": {"candidate": candidate.get("failure"), "champion": champion.get("failure")},
+            "recommended_status": "incompatible" if not compatible else "ineligible" if not eligible["candidate"] else "better" if float(candidate.get("score") or 0.0) > float(champion.get("score") or 0.0) else "not_better",
+            "artifact_refs": [candidate.get("_path"), champion.get("_path")],
+        }
+        comparison_id = hashlib.sha256(f"{candidate['trial_id']}:{champion['trial_id']}".encode()).hexdigest()[:16]
+        path = context.store.write_candidate_comparison(comparison_id, payload)
+        payload["artifact_refs"].append(str(path))
+        return ToolResult("ok", payload)
+
+
+def _official_trial(store: Any, candidate_id: str) -> dict[str, Any] | None:
+    path = store.optimization_trials_dir / f"{candidate_id}.json"
+    if not path.is_file():
+        return None
+    try:
+        trial = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not trial.get("official_measured"):
+        return None
+    trial["_path"] = str(path)
+    return trial
+
+
+def _eligible_champion_id(store: Any) -> str | None:
+    trials = [_official_trial(store, path.stem) for path in sorted(store.optimization_trials_dir.glob("*.json"))]
+    eligible = [trial for trial in trials if trial and trial.get("score_eligible")]
+    return str(max(eligible, key=lambda trial: float(trial.get("score") or 0.0))["trial_id"]) if eligible else None
+
+
+def _numeric_metrics(trial: dict[str, Any]) -> dict[str, float]:
+    metrics = trial.get("metrics") if isinstance(trial.get("metrics"), dict) else {}
+    return {key: float(value) for key, value in metrics.items() if isinstance(value, (int, float)) and not isinstance(value, bool) and key not in {"score", "runtime_ms"}}
+
+
+def _runtime(trial: dict[str, Any]) -> Any:
+    metrics = trial.get("metrics") if isinstance(trial.get("metrics"), dict) else {}
+    return trial.get("runtime_ms", metrics.get("runtime_ms", (trial.get("upstream") or {}).get("runtime_ms")))
+
+
 def _promote_model_directed_round(
     store: Any,
     *,

@@ -29,6 +29,11 @@ class AgentEvent:
     observation: Optional[dict[str, Any]] = None
     error: Optional[str] = None
     decision_summary: Optional[str] = None
+    run_id: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    worker_run_id: Optional[str] = None
+    span_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
 
 
 @dataclass

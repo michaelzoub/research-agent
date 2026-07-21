@@ -21,7 +21,7 @@ autore "Optimize the prediction-market challenge" --grader --grader-loops 8
 autore --help
 ```
 
-All tasks start the same lead `ResearchAgent`; tools are optional capabilities selected by the model. Approved bounded workers are owned internally by `WorkerRegistry` and exposed externally as the ordinary `delegate_task` capability in `ToolRegistry`. The lead remains the sole controller and final synthesizer. Each worker receives an isolated context, artifact store, event stream, permissions, accounting, run identity, and termination state; recursion is initially disabled and aggregate count/parallelism plus per-worker runtime/token/tool-call budgets are enforced. Parallel calls inside one agent loop remain tool concurrency, not workers. With `--grader`, the controller can also run prediction-market optimization batches, exact-replacement parameter sweeps, and evidence-backed learning capture. Workers and sweeps write isolated candidates and use the existing official upstream grader; no score is fabricated and no candidate is promoted without an eligible official measurement. `learnings.md` and `learnings.jsonl` preserve the current run's confirmed findings and dead ends as audit artifacts; new runs do not ingest prior outputs. Registered capabilities include source search, public document fetching, figure inspection, structured document extraction, grounded document analysis, charts, approved-workspace reads, sandboxed analysis, bounded terminal inspection, and optional external services.
+All tasks start the same lead `ResearchAgent`; tools are optional capabilities selected by the model. Approved bounded workers are owned internally by `WorkerRegistry` and exposed externally as the ordinary `delegate_task` capability in `ToolRegistry`. The lead remains the sole controller and final synthesizer. Each worker receives an isolated context, artifact store, event stream, permissions, accounting, run identity, and termination state; recursion is initially disabled and aggregate count/parallelism plus per-worker runtime/token/tool-call budgets are enforced. Parallel calls inside one agent loop remain tool concurrency, not workers. With `--grader`, the controller can submit complete prediction-market candidates to the official evaluator and capture evidence-backed learnings. No score is fabricated and no candidate is promoted without an eligible official measurement. `learnings.md` and `learnings.jsonl` preserve the current run's confirmed findings and dead ends as audit artifacts; new runs do not ingest prior outputs. Registered capabilities include source search, public document fetching, figure inspection, structured document extraction, grounded document analysis, charts, approved-workspace reads, sandboxed analysis, bounded terminal inspection, and optional external services.
 
 The guided CLI does not ask the user to choose an evidence backend: the model selects among registered search capabilities from the objective and observations. `--retriever` remains an advanced capability restriction for offline runs, reproducible tests, or environments where only a specific backend should be exposed.
 
@@ -31,10 +31,12 @@ flowchart TD
     lead --> decision{"Model action"}
     decision -->|tool call| tool["ToolRegistry\nordinary tool"]
     tool --> lead
-    decision -->|delegate_worker / delegate_task| worker["WorkerRegistry\nbounded worker"]
+    decision -->|delegate_task| worker["WorkerRegistry\nbounded AgentLoop"]
     worker -->|WorkerResult findings| lead
     decision -->|final answer| done["Lead synthesizes result"]
 ```
+
+The public loop is singular: **Goal → lead agent → model action → ToolRegistry → ordinary tool or `delegate_task` → observation returned to lead → repeat or final synthesis.** `delegate_task` is a normal public tool call; `WorkerRegistry` resolves it internally to a bounded nested `AgentLoop`.
 
 Workers complete bounded assignments and return findings to the lead; they never replace the lead controller or final synthesizer. Ordinary tool calls remain tool calls, not workers.
 
@@ -51,13 +53,16 @@ Each run writes `outputs/<run>/`:
 - `agent_messages.json` — provider-neutral transcript preserving tool-call IDs and results.
 - `agent_events.jsonl` — append-only model-turn, tool-request, and tool-result events, written as they occur.
 - `agent_timeline.png` / `agent_timeline.svg` — readable overview and complete event timeline with semantic operation colors and independent status styling.
+- `parent_trace.json` — deterministic hierarchical projection of parent and isolated worker event logs, with explicit span relationships.
 - `failed_paths.json` — provider, tool, budget, and runtime failures with retryability metadata; successful calls do not appear here.
 - `cost.json` — model usage and estimated cost.
-- `swarm_results.json`, `sweeps/`, and `learnings.md` — created when the controller uses the grader swarm, sweep, or learning tools.
+- `learnings.md` and `learnings.jsonl` — created when the controller records grader-backed findings or dead ends.
 - `datasets/<id>.json` — complete normalized table/numeric extraction plus source, section/table, and row provenance.
+- `extractions/figures-<id>.json` — persisted figure inspection results, captions, image URLs, aspect ratios, and source metadata.
 - `document_analyses/<id>.json` — LLM document analysis with source-stated findings separated from model inferences.
 - `charts/<id>.svg` and `charts/<id>.json` — deterministic SVG chart and reproducible dataset/config provenance.
 - `candidate_graph.json`, `.svg`, and `.png` — immutable optimization candidates and typed lineage edges.
+- `candidate_comparisons/*.json` — deterministic, non-promoting candidate-versus-champion comparisons.
 - `champion_history.json` — ordered promotion decisions, separate from lineage. Deprecated `champion_tree.*` compatibility files may also be emitted during migration.
 
 For example, after `fetch_document` returns a verified source ID, the model may call `extract_structured_data` with that ID, then call `generate_svg_chart` using the returned dataset ID and column names. It can call `analyze_research_document` when a paper needs a grounded methodology/results reading. These calls are optional; they do not create a paper-processing pipeline. Chart generation rejects missing datasets, nonnumeric values, and incompatible selected units rather than guessing conversions.
@@ -65,6 +70,8 @@ For example, after `fetch_document` returns a verified source ID, the model may 
 Workspace reads are deny-by-default for sensitive files such as `.env` and `.git`. Document retrieval validates every DNS-resolved host and redirect against private, loopback, link-local, and reserved addresses. HTML documents may be rendered into compact Markdown through curl.md after the target URL passes those checks; direct fetch remains available as the fallback.
 
 Model turns and wall-clock runtime are unbounded when their CLI limits are omitted. Explicit `--max-iterations` and `--max-runtime-seconds` values remain hard limits. The guided CLI defaults to eight official candidate evaluations for grader runs. Fetching an arXiv `/abs/` URL resolves to its PDF and extracts bounded page text with PDF-page locators; the abstract page is not treated as the paper body.
+
+When a configured model-iteration limit ends an optimization run after at least one eligible official measurement, deterministic finalization still emits the complete best-so-far output set. `final_report.md` includes the exact winning candidate and accumulated learnings; `optimized_candidate.txt`, `optimal_code.py`, `solution.py`, and `optimization_result.json` all point to or contain that same measured winner. The run retains the truthful `budget_exhausted` termination reason, and `optimization_result.json` labels the outcome `best_at_iteration_limit` rather than implying unconstrained convergence.
 
 Search tools must return relevant records or an explicit error. A DuckDuckGo bot challenge is surfaced as a tool failure, not bypassed. The agent can recover with registered primary-source APIs or direct public URLs through `fetch_document`, figure inspection, or the bounded terminal tool; arXiv exact IDs are fetched directly and unrelated papers are rejected before persistence. The harness compacts source records before returning them to the model while retaining complete source metadata in the artifact store.
 

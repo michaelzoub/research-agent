@@ -37,7 +37,7 @@ flowchart LR
       terminal["Bounded read-only terminal"]
       documents["Extraction + document analysis"]
       charts["Chart generation"]
-      optional["Optional grader, swarm, sweep, learning tools\nscore eligibility + promotion rules"]
+      optional["Optional evaluator + learning tools\nscore eligibility + promotion rules"]
     end
     registry --> capabilities
   end
@@ -48,6 +48,8 @@ flowchart LR
 ```
 
 The model is the cognitive controller: it chooses whether to answer or request a registered capability. Middleware and policies constrain, validate, record, and execute; they do not choose research topics or tools. Guardrails sit at their enforcement points: budgets at the loop, schema and tool limits at the registry, SSRF checks at fetch, path and secret checks at workspace access, sandbox restrictions at Python and terminal execution, grader eligibility at grader tools, final-answer and citation rules at validation, and deterministic append-only ordering at event persistence.
+
+If a configured model-iteration budget is exhausted after eligible optimization measurements exist, post-loop finalization deterministically selects the highest official score. It writes the exact same candidate to `optimized_candidate.txt`, `optimal_code.py`, and `solution.py`, records its provenance and measurement in `optimization_result.json`, synthesizes a confirmed best-candidate learning when needed, and replaces the generic incomplete packet with a complete best-so-far `final_report.md`. This does not hide the budget boundary: run and transcript termination remain `budget_exhausted`, while the optimization result is marked `best_at_iteration_limit`.
 
 `Orchestrator.run(goal)` initializes the run and persists its actual trajectory. It always creates one `ResearchAgent`; a registered optimization grader is exposed as a controlled tool, not a second orchestration path. It does not create a research plan.
 
@@ -194,7 +196,9 @@ Every run directory contains:
 | `candidate_graph.json` / `.svg` / `.png` | Immutable candidate evaluation nodes and typed lineage DAG for optimization runs. |
 | `champion_history.json` | Ordered promotion events, independent of candidate lineage. |
 
-`progress.txt` prints a concise stream of model turns and each requested/completed tool call. Event and failure records survive even if a later model request fails.
+`progress.txt` contains a concise plain stream of model turns and requested/completed tool calls. On an interactive TTY, the CLI projects the same events into one animated status region; `--no-animations`, redirected output, CI, and `NO_COLOR` disable it. The renderer owns no execution state. Event and failure records survive even if a later model request fails.
+
+Worker event files remain under `workers/<worker_run_id>/`. `parent_trace.json` is a deterministic, deduplicated projection that references those files and attaches worker model/tool spans beneath the corresponding `delegate_task` span; concurrent ordinary tools remain ordinary tool lanes.
 
 ## Deterministic capabilities outside the production path
 

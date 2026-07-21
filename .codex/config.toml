@@ -1,0 +1,7 @@
+[mcp_servers.alchemy]
+command = "npx"
+args = [
+    "-y",
+    "@alchemy/mcp-server",
+]
+env_vars = ["ALCHEMY_API_KEY"]

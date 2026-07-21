@@ -26,7 +26,7 @@ from research_harness.research_agent import AgentRunConfig, FinalAnswerValidator
 from research_harness.search import ArxivSearch, LocalCorpusSearch, WebSearch, _arxiv_identifier, _arxiv_query, _retrieval_query
 from research_harness.schemas import Source
 from research_harness.store import ArtifactStore
-from research_harness.tools import DocumentFigureTool, OptimizationSwarmTool, ParameterSweepTool, PredictionMarketEvaluationTool, SaveLearningTool, SearchTool, TerminalExecutionTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
+from research_harness.tools import DocumentFigureTool, PredictionMarketEvaluationTool, SaveLearningTool, SearchTool, TerminalExecutionTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
 from research_harness.llm import LLMResponse
 from research_harness.tools.research import _FigureHTMLParser, _arxiv_pdf_url, _image_dimensions, _inspection_urls
 
@@ -394,6 +394,40 @@ class ResearchAgentTest(unittest.TestCase):
             self.assertEqual(champion["global_champion"]["variant_id"], trial["trial_id"])
             self.assertTrue(champion["global_champion"]["promoted_this_round"])
 
+    def test_iteration_limit_finalizes_best_candidate_learnings_and_full_outputs(self) -> None:
+        code = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    def on_step(self, state):\n        return []\n"
+        decider = ScriptedDecider([
+            {"type": "tool_call", "tool_name": "evaluate_prediction_market_candidate", "arguments": {"code": code, "rationale": "measure the candidate"}},
+        ])
+        measured = {
+            "official_measured": True, "score_eligible": True, "mean_edge": 2.5,
+            "mean_arb_edge": 1.0, "mean_retail_edge": 1.5,
+            "score_source": "upstream_orderbook_pm_challenge",
+            "upstream": {"command": ["official-grader"]},
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.graders.get_optimization_grader") as get_grader:
+            get_grader.return_value.evaluate.return_value = measured
+            store = ArtifactStore(Path(directory) / "run")
+            result = ResearchAgent(
+                decider,
+                ToolRegistry([PredictionMarketEvaluationTool()]),
+                AgentRunConfig(max_iterations=1),
+            ).run("Optimize until the configured iteration limit.", workspace=Path.cwd(), store=store, run_id="run_limited")
+
+            self.assertEqual(result.termination_reason, "budget_exhausted")
+            self.assertIn("configured model-iteration limit was reached", result.final_answer)
+            self.assertIn(code.strip(), result.final_answer)
+            self.assertEqual(store.report_path.read_text(encoding="utf-8"), result.final_answer)
+            self.assertEqual(store.optimized_candidate_path.read_text(encoding="utf-8"), code)
+            self.assertEqual(store.optimal_code_path.read_text(encoding="utf-8"), code)
+            self.assertEqual(store.solution_path.read_text(encoding="utf-8"), code)
+            self.assertIn("Best officially measured candidate", store.learnings_path.read_text(encoding="utf-8"))
+            optimization = json.loads(store.optimization_result_path.read_text(encoding="utf-8"))
+            self.assertEqual(optimization["status"], "best_at_iteration_limit")
+            self.assertEqual(optimization["score"], 2.5)
+            self.assertEqual(optimization["optimal_code_path"], str(store.optimal_code_path))
+            self.assertEqual(optimization["official_result"]["score_source"], "upstream_orderbook_pm_challenge")
+
     def test_prediction_market_evaluation_preserves_each_repeated_trial(self) -> None:
         code = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
         measured = {
@@ -428,54 +462,13 @@ class ResearchAgentTest(unittest.TestCase):
             self.assertEqual(result.status, "error")
             self.assertFalse(store.optimization_trials_dir.exists())
 
-    def test_grader_tools_save_learnings_and_sweep_official_variants(self) -> None:
-        base = "from orderbook_pm_challenge.strategy import BaseStrategy\nPARAM = 1\nclass Strategy(BaseStrategy):\n    pass\n"
-        measured = {"official_measured": True, "score_eligible": True, "mean_edge": 1.5}
-        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.swarm.get_optimization_grader") as get_grader:
+    def test_grader_tool_saves_evidence_backed_learning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
             root, store = Path(directory), ArtifactStore(Path(directory) / "run")
-            (root / "base.py").write_text(base, encoding="utf-8")
-            get_grader.return_value.evaluate.return_value = measured
             context = ToolContext(workspace=root, readable_roots=[root], store=store, run_id="run_pm")
             learning = asyncio.run(SaveLearningTool().execute({"title": "Parameter stable", "finding": "PARAM=2 matched the best score.", "evidence": "official mean_edge=1.5", "status": "confirmed"}, context))
-            sweep = asyncio.run(ParameterSweepTool().execute({"base_strategy_path": "base.py", "old_value": "PARAM = 1", "values": ["PARAM = 2", "PARAM = 3"], "seed_start": 4, "simulations": 8}, context))
             self.assertEqual(learning.status, "ok")
             self.assertIn("Parameter stable", store.learnings_path.read_text(encoding="utf-8"))
-            self.assertEqual(sweep.status, "ok")
-            self.assertTrue(Path(sweep.data["winner"]["winner_path"]).is_file())
-            get_grader.return_value.evaluate.assert_called_with(mock.ANY, simulations="8", seed_start="4")
-
-    def test_grader_swarm_runs_independent_model_workers_and_persists_results(self) -> None:
-        base = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
-        class WorkerLLM:
-            def complete(self, *_args, **_kwargs):
-                return LLMResponse(base, "test-model", "test", 3, 4, 0.01)
-        measured = {"official_measured": True, "score_eligible": True, "mean_edge": 2.0}
-        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.swarm.get_optimization_grader") as get_grader:
-            root, store = Path(directory), ArtifactStore(Path(directory) / "run")
-            (root / "base.py").write_text(base, encoding="utf-8")
-            get_grader.return_value.evaluate.return_value = measured
-            result = asyncio.run(OptimizationSwarmTool(WorkerLLM()).execute({"base_strategy_path": "base.py", "agents": [
-                {"hypothesis": "Reduce stale quote risk.", "evaluation_protocol": "8 fixed seeds", "target_to_beat": 1.0},
-                {"hypothesis": "Improve inventory skew.", "evaluation_protocol": "8 fixed seeds", "target_to_beat": 1.0},
-            ]}, ToolContext(workspace=root, readable_roots=[root], store=store, run_id="run_pm")))
-            self.assertEqual(result.status, "ok")
-            self.assertEqual(len(result.data["workers"]), 2)
-            self.assertTrue((store.root / "swarm_results.json").is_file())
-            self.assertEqual(len(store.list("agent_traces")), 2)
-
-    def test_grader_swarm_allows_a_from_scratch_worker_without_a_base_file(self) -> None:
-        code = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
-        class WorkerLLM:
-            def __init__(self): self.prompt = ""
-            def complete(self, _system, prompt, **_kwargs):
-                self.prompt = prompt
-                return LLMResponse(code, "test-model", "test")
-        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.swarm.get_optimization_grader") as get_grader:
-            llm, store = WorkerLLM(), ArtifactStore(Path(directory) / "run")
-            get_grader.return_value.evaluate.return_value = {"official_measured": True, "score_eligible": True, "mean_edge": 2.0}
-            result = asyncio.run(OptimizationSwarmTool(llm).execute({"agents": [{"hypothesis": "Build an inventory-aware strategy from first principles.", "evaluation_protocol": "8 fixed seeds", "target_to_beat": 1.0, "strategy_mode": "from_scratch"}]}, ToolContext(workspace=Path(directory), readable_roots=[Path(directory)], store=store, run_id="run_pm")))
-            self.assertEqual(result.status, "ok")
-            self.assertNotIn("Base strategy", llm.prompt)
 
     def test_prediction_market_promotion_keeps_the_best_measured_candidate(self) -> None:
         first = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
@@ -1236,14 +1229,17 @@ class ResearchAgentTest(unittest.TestCase):
             "source_url": "https://example.org/paper",
             "figures": [{"image_url": "https://example.org/figures/one.png", "caption": "Figure 1: Verified result."}],
         })
-        with mock.patch.object(tool, "_inspect", return_value=inspected):
-            result = asyncio.run(tool.execute({"url": "https://example.org/paper"}, ToolContext(workspace=Path.cwd())))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(tool, "_inspect", return_value=inspected):
+            store = ArtifactStore(Path(directory) / "run")
+            result = asyncio.run(tool.execute({"url": "https://example.org/paper"}, ToolContext(workspace=Path.cwd(), store=store)))
+            artifact_exists = (store.root / result.data["extraction_artifact"]).is_file()
 
         self.assertEqual(result.status, "ok")
         self.assertEqual(
             {source["url"] for source in result.source_metadata},
             {"https://example.org/paper", "https://example.org/figures/one.png"},
         )
+        self.assertTrue(artifact_exists)
 
     def test_image_dimensions_reads_png_header(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (1200).to_bytes(4, "big") + (800).to_bytes(4, "big")

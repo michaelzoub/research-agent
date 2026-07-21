@@ -36,6 +36,7 @@ class HarnessConfig:
     fork_session_id: Optional[str] = None
     enable_sessions: bool = True
     echo_progress: bool = True
+    animations: bool = False
     default_budget: AgentBudget = field(default_factory=AgentBudget)
     max_cost_usd: Optional[float] = None
     workspace_roots: tuple[Path, ...] = ()
@@ -58,7 +59,11 @@ class Orchestrator:
             harness_config_snapshot=_config_snapshot(self.config),
         )
         session_store = self._start_session_store(goal, run)
-        store = ArtifactStore(self.output_root / run.id, echo_progress=self.config.echo_progress, session_store=session_store)
+        renderer = None
+        if self.config.animations:
+            from .cli_progress import CLIProgressRenderer
+            renderer = CLIProgressRenderer(enabled=True)
+        store = ArtifactStore(self.output_root / run.id, echo_progress=self.config.echo_progress and renderer is None, session_store=session_store, progress_renderer=renderer)
         store.add_run(run)
         store.append_progress(f"Starting model-directed run {run.id}")
         store.append_progress(f"Goal: {goal}")
@@ -93,6 +98,8 @@ class Orchestrator:
             store.append_progress(f"Agent runtime failure: {type(exc).__name__}: {exc}")
             raise
         finally:
+            if renderer is not None:
+                renderer.close()
             run.total_tokens = self.llm.total_prompt_tokens + self.llm.total_completion_tokens
             run.total_cost = round(self.llm.total_cost(), 6)
             run.completed_at = now_iso()
@@ -136,7 +143,7 @@ class Orchestrator:
                 transcript = {}
         store.write_run_state({
             "schema_version": "model_directed_run_state_v1", "stage": stage, "run": to_dict(run), "goal": run.user_goal,
-            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal"] + [tool.name for tool in default_external_service_registry().tools()] + ["consult_specialist", "delegate_task"] + (["evaluate_prediction_market_candidate", "spawn_optimization_agents", "run_parameter_sweep", "save_learning"] if self.config.evaluator_name == "prediction_market" else []),
+            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal"] + [tool.name for tool in default_external_service_registry().tools()] + ["consult_specialist", "delegate_task"] + (["evaluate_prediction_market_candidate", "compare_candidate_to_champion", "save_learning"] if self.config.evaluator_name == "prediction_market" else []),
             "observed_counts": {"events": len(transcript.get("events", [])), "messages": len(transcript.get("messages", [])), "tool_calls": len(transcript.get("tool_calls", []))},
             "termination": transcript.get("termination_reason"),
             "artifacts": {

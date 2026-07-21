@@ -145,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not stream run progress to the terminal; artifacts are still written.",
     )
+    parser.add_argument("--no-animations", action="store_true", help="Disable the live TTY progress animation; progress.txt remains unchanged.")
     parser.add_argument(
         "--session-projects-dir",
         type=Path,
@@ -257,14 +258,14 @@ def _banner_left_lines(width: int) -> list[str]:
     return [
         f"Welcome back, {user}",
         "",
-        "          .-=========-.",
-        "       .-'    AUTORE   '-.",
-        "      /    .-──────-.     \\",
-        "     |    /  ◉    ◉  \\     |",
-        "     |    |    ▴     |     |",
-        "      \\    '─.____.─'     /",
-        "       '─.     ││     .─'",
-        "          '────┴┴────'",
+        "     ___  _   _ _____ ___  ____  _____",
+        r"    / _ \| | | |_   _/ _ \|  _ \| ____|",
+        r"   | |_| | | | | | || | | | |_) |  _|",
+        r"   |  _  | |_| | | || |_| |  _ <| |___",
+        r"   |_| |_|\___/  |_| \___/|_| \_\_____|",
+        "",
+        "            <AUTORE>",
+        "       autonomous research",
         "",
         f"model: {model}",
         f"retriever: {retriever}",
@@ -275,12 +276,13 @@ def _banner_left_lines(width: int) -> list[str]:
 def _banner_right_lines(width: int) -> list[str]:
     return [
         "Available tools",
-        "search: web, arxiv, openalex, scholar",
-        "documents: fetch, figures, extract, analyze",
+        "research: search, fetch documents",
+        "documents: inspect figures, extract data",
+        "analysis: analyze documents, python, charts",
         "workspace: read files, bounded terminal",
-        "analysis: sandboxed python, charts",
-        "services: Firecrawl and configured adapters",
-        "optimization: grader, swarm, sweep, learning",
+        "delegation: delegate_task, specialist",
+        "services: Firecrawl + configured adapters",
+        "optimization: grade candidates, save findings",
         "",
         "Run controls",
         "turns: unlimited by default",
@@ -650,6 +652,7 @@ def main() -> None:
         fork_session_id=args.fork_session,
         enable_sessions=not args.no_sessions,
         echo_progress=not args.quiet,
+        animations=not args.no_animations and not args.quiet and sys.stdout.isatty() and not os.environ.get("CI") and not os.environ.get("NO_COLOR"),
         default_budget=AgentBudget(
             max_tool_calls=args.max_tool_calls,
             max_runtime_seconds=args.max_runtime_seconds,

@@ -73,11 +73,13 @@ class ArtifactStore:
         echo_progress: bool = False,
         session_store: Optional[Any] = None,
         sqlite_path: Optional[Path] = None,
+        progress_renderer: Optional[Any] = None,
     ):
         self.root = root
         self._write_lock = threading.RLock()
         self.echo_progress = echo_progress
         self.session_store = session_store
+        self.progress_renderer = progress_renderer
         self.root.mkdir(parents=True, exist_ok=True)
         self.trace_log_path = self.root / "trace.jsonl"
         self.cost_path = self.root / "cost.json"
@@ -108,11 +110,13 @@ class ArtifactStore:
         self.current_champion_path = self.root / "current_champion.json"
         self.optimization_result_path = self.root / "optimization_result.json"
         self.optimization_trials_dir = self.root / "optimization_trials"
+        self.candidate_comparisons_dir = self.root / "candidate_comparisons"
         self.solution_path = self.root / "solution.py"
         self.run_benchmark_path = self.root / "run_benchmark.html"
         self.decision_dag_path = self.root / "decision_dag.png"
         self.agent_timeline_path = self.root / "agent_timeline.png"
         self.agent_timeline_svg_path = self.root / "agent_timeline.svg"
+        self.parent_trace_path = self.root / "parent_trace.json"
         self.score_improvement_path = self.root / "score_improvement.png"
         self.score_improvement_svg_path = self.root / "score_improvement.svg"
         self.run_notebook_path = self.root / "run_notebook.ipynb"
@@ -126,6 +130,7 @@ class ArtifactStore:
         self.learnings_path = self.root / "learnings.md"
         self.learning_log_path = self.root / "learnings.jsonl"
         self.datasets_dir = self.root / "datasets"
+        self.extractions_dir = self.root / "extractions"
         self.document_analyses_dir = self.root / "document_analyses"
         self.charts_dir = self.root / "charts"
         if not self.progress_path.exists():
@@ -495,6 +500,13 @@ class ArtifactStore:
         self._record_artifact_write(path, "extracted_dataset")
         return path
 
+    def write_extraction(self, extraction_id: str, payload: dict[str, Any]) -> Path:
+        """Persist non-tabular extraction output such as inspected figure metadata."""
+        path = self._artifact_path(self.extractions_dir, extraction_id, ".json")
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(path, "document_extraction")
+        return path
+
     def read_dataset(self, dataset_id: str) -> Optional[dict[str, Any]]:
         path = self._artifact_path(self.datasets_dir, dataset_id, ".json", create=False)
         if not path.is_file(): return None
@@ -528,12 +540,20 @@ class ArtifactStore:
             handle.write(json.dumps(event, sort_keys=True, default=str) + "\n")
         if self.session_store is not None:
             self.session_store.append_event("agent_event", event)
+        if self.progress_renderer is not None:
+            self.progress_renderer.consume(event)
 
     def write_solution(self, text: str) -> Path:
         self._snapshot_before_write(self.solution_path, "before writing solution code")
         self.solution_path.write_text(text, encoding="utf-8")
         self._record_artifact_write(self.solution_path, "solution")
         return self.solution_path
+
+    def write_candidate_comparison(self, comparison_id: str, payload: dict[str, Any]) -> Path:
+        path = self._artifact_path(self.candidate_comparisons_dir, comparison_id, ".json")
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(path, "candidate_comparison")
+        return path
 
     def write_optimized_candidate(self, text: str) -> Path:
         self._snapshot_before_write(self.optimized_candidate_path, "before writing optimized candidate")

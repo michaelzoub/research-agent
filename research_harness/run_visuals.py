@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -19,7 +20,7 @@ def write_research_run_visuals(store: ArtifactStore, events: Sequence[Any]) -> d
     additional spawned agents. Candidate graphs are optimization artifacts and
     are deliberately not fabricated for ordinary research runs.
     """
-    rows = [_event_row(event) for event in events]
+    rows = build_parent_trace_projection(store, [_event_row(event) for event in events])
     timeline = _timeline_data(store, rows)
     timeline_svg = _timeline_svg(timeline)
     store.agent_timeline_svg_path.write_text(timeline_svg, encoding="utf-8")
@@ -33,6 +34,53 @@ def write_research_run_visuals(store: ArtifactStore, events: Sequence[Any]) -> d
         "agent_timeline": store.agent_timeline_path,
         "agent_timeline_svg": store.agent_timeline_svg_path,
     }
+
+
+def build_parent_trace_projection(store: ArtifactStore, parent_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge isolated worker logs into one deterministic, reference-backed trace."""
+    rows: list[dict[str, Any]] = []
+    delegate_by_worker: dict[str, str] = {}
+    for row in parent_events:
+        copy = dict(row)
+        copy.setdefault("run_id", store.root.name)
+        if copy.get("event_type") == "tool_result" and copy.get("tool_name") == "delegate_task":
+            observation = copy.get("observation") or {}
+            data = observation.get("data") if isinstance(observation, dict) else {}
+            if isinstance(data, dict) and data.get("worker_run_id"):
+                delegate_by_worker[str(data["worker_run_id"])] = f"tool:{copy.get('tool_call_id')}"
+        rows.append(copy)
+    for result_path in sorted((store.root / "workers").glob("*/worker_result.json")):
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        worker_id = str(result.get("worker_run_id") or result_path.parent.name)
+        parent_span = delegate_by_worker.get(worker_id)
+        events_path = Path(str(result.get("events_path") or result_path.parent / "agent_events.jsonl"))
+        if not events_path.exists():
+            continue
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            row["worker_run_id"] = worker_id
+            row["parent_run_id"] = result.get("parent_run_id")
+            row["profile"] = result.get("profile")
+            row["worker_status"] = result.get("status")
+            row["worker_runtime_ms"] = result.get("runtime_ms")
+            row["worker_tokens"] = result.get("total_tokens")
+            row["worker_cost_usd"] = result.get("cost_usd")
+            row["artifact_refs"] = [result.get("artifacts_path"), result.get("events_path")]
+            row["parent_span_id"] = parent_span
+            rows.append(row)
+    unique: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("run_id") or row.get("worker_run_id") or "parent"), int(row.get("sequence") or 0), str(row.get("event_type") or ""))
+        unique[key] = row
+    merged = sorted(unique.values(), key=lambda row: (str(row.get("timestamp") or ""), str(row.get("run_id") or ""), int(row.get("sequence") or 0)))
+    store.parent_trace_path.write_text(json.dumps({"schema_version": "hierarchical_trace_v1", "events": merged}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return merged
 
 
 def _event_row(event: Any) -> dict[str, Any]:
@@ -50,6 +98,11 @@ def _event_row(event: Any) -> dict[str, Any]:
         "result_status": getattr(event, "result_status", None),
         "model_turn": getattr(event, "model_turn", None),
         "sequence": getattr(event, "sequence", 0),
+        "run_id": getattr(event, "run_id", None),
+        "parent_run_id": getattr(event, "parent_run_id", None),
+        "worker_run_id": getattr(event, "worker_run_id", None),
+        "span_id": getattr(event, "span_id", None),
+        "parent_span_id": getattr(event, "parent_span_id", None),
     }
 
 
@@ -82,19 +135,24 @@ def _timeline_data(store: ArtifactStore, events: list[dict[str, Any]]) -> dict[s
             operation = operation_for(event_type=kind)
             ordinals[operation.ordinal_scope] = ordinals.get(operation.ordinal_scope, 0) + 1
             controller_spans.append({
-                "label": f"{operation.label} {ordinals[operation.ordinal_scope]}",
+                "label": f"{'Worker model call' if row.get('worker_run_id') else operation.label} {ordinals[operation.ordinal_scope]}",
                 "start": started_at,
                 "end": max(started_at + 0.02, completed_at),
                 "kind": "controller", "operation_kind": operation.kind,
                 "category": operation.category, "color": operation.color, "status": str(row.get("result_status") or "completed"),
                 "detail": f"Model request · {int(row.get('runtime_ms') or 0)} ms",
+                "depth": 1 if row.get("worker_run_id") else 0,
+                "worker_run_id": row.get("worker_run_id"), "parent_span_id": row.get("parent_span_id"),
+                "span_id": row.get("span_id"),
             })
         elif kind == "tool_requested":
             tool_id = str(row.get("tool_call_id") or f"request_{len(starts)}")
-            starts.setdefault(tool_id, []).append((current_batch, point, str(row.get("tool_name") or "tool")))
+            trace_tool_id = f"{row.get('run_id') or row.get('worker_run_id') or 'parent'}:{tool_id}"
+            starts.setdefault(trace_tool_id, []).append((current_batch, point, str(row.get("tool_name") or "tool")))
         elif kind == "tool_result":
             tool_id = str(row.get("tool_call_id") or "")
-            attempts = starts.get(tool_id) or []
+            trace_tool_id = f"{row.get('run_id') or row.get('worker_run_id') or 'parent'}:{tool_id}"
+            attempts = starts.get(trace_tool_id) or []
             if not attempts:
                 continue
             batch, _, name = attempts[-1]
@@ -114,9 +172,13 @@ def _timeline_data(store: ArtifactStore, events: list[dict[str, Any]]) -> dict[s
                 "tooltip_metadata": {key: row.get(key) for key in operation.tooltip_metadata if row.get(key) is not None},
                 "parallel_calls": 1,
                 "batch": batch,
+                "depth": 1 if row.get("worker_run_id") else 0,
+                "worker_run_id": row.get("worker_run_id"), "parent_span_id": row.get("parent_span_id"),
+                "span_id": row.get("span_id") or f"tool:{tool_id}",
+                "tooltip_metadata": {**{key: row.get(key) for key in operation.tooltip_metadata if row.get(key) is not None}, **{key: row.get(key) for key in ("profile", "worker_runtime_ms", "worker_tokens", "worker_cost_usd", "worker_status", "artifact_refs") if row.get(key) is not None}},
             })
 
-    spans = controller_spans + tool_spans
+    spans = sorted(controller_spans + tool_spans, key=lambda span: (float(span["start"]), int(span.get("depth") or 0), str(span.get("label") or "")))
     end = max((float(span["end"]) for span in spans), default=origin + 1.0)
     return {
         "controller_count": controller_count,
@@ -130,9 +192,9 @@ def _timeline_data(store: ArtifactStore, events: list[dict[str, Any]]) -> dict[s
 
 
 def _timeline_svg(data: dict[str, Any]) -> str:
-    tool_spans = [span for span in data["spans"] if span["kind"] != "controller"]
+    lane_spans = list(data["spans"])
     width, left, right, axis_y, row_height = 1600, 340, 36, 56, 38
-    height = axis_y + (len(tool_spans) + 1) * row_height + 44
+    height = axis_y + len(lane_spans) * row_height + 44
     chart_width = width - left - right
     out = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-labelledby="timeline-title timeline-desc" style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">',
@@ -140,7 +202,7 @@ def _timeline_svg(data: dict[str, Any]) -> str:
         f'<desc id="timeline-desc">{data["controller_count"]} controller agent, {data["model_turn_count"]} model turns, {data["tool_call_count"]} tool calls, with up to {data["peak_parallel_tools"]} tool calls running in parallel.</desc>',
         f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
     ]
-    for row in range(len(tool_spans) + 1):
+    for row in range(len(lane_spans)):
         y = axis_y + row * row_height
         if row % 2:
             out.append(f'<rect x="{left}" y="{y}" width="{chart_width + right}" height="{row_height}" fill="#f7f9fc"/>')
@@ -149,20 +211,21 @@ def _timeline_svg(data: dict[str, Any]) -> str:
         out.append(f'<line x1="{x:.1f}" y1="{axis_y - 8}" x2="{x:.1f}" y2="{height - 30}" stroke="#dde4ee" stroke-width="1"/>')
         out.append(f'<text x="{x:.1f}" y="{axis_y - 18}" text-anchor="middle" font-size="13" fill="#8ca0be">{_time_label(tick)}</text>')
     out.append(f'<line x1="{left}" y1="{axis_y - 8}" x2="{width - right}" y2="{axis_y - 8}" stroke="#dde4ee"/>')
-    out.append(f'<text x="{left - 14}" y="{axis_y + 24}" text-anchor="end" font-size="15" font-weight="600" fill="#7c3aed">Main LLM calls</text>')
-    for index, span in enumerate(tool_spans, start=1):
+    for index, span in enumerate(lane_spans):
         y = axis_y + index * row_height + 24
         color = _span_color(span)
-        out.append(f'<text x="{left - 14}" y="{y}" text-anchor="end" font-size="15" font-weight="600" fill="{color}">{html.escape(str(span["label"]))}</text>')
+        prefix = "↳ " if span.get("depth") else ""
+        out.append(f'<text x="{left - 14}" y="{y}" text-anchor="end" font-size="15" font-weight="600" fill="{color}">{html.escape(prefix + str(span["label"]))}</text>')
     for span in data["spans"]:
         start = (float(span["start"]) - data["origin"]) / data["duration"]
         end = (float(span["end"]) - data["origin"]) / data["duration"]
         x = left + start * chart_width
         width_px = max(5, (end - start) * chart_width)
-        row = 0 if span["kind"] == "controller" else tool_spans.index(span) + 1
+        row = lane_spans.index(span)
         y = axis_y + row * row_height + 7
         color = _span_color(span)
-        detail = str(span.get("detail") or span["label"])
+        metadata = span.get("tooltip_metadata") or {}
+        detail = str(span.get("detail") or span["label"]) + (" · " + json.dumps(metadata, sort_keys=True) if metadata else "")
         status = str(span.get("status") or "completed")
         opacity = "0.42" if status in {"failed", "error", "cancelled"} else "0.62" if status == "skipped" else "1"
         dash = ' stroke-dasharray="6 4"' if status == "skipped" else ""

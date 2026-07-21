@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import ipaddress
 import socket
@@ -210,7 +211,7 @@ class DocumentFigureTool:
     """
 
     name = "inspect_document_figures"
-    is_read_only = True
+    is_read_only = False
     description = "Inspect a known public paper or technical page for figure numbers, captions, image URLs, and approximate aspect ratios. For an arXiv /abs/ URL, tries the matching original arXiv HTML paper first. Use after discovery before claiming a figure's caption or visual suitability."
     input_schema = {
         "type": "object",
@@ -233,6 +234,17 @@ class DocumentFigureTool:
             return result
         data = result.data if isinstance(result.data, dict) else {}
         source_url = str(data.get("source_url") or requested_url)
+        extraction_artifact = None
+        if context.store is not None:
+            extraction_id = "figures-" + hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:16]
+            extraction_artifact = context.store.write_extraction(extraction_id, {
+                "id": extraction_id,
+                "type": "figure_inspection",
+                "source_url": source_url,
+                "figures": data.get("figures", []),
+                "figure_count": data.get("figure_count", len(data.get("figures", []))),
+                "notes": data.get("notes", ""),
+            })
         source = Source(
             url=source_url,
             title=f"Figure inspection: {source_url[:240]}",
@@ -262,6 +274,8 @@ class DocumentFigureTool:
                 evidence_kind="verified_document",
             )
             sources.append(figure_source)
+        if extraction_artifact is not None:
+            data = {**data, "extraction_artifact": str(extraction_artifact.relative_to(context.store.root))}
         return ToolResult("ok", data, source_metadata=[asdict(item) for item in sources])
 
     def _inspect(self, requested_url: str, max_figures: int) -> ToolResult:

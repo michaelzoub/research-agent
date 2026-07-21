@@ -25,6 +25,25 @@ All tasks start the same lead `ResearchAgent`; tools are optional capabilities s
 
 The guided CLI does not ask the user to choose an evidence backend: the model selects among registered search capabilities from the objective and observations. `--retriever` remains an advanced capability restriction for offline runs, reproducible tests, or environments where only a specific backend should be exposed.
 
+```mermaid
+flowchart TD
+    goal["User goal"] --> lead["Lead ResearchAgent"]
+    lead --> loop["AgentLoop\nmodel turn + bounded state"]
+    loop --> decision{"Answer or use a tool?"}
+    decision -->|answer| validate["Validate and synthesize final answer"]
+    validate --> done["Return result to user"]
+    decision -->|tool call| tools["ToolRegistry\nschema + permission checks"]
+    tools --> observe["Tool result / observation"]
+    observe --> loop
+    tools -->|delegate_task| registry["WorkerRegistry\napproved profile + prompt + budget"]
+    registry --> worker["Isolated nested AgentLoop"]
+    worker --> worker_result["Structured WorkerResult\nfindings + artifacts + accounting"]
+    worker_result --> observe
+    worker -.->|delegation disabled| blocked["No recursive workers"]
+```
+
+Workers complete bounded assignments and return findings to the lead; they never replace the lead controller or final synthesizer. Concurrent read-only calls made by `ToolRegistry` remain ordinary tool calls and are not worker loops.
+
 Grader runs separate the full audit transcript from model working context. Every iteration receives a deterministic checkpoint containing the strategy ledger, exact champion/latest code, official edge metrics, fetched literature extracts, and only the newest unresolved tool exchange. Older tool chatter remains in `agent_messages.json` and `agent_events.jsonl` but is not replayed to the model. Fetched documents are keyed by canonical URL and served from the artifact cache on repeat requests.
 
 Document download bytes and model-facing extracted characters are separate limits, so ordinary HTML pages larger than the extract budget are parsed and compacted instead of rejected. Transient provider timeouts are retried once at the agent-loop boundary with the same working state after transport retries are exhausted; malformed or otherwise deterministic provider errors still terminate immediately. Kimi uses a 120-second default request timeout, configurable with `RESEARCH_HARNESS_LLM_TIMEOUT_SECONDS`.

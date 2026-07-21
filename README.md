@@ -29,10 +29,8 @@ The guided CLI does not ask the user to choose an evidence backend: the model se
 flowchart TD
     goal["Goal"] --> lead["Lead agent"]
     lead --> decision{"Model action"}
-    decision -->|tool call| tool["ToolRegistry\nordinary tool"]
-    tool --> lead
-    decision -->|delegate_task| worker["WorkerRegistry\nbounded AgentLoop"]
-    worker -->|WorkerResult findings| lead
+    decision -->|tool call| registry["ToolRegistry\nordinary tool or delegate_task"]
+    registry -->|ToolResult observation| lead
     decision -->|final answer| done["Lead synthesizes result"]
 ```
 

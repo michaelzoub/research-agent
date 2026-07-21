@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -127,7 +128,25 @@ class PredictionMarketGrader:
         results = payload.get("simulation_results", [])
         successes = [result for result in results if not result.get("failed")]
         if not results or not successes:
-            return self._unmeasured("official_scorer_no_successes", f"official scorer returned {len(results)} result(s), {len(successes)} successful.", docker_sandbox=docker_sandbox, **base)
+            failures = Counter(
+                str(result.get("error") or "unknown simulation failure")
+                for result in results
+                if result.get("failed")
+            )
+            details = "; ".join(
+                f"{count}x {message}" for message, count in failures.most_common(3)
+            )
+            error = f"official scorer returned {len(results)} result(s), {len(successes)} successful"
+            if details:
+                error += f": {details}"
+            return self._unmeasured(
+                "official_scorer_no_successes",
+                error + ".",
+                docker_sandbox=docker_sandbox,
+                failure_count=len(results) - len(successes),
+                simulations=len(results),
+                **base,
+            )
         mean = lambda key: round(sum(float(row.get(key, 0.0)) for row in successes) / len(successes), 6)
         return {
             **base,
@@ -165,12 +184,12 @@ class PredictionMarketGrader:
             return SandboxExecutionResult("", f"{type(exc).__name__}: {exc}", 1, command=command)
 
     @staticmethod
-    def _unmeasured(score_source: str, error: str, *, candidate_code: str = "", docker_sandbox: bool = False, exit_code: Optional[int] = None, timed_out: bool = False, stdout: str = "", stderr: str = "", upstream: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    def _unmeasured(score_source: str, error: str, *, candidate_code: str = "", docker_sandbox: bool = False, exit_code: Optional[int] = None, timed_out: bool = False, stdout: str = "", stderr: str = "", upstream: Optional[dict[str, Any]] = None, failure_count: int = 0, simulations: int = 0) -> dict[str, Any]:
         return {
             "official_measured": False, "score_eligible": False, "sandbox_executed": False,
             "docker_sandbox": docker_sandbox, "paired_crn": False, "eval_protocol": "unmeasured",
             "mean_edge": 0.0, "mean_arb_edge": 0.0, "mean_retail_edge": 0.0,
-            "success_count": 0, "failure_count": 0, "simulations": 0, "score_source": score_source,
+            "success_count": 0, "failure_count": failure_count, "simulations": simulations, "score_source": score_source,
             "error": error, "exit_code": exit_code, "timed_out": timed_out, "candidate_code": candidate_code,
             "stdout": stdout, "stderr": stderr, "upstream": upstream or {"grader_id": "prediction_market", "upstream_url": UPSTREAM_URL, "command": []},
         }

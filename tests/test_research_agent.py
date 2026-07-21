@@ -26,7 +26,7 @@ from research_harness.research_agent import AgentRunConfig, FinalAnswerValidator
 from research_harness.search import ArxivSearch, LocalCorpusSearch, WebSearch, _arxiv_identifier, _arxiv_query, _retrieval_query
 from research_harness.schemas import Source
 from research_harness.store import ArtifactStore
-from research_harness.tools import DocumentFigureTool, PredictionMarketEvaluationTool, SaveLearningTool, SearchTool, TerminalExecutionTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
+from research_harness.tools import CodeExecutionTool, DocumentFigureTool, PredictionMarketEvaluationTool, SaveLearningTool, SearchTool, TerminalExecutionTool, ToolContext, ToolRegistry, ToolResult, WebFetchTool
 from research_harness.llm import LLMResponse
 from research_harness.tools.research import _FigureHTMLParser, _arxiv_pdf_url, _image_dimensions, _inspection_urls
 
@@ -587,6 +587,41 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertIn("Private or loopback", private_curl.error or "")
         self.assertEqual(npm_install.status, "error")
         self.assertIn("limited", npm_install.error or "")
+
+    def test_terminal_finds_bundled_rg_when_process_path_is_sparse(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def runner(argv: list[str], cwd: Path, timeout_seconds: float):
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="file.py\n", stderr="")
+
+        with mock.patch(
+            "research_harness.tools.terminal.shutil.which",
+            return_value="/Applications/ChatGPT.app/Contents/Resources/rg",
+        ) as which:
+            result = asyncio.run(TerminalExecutionTool(runner=runner).execute(
+                {"command": "rg", "args": ["--files"]}, ToolContext(workspace=Path.cwd())
+            ))
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(captured["argv"][0], "/Applications/ChatGPT.app/Contents/Resources/rg")
+        self.assertIn("/Applications/ChatGPT.app/Contents/Resources", which.call_args.kwargs["path"])
+
+    def test_python_analysis_receives_approved_workspace_read_only(self) -> None:
+        class Sandbox:
+            def execute_python(self, code: str, **kwargs: Any):
+                captured.update({"code": code, **kwargs})
+                from research_harness.sandbox import SandboxExecutionResult
+                return SandboxExecutionResult("ok\n", "", 0)
+
+        captured: dict[str, Any] = {}
+        workspace = Path.cwd()
+        result = asyncio.run(CodeExecutionTool(sandbox=Sandbox()).execute(
+            {"code": "print('ok')"}, ToolContext(workspace=workspace)
+        ))
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(captured["workspace_path"], workspace)
 
     def test_registry_rejects_invalid_tool_arguments_before_execution(self) -> None:
         backend = LocalCorpusSearch(Path("examples/corpus/research_corpus.json"))

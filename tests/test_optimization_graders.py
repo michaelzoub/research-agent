@@ -9,6 +9,7 @@ from unittest.mock import patch
 from unittest.mock import patch
 
 from optimization_graders import get_optimization_grader, list_optimization_graders, optimization_grader_baselines
+from research_harness.sandbox import SandboxExecutionResult
 from research_harness.store import ArtifactStore
 
 
@@ -45,6 +46,26 @@ class OptimizationGraderTest(unittest.TestCase):
         self.assertFalse(result["score_eligible"])
         self.assertEqual(result["score_source"], "candidate_contract_invalid")
         self.assertIn("getattr()", result["error"])
+
+    def test_all_failed_simulations_surface_aggregated_scorer_error(self) -> None:
+        payload = {"simulation_results": [
+            {"failed": True, "error": "OrderBookError: price_ticks must be an integer"},
+            {"failed": True, "error": "OrderBookError: price_ticks must be an integer"},
+        ]}
+        completed = SandboxExecutionResult(json.dumps(payload), "", 0, command=("docker", "run"))
+        grader = get_optimization_grader("prediction_market")
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "strategy.py"
+            candidate.write_text("class Strategy: pass\n", encoding="utf-8")
+            with patch.object(grader, "find_upstream_path", return_value=Path("challenges/prediction-market-challenge")), patch(
+                "optimization_graders.prediction_market.adapter.DockerSandboxRunner.execute_prediction_market",
+                return_value=completed,
+            ):
+                result = grader.evaluate(candidate)
+
+        self.assertIn("2x OrderBookError: price_ticks must be an integer", result["error"])
+        self.assertEqual(result["failure_count"], 2)
+        self.assertEqual(result["simulations"], 2)
 
     def test_trial_artifact_retains_audit_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

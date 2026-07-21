@@ -134,7 +134,13 @@ class DockerSandboxRunner:
                 return SandboxExecutionResult("", f"{type(exc).__name__}: {exc}", 1, command=tuple(command))
         return SandboxExecutionResult(completed.stdout, completed.stderr, completed.returncode, command=tuple(command))
 
-    def execute_python(self, code: str, *, timeout_seconds: Optional[float] = None) -> SandboxExecutionResult:
+    def execute_python(
+        self,
+        code: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+        workspace_path: Optional[Path] = None,
+    ) -> SandboxExecutionResult:
         """Execute a short analysis script in the same network-isolated boundary."""
         if not self.available:
             return SandboxExecutionResult("", "docker executable not found on PATH", 127)
@@ -144,13 +150,15 @@ class DockerSandboxRunner:
             sandbox_dir = Path(directory)
             script = sandbox_dir / "analysis.py"
             script.write_text(code, encoding="utf-8")
+            workspace = Path(workspace_path).resolve() if workspace_path is not None else sandbox_dir
             command = [
                 "docker", "run", "--rm", "--network", self.network,
                 "--cpus", os.environ.get("RESEARCH_HARNESS_DOCKER_CPUS", "2"),
                 "--memory", os.environ.get("RESEARCH_HARNESS_DOCKER_MEMORY", "2g"),
                 "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-                "-v", f"{sandbox_dir}:/workspace:ro", "-w", "/workspace", self.image,
-                "python", "-I", "analysis.py",
+                "-v", f"{sandbox_dir}:/analysis:ro",
+                "-v", f"{workspace}:/workspace:ro", "-w", "/workspace", self.image,
+                "python", "-I", "/analysis/analysis.py",
             ]
             try:
                 completed = subprocess.run(

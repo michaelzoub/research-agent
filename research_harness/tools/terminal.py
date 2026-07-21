@@ -32,6 +32,13 @@ _CURL_WRITE_OR_CREDENTIAL_FLAGS = {
 }
 _GIT_READ_ONLY_SUBCOMMANDS = frozenset({"branch", "diff", "log", "ls-files", "remote", "rev-parse", "show", "status", "tag"})
 _NPM_READ_ONLY_SUBCOMMANDS = frozenset({"help", "info", "ping", "search", "view"})
+_EXTRA_EXECUTABLE_DIRS = (
+    "/Applications/ChatGPT.app/Contents/Resources",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+)
 
 
 class TerminalExecutionTool:
@@ -73,7 +80,11 @@ class TerminalExecutionTool:
         safety_error = _command_safety_error(command, args)
         if safety_error:
             return ToolResult("error", error=safety_error)
-        executable = shutil.which(command)
+        # Desktop apps commonly start with a deliberately small PATH.  Search
+        # the same known-safe directories that the child process receives so
+        # advertised tools (notably Codex's bundled rg) remain discoverable.
+        search_dirs = dict.fromkeys([*os.environ.get("PATH", "").split(os.pathsep), *_EXTRA_EXECUTABLE_DIRS])
+        executable = shutil.which(command, path=os.pathsep.join(path for path in search_dirs if path))
         if executable is None:
             return ToolResult("error", error=f"Terminal command '{command}' is not installed on PATH.", retryable=False)
         try:
@@ -116,7 +127,7 @@ class TerminalExecutionTool:
 def _run_command(argv: list[str], working_directory: Path, timeout_seconds: float) -> subprocess.CompletedProcess[str]:
     """Run one direct executable with an ephemeral home and no inherited secrets."""
     executable_dir = str(Path(argv[0]).parent)
-    safe_path = os.pathsep.join(dict.fromkeys([executable_dir, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))
+    safe_path = os.pathsep.join(dict.fromkeys([executable_dir, *_EXTRA_EXECUTABLE_DIRS]))
     with tempfile.TemporaryDirectory(prefix="research_harness_terminal_") as home:
         return subprocess.run(
             argv,

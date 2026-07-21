@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 import io
 import os
 import socket
@@ -393,6 +394,31 @@ class ResearchAgentTest(unittest.TestCase):
             self.assertEqual(champion["global_champion"]["variant_id"], trial["trial_id"])
             self.assertTrue(champion["global_champion"]["promoted_this_round"])
 
+    def test_prediction_market_evaluation_preserves_each_repeated_trial(self) -> None:
+        code = "from orderbook_pm_challenge.strategy import BaseStrategy\nclass Strategy(BaseStrategy):\n    pass\n"
+        measured = {
+            "official_measured": True, "score_eligible": True, "mean_edge": 1.25,
+            "mean_arb_edge": 0.5, "mean_retail_edge": 0.75, "score_source": "upstream_orderbook_pm_challenge",
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch("research_harness.tools.graders.get_optimization_grader") as get_grader:
+            store = ArtifactStore(Path(directory) / "run")
+            tool = PredictionMarketEvaluationTool()
+            context = ToolContext(workspace=Path.cwd(), store=store, run_id="run_pm")
+            get_grader.return_value.evaluate.return_value = measured
+
+            first = asyncio.run(tool.execute({"code": code}, context))
+            second = asyncio.run(tool.execute({"code": code}, context))
+
+            trials = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted(store.optimization_trials_dir.glob("*.json"))
+            ]
+            self.assertEqual(get_grader.return_value.evaluate.call_count, 2)
+            self.assertEqual(len(trials), 2)
+            self.assertEqual([trial["round_index"] for trial in trials], [1, 2])
+            self.assertNotEqual(first.data["candidate_id"], second.data["candidate_id"])
+            self.assertEqual({trial["strategy_id"] for trial in trials}, {"model_" + hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]})
+
     def test_prediction_market_tool_rejects_non_candidate_without_a_trial(self) -> None:
         tool = PredictionMarketEvaluationTool()
         with tempfile.TemporaryDirectory() as directory:
@@ -595,30 +621,40 @@ class ResearchAgentTest(unittest.TestCase):
     def test_guided_cli_can_select_an_official_grader(self) -> None:
         args = build_parser().parse_args([])
         answers = iter(["Optimize the PM challenge.", "2", "3", "", "", ""])
+        prompts = []
 
         configured = configure_interactive_run(
             args,
-            input_func=lambda _prompt: next(answers),
+            input_func=lambda prompt: prompts.append(prompt) or next(answers),
             output_func=lambda _text: None,
             key_reader=None,
         )
 
         self.assertEqual(configured.grader, "prediction_market")
         self.assertEqual(configured.grader_loops, 3)
+        self.assertNotIn("Where should research evidence come from?", "\n".join(prompts))
 
     def test_cli_accepts_a_separate_grader_loop_limit(self) -> None:
         args = build_parser().parse_args(["optimize pm challenge", "--grader", "prediction_market", "--grader-loops", "3"])
         self.assertEqual(args.grader_loops, 3)
 
-    def test_cli_scales_implicit_budgets_for_more_grader_rounds(self) -> None:
+    def test_cli_omitted_turn_and_runtime_limits_are_unbounded(self) -> None:
+        args = build_parser().parse_args(["research this"])
+        self.assertIsNone(args.max_iterations)
+        self.assertIsNone(args.max_runtime_seconds)
+        self.assertIsNone(HarnessConfig().max_iterations)
+        self.assertIsNone(AgentRunConfig().max_iterations)
+        self.assertIsNone(AgentRunConfig().max_runtime_seconds)
+
+    def test_cli_leaves_unspecified_grader_budgets_unbounded(self) -> None:
         args = build_parser().parse_args(["optimize pm challenge", "--grader", "--grader-loops", "8"])
         args.max_iterations_explicit = False
         args.max_runtime_seconds_explicit = False
 
         _apply_grader_budget_defaults(args)
 
-        self.assertEqual(args.max_iterations, 28)
-        self.assertEqual(args.max_runtime_seconds, 960.0)
+        self.assertIsNone(args.max_iterations)
+        self.assertIsNone(args.max_runtime_seconds)
 
     def test_cli_preserves_explicit_tight_grader_budgets(self) -> None:
         args = build_parser().parse_args([

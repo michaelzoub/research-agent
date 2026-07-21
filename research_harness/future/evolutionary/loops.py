@@ -1434,6 +1434,7 @@ class EvolutionaryOuterLoop:
         round_variant = variant_lookup.get(round_winner.variant_id)
         if round_variant is None:
             return
+        previous_champion_id = self._champion_variant_id
         promoted_global = round_winner.score >= self._champion_score
         if promoted_global:
             self._champion_variant_id = round_variant.id
@@ -1459,46 +1460,87 @@ class EvolutionaryOuterLoop:
             },
         }
         path = store.write_round_champion(round_index, champion_payload)
-        self._write_champion_tree(store)
+        store.append_champion_history({
+            "sequence": len(json.loads(store.champion_history_path.read_text(encoding="utf-8"))) + 1 if store.champion_history_path.exists() else 1,
+            "round_index": round_index,
+            "candidate_id": round_variant.id,
+            "score": round_winner.score,
+            "promoted": promoted_global,
+            "previous_champion_candidate_id": previous_champion_id,
+            "event_type": "promotion" if promoted_global else "promotion_rejected",
+        })
+        self._write_candidate_graph(store)
         store.append_progress(
             f"Champion promotion round {round_index}: winner={round_variant.id} "
             f"score={round_winner.score:.3f}; global={self._champion_variant_id}; artifact={path}"
         )
 
-    def _write_champion_tree(self, store: ArtifactStore) -> None:
+    def _write_candidate_graph(self, store: ArtifactStore) -> None:
         evaluations = {str(row.get("variant_id")): row for row in store.list("variant_evaluations")}
         rounds = store.list("evolution_rounds")
         round_winners = {str(row.get("best_variant_id")) for row in rounds if row.get("best_variant_id")}
+        promotion_rows = json.loads(store.champion_history_path.read_text(encoding="utf-8")) if store.champion_history_path.exists() else []
+        promoted_ids = {str(row.get("candidate_id")) for row in promotion_rows if row.get("promoted")}
+        variant_rows = store.list("variants")
+        parent_map = {str(row.get("id")): [str(value) for value in row.get("parent_ids", [])] for row in variant_rows}
+        champion_lineage: set[str] = set()
+        pending = [str(self._champion_variant_id)] if self._champion_variant_id else []
+        while pending:
+            candidate_id = pending.pop()
+            if candidate_id in champion_lineage:
+                continue
+            champion_lineage.add(candidate_id)
+            pending.extend(parent_map.get(candidate_id, []))
+        latest_iteration = max((int(row.get("outer_iteration") or 0) for row in variant_rows), default=0)
         nodes = []
         edges = []
-        for row in store.list("variants"):
+        for row in variant_rows:
             variant_id = str(row.get("id"))
             evaluation = evaluations.get(variant_id, {})
             parent_ids = [str(parent_id) for parent_id in row.get("parent_ids", [])]
+            passed = bool(evaluation.get("passed"))
+            metrics = evaluation.get("metrics") if isinstance(evaluation.get("metrics"), dict) else {}
+            eligible = passed and metrics.get("eligible", metrics.get("score_eligible", True)) is not False
             nodes.append(
                 {
                     "id": variant_id,
                     "outer_iteration": row.get("outer_iteration"),
                     "kind": row.get("kind"),
                     "parent_ids": parent_ids,
+                    "parent_candidate_ids": parent_ids,
                     "score": float(evaluation.get("score", 0.0) or 0.0),
+                    "evaluation": {"id": evaluation.get("id"), "passed": passed, "eligible": eligible, "summary": evaluation.get("summary", "")},
                     "is_round_winner": variant_id in round_winners,
                     "is_global_champion": variant_id == self._champion_variant_id,
-                    "highlight": "global_champion" if variant_id == self._champion_variant_id else ("round_winner" if variant_id in round_winners else "candidate"),
+                    "status": "current_champion" if variant_id == self._champion_variant_id else "former_champion" if variant_id in promoted_ids else "failed_or_ineligible" if not eligible else "rejected",
+                    "branch_status": "champion_lineage" if variant_id in champion_lineage else "current_exploration" if int(row.get("outer_iteration") or 0) == latest_iteration else "abandoned_branch",
+                    "highlight": "global_champion" if variant_id == self._champion_variant_id else ("former_champion" if variant_id in promoted_ids else "failed" if not eligible else "candidate"),
                     "summary": evaluation.get("summary", ""),
                 }
             )
+            relationship = str((row.get("metadata") or {}).get("lineage_type") or "derived_from")
+            if relationship not in {"derived_from", "reverted_to", "retried_from", "merged_from"}:
+                relationship = "derived_from"
+            if len(parent_ids) > 1 and relationship != "merged_from":
+                relationship = "derived_from"
             for parent_id in parent_ids:
-                edges.append({"from": parent_id, "to": variant_id})
-        store.write_champion_tree(
+                edges.append({"from": parent_id, "to": variant_id, "type": relationship})
+        store.write_candidate_graph(
             {
+                "schema_version": 1,
+                "kind": "candidate_strategy_graph",
                 "run_id": self.run_id,
+                "current_champion_candidate_id": self._champion_variant_id,
                 "global_champion_variant_id": self._champion_variant_id,
                 "global_champion_score": self._champion_score,
                 "nodes": nodes,
                 "edges": edges,
             }
         )
+
+    def _write_champion_tree(self, store: ArtifactStore) -> None:
+        """Deprecated compatibility entry point."""
+        self._write_candidate_graph(store)
 
     def _should_stop_outer_loop(
         self,

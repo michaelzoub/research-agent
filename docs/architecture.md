@@ -7,25 +7,47 @@ There is no execution-mode flag, plan builder, task router, phase dispatcher, or
 ## Production path
 
 ```mermaid
-flowchart TD
-  user["Goal"] --> cli["CLI"]
-  cli --> orchestrator["Orchestrator"]
-  orchestrator --> state["RunRecord + ArtifactStore"]
-  state --> agent["ResearchAgent"]
-  agent --> beforeAgent["before_agent hooks"]
-  beforeAgent --> beforeModel["before_model: budgets + nudges + context projection + request event"]
-  beforeModel --> model["Native provider model call"]
-  model --> afterModel["after_model: response event"]
-  afterModel --> decision{"Requested tools?"}
-  decision -->|yes| beforeTools["before_tools: request events"]
-  beforeTools --> registry["Tool limit policy + async ToolRegistry"]
-  registry --> afterTools["after_tools hooks + ordered observations"]
-  afterTools --> beforeModel
-  decision -->|no| validator["FinalAnswerValidator"]
-  validator -->|revise| beforeModel
-  validator -->|pass| afterAgent["after_agent hooks"]
-  afterAgent --> artifacts["Report, state, transcript, cost"]
+flowchart LR
+  subgraph outside["Outside the harness"]
+    user["User / CLI"]
+    provider["Configured model provider through LLMClient"]
+    external["External services and deterministic graders"]
+  end
+  subgraph harness["Research harness boundary"]
+    orchestrator["Orchestrator"] --> agent["ResearchAgent"] --> loop["AgentLoop"]
+    loop <--> state["AgentState"]
+    state --> persistence["ArtifactStore\nappend-only events, artifacts, costs"]
+    subgraph lifecycle["Middleware lifecycle"]
+      budget["BudgetPolicy\nruntime · cost · iteration"]
+      nudge["NudgePolicy"]
+      compact["ContextCompactionMiddleware"]
+      logging["EventLoggingMiddleware\ndeterministic ordering"]
+    end
+    loop <--> lifecycle
+    loop --> limits["ToolLimitPolicy\ntool + grader-call budgets"] --> registry["ToolRegistry\nschema validation"]
+    registry --> delegate["delegate_task"] --> workers["WorkerRegistry\napproved profiles + prompts + tools + models + budgets"]
+    workers --> nested["Bounded nested AgentLoop\nisolated context, artifacts, events, permissions, accounting"]
+    loop --> final["FinalAnswerValidator\nanswer + citation validation"]
+    subgraph capabilities["Registered capabilities"]
+      search["Search backends"]
+      fetch["Public document fetching\nSSRF + redirect checks"]
+      adapters["External-service adapters"]
+      workspace["Workspace reads\nsecret-file denial"]
+      python["Sandboxed Python\nnetwork restrictions"]
+      terminal["Bounded read-only terminal"]
+      documents["Extraction + document analysis"]
+      charts["Chart generation"]
+      optional["Optional grader, swarm, sweep, learning tools\nscore eligibility + promotion rules"]
+    end
+    registry --> capabilities
+  end
+  user --> orchestrator
+  loop <--> provider
+  adapters <--> external
+  optional <--> external
 ```
+
+The model is the cognitive controller: it chooses whether to answer or request a registered capability. Middleware and policies constrain, validate, record, and execute; they do not choose research topics or tools. Guardrails sit at their enforcement points: budgets at the loop, schema and tool limits at the registry, SSRF checks at fetch, path and secret checks at workspace access, sandbox restrictions at Python and terminal execution, grader eligibility at grader tools, final-answer and citation rules at validation, and deterministic append-only ordering at event persistence.
 
 `Orchestrator.run(goal)` initializes the run and persists its actual trajectory. It always creates one `ResearchAgent`; a registered optimization grader is exposed as a controlled tool, not a second orchestration path. It does not create a research plan.
 
@@ -107,6 +129,8 @@ The model’s visible text and a concise public tool-decision summary are record
 
 All integrations live behind `ToolRegistry`:
 
+`WorkerRegistry` is an internal control plane, not a second model-facing registry. It resolves approved profiles and launches separately model-directed, bounded `AgentLoop` instances. The parent sees only `delegate_task` in `ToolRegistry`, receives a structured `WorkerResult`, and retains trajectory control and final synthesis. Every result carries `parent_run_id` and `worker_run_id`; worker artifacts and event logs live below `workers/<worker_run_id>/`. Worker profiles narrow the parent's tool and filesystem permissions and own model configuration, prompts, and default budgets. Recursive delegation is disabled. Count, parallelism, runtime, token, and tool-call ceilings are independently configurable. Concurrent read-only calls made by `ToolRegistry.execute_many()` are ordinary tool concurrency and never counted as workers.
+
 | Capability | Tool | Boundary |
 | --- | --- | --- |
 | Evidence discovery | `SearchTool` backends | Search results are source records, not raw HTTP in the agent loop. |
@@ -166,6 +190,9 @@ Every run directory contains:
 | `final_report.md` | Validated answer or clearly labelled partial synthesis. |
 | `cost.json` / `cost_events.json` | Provider token usage and estimated cost. |
 | `datasets/`, `document_analyses/`, `charts/` | Optional extraction, grounded analysis, and reproducible SVG artifacts selected by the model. |
+| `agent_timeline.png` / `agent_timeline.svg` | Readable overview and complete event timeline with per-operation ordinals, concurrency, retry metadata, and independent status styling. |
+| `candidate_graph.json` / `.svg` / `.png` | Immutable candidate evaluation nodes and typed lineage DAG for optimization runs. |
+| `champion_history.json` | Ordered promotion events, independent of candidate lineage. |
 
 `progress.txt` prints a concise stream of model turns and each requested/completed tool call. Event and failure records survive even if a later model request fails.
 
@@ -174,6 +201,19 @@ Every run directory contains:
 The repository still contains evaluator, optimization, prediction-market, benchmark, and experiment utilities. They are deterministic capabilities and test fixtures; they are not alternative top-level execution paths. A future agent-facing experiment adapter must preserve the separation: the model may propose or inspect an experiment, but deterministic evaluator and promotion policy own execution and promotion.
 
 Optimization graders remain registered capabilities with explicit call limits and promotion safeguards. Grader execution and score eligibility are deterministic; grader feedback is an observation available to the model, not grader logic merged into the model loop.
+
+```mermaid
+flowchart LR
+  proposal["Candidate proposal"] --> evaluation["Deterministic evaluation"] --> recorded["Immutable candidate + result recorded"] --> eligible{"Eligible?"}
+  eligible -->|yes| promotion["Optional promotion event"]
+  eligible -->|no| retained["Retained rejected / failed candidate"]
+  promotion --> history["Ordered champion history"]
+  retained --> next["Next candidate may branch from any retained candidate"]
+  history --> next
+  next --> proposal
+```
+
+`candidate_graph.json` is a DAG-compatible record of immutable candidate versions. Its `parent_candidate_ids` and typed edges describe derivation, retry, reversion, or a real supported merge; promotion never creates lineage. `champion_history.json` is the ordered sequence of promotion decisions. A later candidate may base itself on an earlier retained candidate without mutating that historical node. `champion_tree.*` is a deprecated compatibility export only.
 
 ## Optimization grader adapters
 
@@ -203,7 +243,7 @@ champion.
 
 ## Configuration
 
-`HarnessConfig` is a policy object, not a trajectory selector. It contains retriever availability, model/provider selection, iteration/tool/runtime/cost budgets, approved workspace roots, sessions, output location, and optional grader availability.
+`HarnessConfig` is a policy object, not a trajectory selector. It contains retriever availability, model/provider selection, optional iteration/runtime/cost ceilings, the tool budget, approved workspace roots, sessions, output location, and optional grader availability. Model turns and wall-clock runtime are unbounded when the corresponding CLI options are omitted; explicit limits remain hard ceilings.
 
 The public CLI exposes a goal, retriever availability, model selection, budgets, and the current `--grader --grader-loops N` contract. It does not expose `--mode`, `--task-mode`, `--evaluator`, fixed research phases, or an optimizer-routing choice. A new run never scans or registers previous output directories as model evidence.
 

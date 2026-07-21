@@ -25,7 +25,7 @@ class HarnessConfig:
     """Safety, budgets, and available capabilities—not a trajectory selector."""
     id: str = "model-directed-agent-v1"
     retriever: str = "auto"
-    max_iterations: int = 20
+    max_iterations: Optional[int] = None
     evaluator_name: Optional[str] = None
     max_grader_calls: Optional[int] = None
     llm_provider: str = "auto"
@@ -136,7 +136,7 @@ class Orchestrator:
                 transcript = {}
         store.write_run_state({
             "schema_version": "model_directed_run_state_v1", "stage": stage, "run": to_dict(run), "goal": run.user_goal,
-            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal"] + [tool.name for tool in default_external_service_registry().tools()] + ["consult_specialist"] + (["evaluate_prediction_market_candidate", "spawn_optimization_agents", "run_parameter_sweep", "save_learning"] if self.config.evaluator_name == "prediction_market" else []),
+            "available_tools": self._enabled_retrievers() + ["fetch_document", "inspect_document_figures", "read_workspace_file", "execute_python_analysis", "execute_terminal"] + [tool.name for tool in default_external_service_registry().tools()] + ["consult_specialist", "delegate_task"] + (["evaluate_prediction_market_candidate", "spawn_optimization_agents", "run_parameter_sweep", "save_learning"] if self.config.evaluator_name == "prediction_market" else []),
             "observed_counts": {"events": len(transcript.get("events", [])), "messages": len(transcript.get("messages", [])), "tool_calls": len(transcript.get("tool_calls", []))},
             "termination": transcript.get("termination_reason"),
             "artifacts": {
@@ -147,7 +147,8 @@ class Orchestrator:
                 "learnings": str(store.learnings_path),
                 "learning_log": str(store.learning_log_path),
                 **({"grader_preflight": str(store.grader_preflight_path)} if store.grader_preflight_path.exists() else {}),
-                **({"agent_timeline": str(store.agent_timeline_path), "champion_tree": str(store.champion_tree_path)} if store.agent_timeline_path.exists() and store.champion_tree_path.exists() else {}),
+                **({"agent_timeline": str(store.agent_timeline_path)} if store.agent_timeline_path.exists() else {}),
+                **({"candidate_graph": str(store.candidate_graph_path), "champion_history": str(store.champion_history_path)} if store.candidate_graph_path.exists() else {}),
             },
             "notes": ["This event history is append-only from actual model turns and tool results.", "No predefined plan, source strategy, or execution mode is recorded or used."],
         })

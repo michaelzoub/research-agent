@@ -93,8 +93,9 @@ def main() -> None:
         print(f"Optimizer trace: {store.root / 'optimizer_trace.json'}")
         print(f"Optimizer flow: {store.root / 'optimizer_flow.png'}")
         print(f"Optimizer flow SVG: {store.root / 'optimizer_flow.svg'}")
-        print(f"Champion tree graph: {store.champion_tree_graph_path}")
-        print(f"Champion tree SVG: {store.champion_tree_svg_path}")
+        print(f"Candidate graph: {store.candidate_graph_graph_path}")
+        print(f"Candidate graph SVG: {store.candidate_graph_svg_path}")
+        print(f"Champion history: {store.champion_history_path}")
         if trace:
             best = max(trace, key=lambda row: float(row.get("best_mean_edge") or row.get("best_score") or 0.0))
             parameter_like = sum(1 for row in trace if row.get("all_variants_parameter_nudges"))

@@ -44,7 +44,14 @@ class PredictionMarketEvaluationTool:
         if context.store is None:
             return ToolResult("error", error="Prediction-market evaluation requires an artifact store.")
 
-        candidate_id = f"model_{hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]}"
+        strategy_id = f"model_{hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]}"
+        # A strategy fingerprint is not an evaluation identity: the model can
+        # legitimately submit the same code more than once (for example when
+        # confirming a noisy scorer result).  Reusing the fingerprint as the
+        # trial filename silently overwrote the earlier JSON record, making an
+        # eight-round CLI run appear to contain only one evaluation.
+        round_index = _next_measured_round_index(context.store)
+        candidate_id = f"{strategy_id}_round_{round_index:03d}"
         candidate_path = Path(context.store.candidates_dir) / f"{candidate_id}.py"
         candidate_path.parent.mkdir(parents=True, exist_ok=True)
         candidate_path.write_text(code, encoding="utf-8")
@@ -52,9 +59,9 @@ class PredictionMarketEvaluationTool:
         trial_code_path = context.store.write_optimization_trial_code(candidate_id, code)
         grader = get_optimization_grader("prediction_market")
         result = await asyncio.to_thread(grader.evaluate, candidate_path)
-        round_index = _next_measured_round_index(context.store)
         trial = {
             "trial_id": candidate_id,
+            "strategy_id": strategy_id,
             "run_id": context.run_id,
             "grader_id": "prediction_market",
             "candidate_path": str(candidate_path),

@@ -100,6 +100,11 @@ class ArtifactStore:
         self.champion_tree_graph_path = self.root / "champion_tree.png"
         self.champion_tree_svg_path = self.root / "champion_tree.svg"
         self.champion_tree_mermaid_path = self.root / "champion_tree.mmd"
+        self.candidate_graph_path = self.root / "candidate_graph.json"
+        self.candidate_graph_graph_path = self.root / "candidate_graph.png"
+        self.candidate_graph_svg_path = self.root / "candidate_graph.svg"
+        self.candidate_graph_mermaid_path = self.root / "candidate_graph.mmd"
+        self.champion_history_path = self.root / "champion_history.json"
         self.current_champion_path = self.root / "current_champion.json"
         self.optimization_result_path = self.root / "optimization_result.json"
         self.optimization_trials_dir = self.root / "optimization_trials"
@@ -583,6 +588,27 @@ class ArtifactStore:
         self.champion_tree_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self._record_artifact_write(self.champion_tree_path, "champion_tree")
         return self.champion_tree_path
+
+    def write_candidate_graph(self, payload: dict[str, Any], *, emit_legacy: bool = True) -> Path:
+        """Persist canonical immutable-candidate lineage; legacy tree is deprecated."""
+        self._snapshot_before_write(self.candidate_graph_path, "before writing candidate graph")
+        self.candidate_graph_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(self.candidate_graph_path, "candidate_graph")
+        if emit_legacy:
+            legacy = dict(payload)
+            legacy["deprecated"] = "Use candidate_graph.json; promotion history is in champion_history.json."
+            self.write_champion_tree(legacy)
+        return self.candidate_graph_path
+
+    def append_champion_history(self, event: dict[str, Any]) -> Path:
+        with self._write_lock:
+            history = []
+            if self.champion_history_path.exists():
+                history = json.loads(self.champion_history_path.read_text(encoding="utf-8"))
+            history.append(event)
+            self.champion_history_path.write_text(json.dumps(history, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record_artifact_write(self.champion_history_path, "champion_history")
+        return self.champion_history_path
 
     def write_cost(self, payload: dict[str, Any]) -> Path:
         self._snapshot_before_write(self.cost_path, "before writing cost summary")

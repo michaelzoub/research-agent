@@ -28,12 +28,13 @@ class AgentDecider(Protocol):
 
 @dataclass(frozen=True)
 class AgentRunConfig:
-    max_iterations: int = 20
+    max_iterations: Optional[int] = None
     max_tool_calls: int = 48
     max_grader_calls: Optional[int] = None
     source_refresh_nudge_after_iterations: int = 5
     max_cost_usd: Optional[float] = None
-    max_runtime_seconds: float = 300.0
+    max_runtime_seconds: Optional[float] = None
+    max_tokens: Optional[int] = None
     grader_action_nudge_after_iterations: int = 1
     max_consecutive_model_failures: int = 2
 
@@ -151,13 +152,16 @@ class BudgetPolicy(AgentMiddleware):
         if state.context.cancelled:
             return "cancelled"
         elapsed = time.monotonic() - state.started_at_monotonic
-        if elapsed > self.config.max_runtime_seconds:
+        if self.config.max_runtime_seconds is not None and elapsed > self.config.max_runtime_seconds:
             state.termination_error = (
                 f"Wall-clock runtime budget exhausted after {elapsed:.1f}s "
                 f"(limit: {self.config.max_runtime_seconds:.1f}s)."
             )
             return "budget_exhausted"
         if self.config.max_cost_usd is not None and self.cost_reader() - state.initial_cost >= self.config.max_cost_usd:
+            return "budget_exhausted"
+        if self.config.max_tokens is not None and _decider_tokens(state.context) >= self.config.max_tokens:
+            state.termination_error = f"Token budget exhausted (limit: {self.config.max_tokens})."
             return "budget_exhausted"
         return None
 
@@ -459,9 +463,11 @@ class AgentLoop:
         config: AgentRunConfig,
         validator: Optional[FinalAnswerValidator] = None,
         middleware: Optional[MiddlewareStack] = None,
+        system_messages: Optional[Sequence[str]] = None,
     ):
         self.decider, self.registry, self.config = decider, registry, config
         self.validator = validator or FinalAnswerValidator()
+        self.system_messages = list(system_messages or [_SYSTEM_INSTRUCTIONS, _OPTIMIZATION_EXPLORATION_GUIDANCE])
         self.recorder = EventRecorder()
         self.tool_policy = ToolLimitPolicy(config)
         self.tool_executor = ToolExecutor(registry, self.tool_policy, self.recorder)
@@ -478,11 +484,13 @@ class AgentLoop:
             objective=objective,
             context=context,
             initial_cost=_decider_cost(self.decider),
-            system_messages=[_SYSTEM_INSTRUCTIONS, _OPTIMIZATION_EXPLORATION_GUIDANCE],
+            system_messages=self.system_messages,
         )
         await self.middleware.before_agent(state)
 
-        for iteration in range(1, self.config.max_iterations + 1):
+        iteration = 0
+        while self.config.max_iterations is None or iteration < self.config.max_iterations:
+            iteration += 1
             state.begin_iteration(iteration)
             termination = await self.middleware.before_model(state)
             if termination:
@@ -598,6 +606,11 @@ def _public_decision_summary(turn: ModelTurn) -> Optional[str]:
 def _decider_cost(decider: Any) -> float:
     llm = getattr(decider, "llm", None)
     return float(llm.total_cost()) if llm and hasattr(llm, "total_cost") else 0.0
+
+
+def _decider_tokens(context: ToolContext) -> int:
+    reader = getattr(context, "token_reader", None)
+    return int(reader()) if callable(reader) else 0
 
 
 def _model_error(exc: Exception) -> str:

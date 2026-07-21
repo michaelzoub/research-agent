@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Optional, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,10 @@ class ToolContext:
     readable_roots: Sequence[Any] = field(default_factory=tuple)
     store: Optional[Any] = None
     run_id: str = ""
+    parent_run_id: str = ""
+    worker_run_id: str = ""
+    delegation_depth: int = 0
+    token_reader: Optional[Callable[[], int]] = None
     cancelled: bool = False
 
 
@@ -69,6 +73,13 @@ class ToolRegistry:
             {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
             for tool in self._tools.values()
         ]
+
+    def subset(self, names: Sequence[str]) -> "ToolRegistry":
+        """Return an isolated capability view, rejecting unapproved names."""
+        missing = sorted(set(names) - set(self._tools))
+        if missing:
+            raise ValueError(f"Unknown or unavailable worker tool(s): {', '.join(missing)}")
+        return ToolRegistry([self._tools[name] for name in names])
 
     async def execute(self, name: str, arguments: Any, context: ToolContext) -> ToolResult:
         if context.cancelled:

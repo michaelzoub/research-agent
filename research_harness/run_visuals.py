@@ -2,22 +2,22 @@
 from __future__ import annotations
 
 import html
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
 from .run_benchmarks import _PngCanvas, _write_png_from_svg_or_fallback
 from .store import ArtifactStore
+from .visual_operations import operation_for
 
 
 def write_research_run_visuals(store: ArtifactStore, events: Sequence[Any]) -> dict[str, Path]:
-    """Write only the two visuals that describe an actual research trajectory.
+    """Write the event-backed timeline for an actual research trajectory.
 
     Tool calls are concurrent work performed for a single controller agent; the
     timeline makes that distinction explicit instead of misrepresenting tools as
-    additional spawned agents.  The historical ``champion_tree`` name is kept
-    for compatibility, while research runs label the graphic as a trajectory.
+    additional spawned agents. Candidate graphs are optimization artifacts and
+    are deliberately not fabricated for ordinary research runs.
     """
     rows = [_event_row(event) for event in events]
     timeline = _timeline_data(store, rows)
@@ -29,21 +29,9 @@ def write_research_run_visuals(store: ArtifactStore, events: Sequence[Any]) -> d
         lambda: _timeline_png(timeline),
     )
 
-    trajectory = _trajectory_tree(store, rows)
-    store.write_champion_tree(trajectory)
-    tree_svg = _trajectory_tree_svg(trajectory)
-    store.champion_tree_svg_path.write_text(tree_svg, encoding="utf-8")
-    _write_png_from_svg_or_fallback(
-        store.champion_tree_graph_path,
-        tree_svg,
-        lambda: _trajectory_tree_png(trajectory),
-    )
     return {
         "agent_timeline": store.agent_timeline_path,
         "agent_timeline_svg": store.agent_timeline_svg_path,
-        "champion_tree": store.champion_tree_path,
-        "champion_tree_graph": store.champion_tree_graph_path,
-        "champion_tree_svg": store.champion_tree_svg_path,
     }
 
 
@@ -76,10 +64,11 @@ def _timeline_data(store: ArtifactStore, events: list[dict[str, Any]]) -> dict[s
     ]
     origin = min(points) if points else 0.0
     current_batch = 0
-    starts: dict[str, tuple[int, float, str]] = {}
+    starts: dict[str, list[tuple[int, float, str]]] = {}
     controller_spans: list[dict[str, Any]] = []
     tool_spans: list[dict[str, Any]] = []
     model_turn_count = 0
+    ordinals: dict[str, int] = {}
 
     for row, point in timestamped:
         if point is None:
@@ -90,29 +79,39 @@ def _timeline_data(store: ArtifactStore, events: list[dict[str, Any]]) -> dict[s
             model_turn_count += 1
             started_at = _timestamp(row.get("started_at")) or point
             completed_at = _timestamp(row.get("completed_at")) or point
+            operation = operation_for(event_type=kind)
+            ordinals[operation.ordinal_scope] = ordinals.get(operation.ordinal_scope, 0) + 1
             controller_spans.append({
-                "label": f"Model turn {model_turn_count}",
+                "label": f"{operation.label} {ordinals[operation.ordinal_scope]}",
                 "start": started_at,
                 "end": max(started_at + 0.02, completed_at),
-                "kind": "controller",
+                "kind": "controller", "operation_kind": operation.kind,
+                "category": operation.category, "color": operation.color, "status": str(row.get("result_status") or "completed"),
                 "detail": f"Model request · {int(row.get('runtime_ms') or 0)} ms",
             })
         elif kind == "tool_requested":
             tool_id = str(row.get("tool_call_id") or f"request_{len(starts)}")
-            starts[tool_id] = (current_batch, point, str(row.get("tool_name") or "tool"))
+            starts.setdefault(tool_id, []).append((current_batch, point, str(row.get("tool_name") or "tool")))
         elif kind == "tool_result":
             tool_id = str(row.get("tool_call_id") or "")
-            request = starts.get(tool_id)
-            if request is None:
+            attempts = starts.get(tool_id) or []
+            if not attempts:
                 continue
-            batch, start, name = request
+            batch, _, name = attempts[-1]
+            start = attempts[0][1]
             status = str(row.get("result_status") or "unknown")
+            operation = operation_for(tool_name=name)
+            ordinals[operation.ordinal_scope] = ordinals.get(operation.ordinal_scope, 0) + 1
+            retry_count = max(0, len(attempts) - 1)
             tool_spans.append({
-                "label": _tool_label(name, len(tool_spans) + 1),
+                "label": f"{operation.label} {ordinals[operation.ordinal_scope]}",
                 "start": start,
                 "end": max(start + 0.02, point),
-                "kind": "tools_error" if status not in {"ok", "skipped"} else "tools",
-                "detail": f"{name} · {status} · batch {batch}",
+                "kind": "tools", "operation_kind": operation.kind,
+                "category": operation.category, "color": operation.color, "status": status,
+                "detail": f"{operation.label} · {status} · batch {batch}" + (f" · {retry_count} retr{'y' if retry_count == 1 else 'ies'}" if retry_count else ""),
+                "retry_count": retry_count, "tool_call_id": tool_id,
+                "tooltip_metadata": {key: row.get(key) for key in operation.tooltip_metadata if row.get(key) is not None},
                 "parallel_calls": 1,
                 "batch": batch,
             })
@@ -164,7 +163,11 @@ def _timeline_svg(data: dict[str, Any]) -> str:
         y = axis_y + row * row_height + 7
         color = _span_color(span)
         detail = str(span.get("detail") or span["label"])
-        out.append(f'<rect x="{x:.1f}" y="{y}" width="{width_px:.1f}" height="25" rx="5" fill="{color}"><title>{html.escape(detail)}</title></rect>')
+        status = str(span.get("status") or "completed")
+        opacity = "0.42" if status in {"failed", "error", "cancelled"} else "0.62" if status == "skipped" else "1"
+        dash = ' stroke-dasharray="6 4"' if status == "skipped" else ""
+        stroke = "#b91c1c" if status in {"failed", "error", "cancelled"} else color
+        out.append(f'<rect x="{x:.1f}" y="{y}" width="{width_px:.1f}" height="25" rx="5" fill="{color}" fill-opacity="{opacity}" stroke="{stroke}" stroke-width="1.5"{dash}><title>{html.escape(detail)}</title></rect>')
         if width_px >= 72:
             label = _truncate(str(span["label"]), max(7, int(width_px // 8)))
             out.append(f'<text x="{x + 9:.1f}" y="{y + 17}" font-size="12" font-weight="600" fill="#ffffff">{html.escape(label)}</text>')
@@ -198,22 +201,23 @@ def _timeline_png(data: dict[str, Any]) -> bytes:
         row = 0 if span["kind"] == "controller" else tool_spans.index(span) + 1
         y = axis_y + row * row_height + 7
         canvas.rect(x, y, bar_width, 25, _span_color(span))
+        status = str(span.get("status") or "completed")
+        if status in {"failed", "error", "cancelled"}:
+            canvas.outline(x, y, bar_width, 25, "#b91c1c")
+            canvas.rect(x + 2, y + 2, 4, 4, "#b91c1c")
+        elif status == "skipped":
+            canvas.outline(x, y, bar_width, 25, "#64748b")
+            canvas.rect(x + 2, y + 2, 4, 4, "#64748b")
         if bar_width > 72:
             canvas.text(x + 7, y + 8, _truncate(str(span["label"]), max(7, bar_width // 8)).upper(), "#ffffff", 1)
+    canvas.text(
+        18,
+        canvas.height - 14,
+        f"{data['controller_count']} CONTROLLER AGENT / {data['tool_call_count']} TOOL CALLS / PEAK {data['peak_parallel_tools']} TOOLS IN PARALLEL",
+        "#64748b",
+        1,
+    )
     return canvas.png()
-
-
-def _tool_label(name: str, index: int) -> str:
-    labels = {
-        "arxiv_api_search": "Literature search",
-        "semantic_scholar_api_search": "Scholar search",
-        "openalex_api_search": "OpenAlex search",
-        "web_search": "Web search",
-        "docs_blogs_search": "Docs search",
-        "fetch_document": "Document fetch",
-        "inspect_document_figures": "Figure inspection",
-    }
-    return f"{labels.get(name, name.replace('_', ' ').title())} {index}"
 
 
 def _peak_parallelism(spans: Sequence[dict[str, Any]]) -> int:
@@ -228,11 +232,7 @@ def _peak_parallelism(spans: Sequence[dict[str, Any]]) -> int:
 
 
 def _span_color(span: dict[str, Any]) -> str:
-    if span["kind"] == "controller":
-        return "#7c3aed"
-    if span["kind"] == "tools_error":
-        return "#ef4444"
-    return "#2563eb" if "search" in str(span.get("detail") or "") else "#06b6d4"
+    return str(span.get("color") or "#64748b")
 
 
 def _time_ticks(duration: float) -> list[float]:
@@ -255,61 +255,6 @@ def _time_label(value: float) -> str:
 
 def _truncate(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[: max(1, limit - 1)].rstrip() + "…"
-
-
-def _trajectory_tree(store: ArtifactStore, events: list[dict[str, Any]]) -> dict[str, Any]:
-    nodes = [{"id": "research_agent", "label": "Controller agent", "kind": "controller"}]
-    edges: list[dict[str, str]] = []
-    parent = "research_agent"
-    number = 0
-    for event in events:
-        if event.get("event_type") != "model_turn":
-            continue
-        number += 1
-        node_id = f"turn_{number}"
-        nodes.append({"id": node_id, "label": f"Model turn {number}", "kind": "model_turn"})
-        edges.append({"from": parent, "to": node_id})
-        parent = node_id
-    return {"kind": "research_trajectory", "run_id": store.root.name, "nodes": nodes, "edges": edges}
-
-
-def _trajectory_tree_svg(tree: dict[str, Any]) -> str:
-    nodes = list(tree["nodes"])
-    width = max(960, 160 + len(nodes) * 140)
-    out = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="180" viewBox="0 0 {width} 180" style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">',
-        f'<rect width="{width}" height="180" fill="#ffffff"/>',
-        '<text x="24" y="32" font-size="18" font-weight="700" fill="#0f172a">Research controller trajectory</text>',
-        '<text x="24" y="52" font-size="11" fill="#64748b">This run created one controller agent. Nodes are observed model turns, not optimization candidates.</text>',
-    ]
-    positions = {str(node["id"]): 90 + index * 140 for index, node in enumerate(nodes)}
-    for edge in tree["edges"]:
-        x1, x2 = positions[edge["from"]], positions[edge["to"]]
-        out.append(f'<path d="M{x1 + 28},106 H{x2 - 28}" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>')
-    out.insert(1, '<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/></marker></defs>')
-    for node in nodes:
-        x = positions[str(node["id"])]
-        fill = "#ede9fe" if node["kind"] == "controller" else "#eff6ff"
-        stroke = "#7c3aed" if node["kind"] == "controller" else "#2563eb"
-        out.append(f'<rect x="{x - 42}" y="82" width="84" height="48" rx="8" fill="{fill}" stroke="{stroke}" stroke-width="2"/>')
-        out.append(f'<text x="{x}" y="111" text-anchor="middle" font-size="11" fill="#0f172a">{html.escape(str(node["label"]))}</text>')
-    out.append('</svg>')
-    return "\n".join(out)
-
-
-def _trajectory_tree_png(tree: dict[str, Any]) -> bytes:
-    canvas = _PngCanvas(1280, 180, "#ffffff")
-    canvas.text(24, 18, "RESEARCH CONTROLLER TRAJECTORY", "#0f172a", 2)
-    nodes = list(tree["nodes"])
-    for index, node in enumerate(nodes[:8]):
-        x = 70 + index * 150
-        color = "#7c3aed" if node["kind"] == "controller" else "#2563eb"
-        canvas.rect(x, 82, 108, 38, "#ede9fe" if node["kind"] == "controller" else "#eff6ff")
-        canvas.outline(x, 82, 108, 38, color)
-        canvas.text(x + 8, 96, str(node["label"]).upper(), "#0f172a", 1, 16)
-        if index:
-            canvas.line(x - 42, 101, x, 101, "#64748b")
-    return canvas.png()
 
 
 def _timestamp(value: Any) -> float | None:

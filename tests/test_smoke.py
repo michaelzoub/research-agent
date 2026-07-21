@@ -32,9 +32,7 @@ class OrchestratorSmokeTest(unittest.TestCase):
             self.assertTrue(store.agent_transcript_path.exists())
             self.assertTrue(store.agent_timeline_path.exists())
             self.assertTrue(store.agent_timeline_svg_path.exists())
-            self.assertTrue(store.champion_tree_path.exists())
-            self.assertTrue(store.champion_tree_graph_path.exists())
-            self.assertTrue(store.champion_tree_svg_path.exists())
+            self.assertFalse(store.candidate_graph_path.exists())
 
             # Collections appear only after a real record is written; research
             # runs should not be cluttered with unrelated empty optimizer data.

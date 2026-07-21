@@ -41,6 +41,7 @@ from .tools import (
     WebFetchTool,
 )
 from .validation import FinalAnswerValidator, ValidationResult
+from .worker_registry import DelegateTaskTool, WorkerBudget, WorkerProfile, WorkerRegistry
 
 
 class LLMToolDecider:
@@ -74,13 +75,25 @@ class ResearchAgent:
             ParameterSweepTool(), SaveLearningTool(),
         ] if evaluator_name == "prediction_market" else []
         external_service_tools = default_external_service_registry().tools()
-        return cls(LLMToolDecider(llm), ToolRegistry([
+        tools = [
             *(SearchTool(backend) for backend in backends), WebFetchTool(),
             DocumentFigureTool(), StructuredDataExtractionTool(), DocumentAnalysisTool(llm), SVGChartTool(),
             FileReadTool(), CodeExecutionTool(),
             TerminalExecutionTool(), *external_service_tools, *evaluator_tools,
             SpecialistConsultationTool(llm),
-        ]), config)
+        ]
+        base_registry = ToolRegistry(tools)
+        safe_worker_tools = tuple(tool.name for tool in tools if tool.name not in {
+            "spawn_optimization_agents", "run_parameter_sweep", "save_learning"
+        })
+        workers = WorkerRegistry([
+            WorkerProfile("researcher", "You are a focused research worker. Investigate the assignment and return concise evidence-backed findings.", safe_worker_tools),
+            WorkerProfile("critic", "You are a critical review worker. Stress-test the assignment, identify gaps, and return actionable findings.", safe_worker_tools, budget=WorkerBudget(max_iterations=3, max_tokens=3000, max_tool_calls=6, max_runtime_seconds=90.0)),
+        ], lambda profile: LLMToolDecider(LLMClient(
+            provider=profile.model_provider or llm.provider, model=profile.model_name or llm.model,
+            timeout_seconds=min(llm.timeout_seconds, profile.budget.max_runtime_seconds), seed=llm.seed,
+        )))
+        return cls(LLMToolDecider(llm), ToolRegistry([*tools, DelegateTaskTool(workers, base_registry)]), config)
 
     async def arun(
         self,

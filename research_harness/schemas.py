@@ -29,7 +29,7 @@ class AgentBudget:
     max_steps: int = 4
     max_tokens: int = 4000
     max_tool_calls: int = 48
-    max_runtime_seconds: float = 300.0
+    max_runtime_seconds: Optional[float] = None
     write_policy: WritePolicy = "append_only"
     reporting_schema: str = "structured_artifact_v1"
     trace_id: str = field(default_factory=lambda: new_id("trace"))

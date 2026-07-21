@@ -1,5 +1,7 @@
 # Artifact Schema
 
+Optimization lineage is persisted canonically in `candidate_graph.json`. Nodes are immutable candidate versions with `parent_candidate_ids` and their evaluation result; edges are typed as `derived_from`, `reverted_to`, `retried_from`, or `merged_from` only when a real multi-parent combination occurred. Promotion is not a lineage edge. Ordered promotion decisions live in `champion_history.json`. The former `champion_tree.*` names are deprecated compatibility artifacts.
+
 The harness keeps append-friendly JSON files for inspectability and mirrors the
 same records into `world_model.sqlite` in the output root. SQLite migrations live
 under `research_harness/migrations/` and maintain cross-run dedupe, provenance,

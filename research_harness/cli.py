@@ -24,8 +24,6 @@ RETRIEVER_CHOICES = ("auto", "local", "arxiv", "openalex", "semantic_scholar", "
 LLM_PROVIDER_CHOICES = ("auto", "openai", "anthropic", "kimi", "ollama", "local", "multi")
 OPTIMIZATION_GRADER_CHOICES = list_optimization_graders()
 DEFAULT_GRADER_LOOPS = 8
-MODEL_TURNS_PER_GRADER_LOOP = 3
-SECONDS_PER_GRADER_LOOP = 120
 
 ANSI = {
     "reset": "\033[0m",
@@ -37,6 +35,8 @@ ANSI = {
     "gray": "\033[38;5;245m",
     "yellow": "\033[38;5;221m",
     "red": "\033[38;5;203m",
+    "amber": "\033[38;5;214m",
+    "gold": "\033[38;5;220m",
 }
 
 LOGO = r"""
@@ -94,8 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=20,
-        help="Maximum model turns for this run.",
+        default=None,
+        help="Maximum model turns. Unbounded when omitted.",
     )
     parser.add_argument(
         "--max-tool-calls",
@@ -106,8 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-runtime-seconds",
         type=float,
-        default=300.0,
-        help="Wall-clock limit for the run, including source and figure inspection.",
+        default=None,
+        help="Wall-clock limit for the run, including source and figure inspection. Unbounded when omitted.",
     )
     parser.add_argument(
         "--grader",
@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--grader-loops",
         type=int,
         default=int(os.environ["RESEARCH_HARNESS_GRADER_LOOPS"]) if os.environ.get("RESEARCH_HARNESS_GRADER_LOOPS") else None,
-        help="Requested number of official candidate evaluations for --grader; implicit turn and runtime defaults scale to fit, while explicit budget flags remain hard limits.",
+        help="Requested number of official candidate evaluations for --grader. Model-turn and runtime limits remain unbounded unless explicitly supplied.",
     )
     parser.add_argument(
         "--llm-provider",
@@ -214,17 +214,17 @@ def _print_cli_banner(
     version = _package_version()
     if compact:
         output_func(
-            f"{_paint(f'Autore Code v{version}', 'teal', enabled=use_color)} "
+            f"{_paint(f'Autore Agent v{version}', 'gold', enabled=use_color)} "
             f"{_paint('research + optimize agent harness', 'gray', enabled=use_color)}"
         )
         return
     width = max(72, min(116, shutil.get_terminal_size((100, 24)).columns - 4))
     left_width = max(31, min(46, width // 2 - 2))
     right_width = width - left_width - 3
-    header = f" Autore Code v{version} "
-    output_func(_paint(header, "teal", enabled=use_color) + _paint("-" * max(0, width - len(header)), "teal", enabled=use_color))
+    header = f" Autore Agent v{version} "
+    output_func(_paint("─" * max(1, left_width - 1), "amber", enabled=use_color) + _paint(header, "gold", enabled=use_color) + _paint("─" * max(0, width - left_width - len(header) + 1), "amber", enabled=use_color))
     border = "+" + "-" * left_width + "+" + "-" * right_width + "+"
-    output_func(_paint(border, "teal", enabled=use_color))
+    output_func(_paint(border, "amber", enabled=use_color))
     left_lines = _banner_left_lines(left_width)
     right_lines = _banner_right_lines(right_width)
     max_lines = max(len(left_lines), len(right_lines))
@@ -232,13 +232,13 @@ def _print_cli_banner(
         left = left_lines[index] if index < len(left_lines) else ""
         right = right_lines[index] if index < len(right_lines) else ""
         output_func(
-            _paint("|", "teal", enabled=use_color)
+            _paint("|", "amber", enabled=use_color)
             + _banner_cell(left, left_width, use_color=use_color)
-            + _paint("|", "teal", enabled=use_color)
+            + _paint("|", "amber", enabled=use_color)
             + _banner_cell(right, right_width, use_color=use_color)
-            + _paint("|", "teal", enabled=use_color)
+            + _paint("|", "amber", enabled=use_color)
         )
-    output_func(_paint(border, "teal", enabled=use_color))
+    output_func(_paint(border, "amber", enabled=use_color))
     output_func("")
 
 
@@ -255,31 +255,39 @@ def _banner_left_lines(width: int) -> list[str]:
     retriever = os.environ.get("RESEARCH_HARNESS_RETRIEVER", "auto")
     cwd = _compact_path(Path.cwd(), max(18, width - 5))
     return [
-        f"Welcome back {user}!",
+        f"Welcome back, {user}",
         "",
-        "     _         _",
-        "    / \\  _   _| |_ ___  _ __ ___",
-        "   / _ \\| | | | __/ _ \\| '__/ _ \\",
-        "  / ___ \\ |_| | || (_) | | |  __/",
-        " /_/   \\_\\__,_|\\__\\___/|_|  \\___|",
+        "          .-=========-.",
+        "       .-'    AUTORE   '-.",
+        "      /    .-──────-.     \\",
+        "     |    /  ◉    ◉  \\     |",
+        "     |    |    ▴     |     |",
+        "      \\    '─.____.─'     /",
+        "       '─.     ││     .─'",
+        "          '────┴┴────'",
         "",
-        f"Model {model}",
-        f"Retriever {retriever}",
-        cwd,
+        f"model: {model}",
+        f"retriever: {retriever}",
+        f"workspace: {cwd}",
     ]
 
 
 def _banner_right_lines(width: int) -> list[str]:
     return [
-        "Tips for getting started",
-        "Run autore with no args for guided setup.",
-        "Use autore \"goal\" for direct runs.",
-        "Use --llm-model ollama/qwen3.5:latest locally.",
+        "Available tools",
+        "search: web, arxiv, openalex, scholar",
+        "documents: fetch, figures, extract, analyze",
+        "workspace: read files, bounded terminal",
+        "analysis: sandboxed python, charts",
+        "services: Firecrawl and configured adapters",
+        "optimization: grader, swarm, sweep, learning",
         "",
-        "What's new",
-        "New startup panel and guided flow.",
-        "Ollama provider support for local models.",
-        "Install command: python3 -m pip install -e .",
+        "Run controls",
+        "turns: unlimited by default",
+        "runtime: unlimited by default",
+        "limit turns: --max-iterations",
+        "limit runtime: --max-runtime-seconds",
+        "cancel: Ctrl-C; artifacts remain append-only",
     ]
 
 
@@ -292,9 +300,11 @@ def _compact_path(path: Path, width: int) -> str:
 
 def _banner_cell(text: str, width: int, *, use_color: bool) -> str:
     clean = text[: max(0, width - 2)]
-    color = "teal" if clean in {"Tips for getting started", "What's new"} else "gray"
+    color = "gold" if clean in {"Available tools", "Run controls"} else "gray"
     if clean.startswith("Welcome back"):
-        color = "bold"
+        color = "gold"
+    elif ":" in clean:
+        color = "amber"
     return " " + _paint(clean.ljust(width - 2), color, enabled=use_color) + " "
 
 
@@ -322,8 +332,9 @@ def _print_run_summary(run, store, *, output_func: Callable[[str], None] = print
         ("optimal code", store.optimal_code_path),
         ("solution", store.solution_path),
         ("champion", store.current_champion_path),
-        ("champ tree", store.champion_tree_path),
-        ("champ graph", store.champion_tree_graph_path),
+        ("candidate graph", store.candidate_graph_path),
+        ("candidate visual", store.candidate_graph_graph_path),
+        ("champion history", store.champion_history_path),
     ]
     diagnostics = [
         ("diagnosis", store.harness_diagnosis_path),
@@ -485,6 +496,31 @@ def prompt_int(
         output_func(_paint("Please enter a number greater than zero.", "yellow", enabled=use_color))
 
 
+def prompt_optional_int(
+    prompt: str,
+    *,
+    default: Optional[int] = None,
+    input_func: Callable[[str], str] = input,
+    output_func: Callable[[str], None] = print,
+) -> Optional[int]:
+    use_color = _use_color()
+    default_label = str(default) if default is not None else "unlimited"
+    while True:
+        answer = input_func(_paint(f"{prompt} [{default_label}]: ", "blue", enabled=use_color)).strip().lower()
+        if not answer:
+            return default
+        if answer in {"none", "unlimited", "infinite", "inf"}:
+            return None
+        try:
+            value = int(answer)
+        except ValueError:
+            output_func(_paint("Enter a positive whole number or 'unlimited'.", "yellow", enabled=use_color))
+            continue
+        if value > 0:
+            return value
+        output_func(_paint("Enter a positive whole number or 'unlimited'.", "yellow", enabled=use_color))
+
+
 def configure_interactive_run(
     args: argparse.Namespace,
     *,
@@ -523,33 +559,13 @@ def configure_interactive_run(
         )
     else:
         args.grader_loops = None
-    args.retriever = prompt_choice(
-        "Where should research evidence come from?",
-        [
-            ("auto", "Auto mix of available sources"),
-            ("local", "Bundled offline corpus"),
-            ("arxiv", "arXiv"),
-            ("openalex", "OpenAlex"),
-            ("semantic_scholar", "Semantic Scholar"),
-            ("github", "GitHub"),
-            ("web", "General web"),
-            ("docs_blogs", "Docs and blogs"),
-            ("twitter", "Twitter/X"),
-            ("alchemy", "Alchemy blockchain data (requires ALCHEMY_API_KEY)"),
-        ],
-        default=args.retriever or "auto",
-        input_func=input_func,
-        output_func=output_func,
-        key_reader=key_reader,
-    )
-    suggested_iterations = _recommended_model_turns(args.grader_loops) if args.grader else args.max_iterations
-    args.max_iterations = prompt_int(
+    args.max_iterations = prompt_optional_int(
         "Maximum model turns",
-        default=max(args.max_iterations, suggested_iterations),
+        default=args.max_iterations,
         input_func=input_func,
         output_func=output_func,
     )
-    args.max_iterations_explicit = True
+    args.max_iterations_explicit = args.max_iterations is not None
     selected_model = prompt_choice(
         "Which model/lab should run the harness?",
         model_choices(),
@@ -618,7 +634,10 @@ def main() -> None:
         parser.error("--grader-loops requires --grader.")
     if args.grader_loops is not None and args.grader_loops < 1:
         parser.error("--grader-loops must be at least 1.")
-    _apply_grader_budget_defaults(args)
+    if args.max_iterations is not None and args.max_iterations < 1:
+        parser.error("--max-iterations must be at least 1 when supplied.")
+    if args.max_runtime_seconds is not None and args.max_runtime_seconds <= 0:
+        parser.error("--max-runtime-seconds must be greater than zero when supplied.")
     config = HarnessConfig(
         retriever=args.retriever,
         max_iterations=args.max_iterations,
@@ -644,24 +663,9 @@ def main() -> None:
     _print_run_summary(run, store)
 
 
-def _recommended_model_turns(grader_loops: Optional[int]) -> int:
-    return 20 if not grader_loops else grader_loops * MODEL_TURNS_PER_GRADER_LOOP + 4
-
-
 def _apply_grader_budget_defaults(args: argparse.Namespace) -> None:
-    """Reserve enough turns and wall time for requested official rounds.
-
-    Explicit user budgets remain hard limits. Only implicit CLI defaults scale.
-    """
-    if not args.grader or not args.grader_loops:
-        return
-    if not getattr(args, "max_iterations_explicit", False):
-        args.max_iterations = max(args.max_iterations, _recommended_model_turns(args.grader_loops))
-    if not getattr(args, "max_runtime_seconds_explicit", False):
-        args.max_runtime_seconds = max(
-            args.max_runtime_seconds,
-            float(args.grader_loops * SECONDS_PER_GRADER_LOOP),
-        )
+    """Compatibility hook: omitted limits intentionally remain unbounded."""
+    return
 
 
 def run_preflight_evals(args: argparse.Namespace) -> None:

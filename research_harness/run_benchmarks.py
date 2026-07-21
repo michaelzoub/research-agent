@@ -930,22 +930,26 @@ def write_run_benchmarks(store: ArtifactStore) -> None:
     optimizer_trace = summary.get("optimizer_trace") or []
     optimizer_flow = optimizer_flow_mermaid(summary)
     optimizer_flow_svg_text = optimizer_flow_svg(summary)
-    champion_tree = read_json(store.champion_tree_path, {})
-    champion_tree_graph = champion_tree_mermaid(champion_tree)
-    champion_tree_svg_text = champion_tree_svg(champion_tree)
+    candidate_graph = read_json(store.candidate_graph_path, read_json(store.champion_tree_path, {}))
+    candidate_graph_mmd = candidate_graph_mermaid(candidate_graph)
+    candidate_graph_svg_text = candidate_graph_svg(candidate_graph)
     (store.root / "decision_dag.mmd").write_text(dag, encoding="utf-8")
     (store.root / "optimizer_trace.json").write_text(json.dumps(optimizer_trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     store.agent_timeline_svg_path.write_text(timeline_svg_full, encoding="utf-8")
     store.score_improvement_svg_path.write_text(score_svg, encoding="utf-8")
     (store.root / "optimizer_flow.mmd").write_text(optimizer_flow, encoding="utf-8")
     (store.root / "optimizer_flow.svg").write_text(optimizer_flow_svg_text, encoding="utf-8")
-    store.champion_tree_mermaid_path.write_text(champion_tree_graph, encoding="utf-8")
-    store.champion_tree_svg_path.write_text(champion_tree_svg_text, encoding="utf-8")
+    store.candidate_graph_mermaid_path.write_text(candidate_graph_mmd, encoding="utf-8")
+    store.candidate_graph_svg_path.write_text(candidate_graph_svg_text, encoding="utf-8")
+    # Deprecated compatibility renderings for existing consumers.
+    store.champion_tree_mermaid_path.write_text(candidate_graph_mmd, encoding="utf-8")
+    store.champion_tree_svg_path.write_text(candidate_graph_svg_text, encoding="utf-8")
     _write_png_from_svg_or_fallback(store.decision_dag_path, dag_svg, lambda: decision_dag_png(summary))
     _write_png_from_svg_or_fallback(store.agent_timeline_path, timeline_svg, lambda: _gantt_png(spans, num_rows, total_ms))
     _write_png_from_svg_or_fallback(store.score_improvement_path, score_svg, lambda: _score_improvement_png_fallback(summary))
     _write_png_from_svg_or_fallback(store.root / "optimizer_flow.png", optimizer_flow_svg_text, lambda: optimizer_flow_png(summary))
-    _write_png_from_svg_or_fallback(store.champion_tree_graph_path, champion_tree_svg_text, lambda: champion_tree_png(champion_tree))
+    _write_png_from_svg_or_fallback(store.candidate_graph_graph_path, candidate_graph_svg_text, lambda: candidate_graph_png(candidate_graph))
+    _write_png_from_svg_or_fallback(store.champion_tree_graph_path, candidate_graph_svg_text, lambda: candidate_graph_png(candidate_graph))
     store.optimizer_agent_summary_path.write_text(optimizer_agent_summary_markdown(summary), encoding="utf-8")
     store.role_trajectory_contract_path.write_text(role_trajectory_contract_markdown(summary), encoding="utf-8")
     (store.root / "run_benchmark.md").write_text(run_benchmark_markdown(summary, dag, optimizer_flow), encoding="utf-8")
@@ -1600,11 +1604,11 @@ def optimizer_flow_png(summary: dict[str, Any]) -> bytes:
     return canvas.png()
 
 
-def champion_tree_mermaid(tree: dict[str, Any]) -> str:
+def candidate_graph_mermaid(tree: dict[str, Any]) -> str:
     nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
     edges = tree.get("edges") if isinstance(tree.get("edges"), list) else []
     if not nodes:
-        return 'flowchart TD\n  none["No champion tree recorded"]\n'
+        return 'flowchart TD\n  none["No candidate graph recorded"]\n'
     lines = ["flowchart TD"]
     for index, node in enumerate(nodes):
         node_id = _mermaid_node_id(str(node.get("id") or f"node_{index}"))
@@ -1623,20 +1627,21 @@ def champion_tree_mermaid(tree: dict[str, Any]) -> str:
         from_id = _mermaid_node_id(str(edge.get("from") or ""))
         to_id = _mermaid_node_id(str(edge.get("to") or ""))
         if from_id in node_ids and to_id in node_ids:
-            lines.append(f"  {from_id} --> {to_id}")
+            edge_type = str(edge.get("type") or "derived_from")
+            lines.append(f"  {from_id} -- {edge_type} --> {to_id}")
     lines.append("  classDef champion fill:#dcfce7,stroke:#16a34a,stroke-width:3px,color:#0f172a;")
     lines.append("  classDef winner fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0f172a;")
     return "\n".join(lines) + "\n"
 
 
-def champion_tree_svg(tree: dict[str, Any]) -> str:
+def candidate_graph_svg(tree: dict[str, Any]) -> str:
     nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
     if not nodes:
         return (
             '<svg xmlns="http://www.w3.org/2000/svg" width="960" height="120" viewBox="0 0 960 120" '
             'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;">'
             '<rect width="100%" height="100%" fill="#fff"/><text x="24" y="64" font-size="14" fill="#94a3b8">'
-            'No champion tree recorded.</text></svg>'
+            'No candidate graph recorded.</text></svg>'
         )
     layout = _champion_tree_layout(tree, max_nodes=80)
     shown = layout["nodes"]
@@ -1651,8 +1656,8 @@ def champion_tree_svg(tree: dict[str, Any]) -> str:
         'style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;">',
         '<defs><marker id="treeArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 Z" fill="#334155"/></marker></defs>',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<text x="24" y="32" font-size="18" font-weight="700" fill="#0f172a">Champion tree</text>',
-        '<text x="24" y="52" font-size="11" fill="#64748b">Actual parent-to-child lineage. Green is the current global champion; blue rings are round winners.</text>',
+        '<text x="24" y="32" font-size="18" font-weight="700" fill="#0f172a">Candidate strategy graph</text>',
+        '<text x="24" y="52" font-size="11" fill="#64748b">Immutable candidate lineage. Promotion is recorded separately in champion_history.json.</text>',
     ]
     for edge in edges:
         x1, y1 = positions[str(edge.get("from"))]
@@ -1661,24 +1666,29 @@ def champion_tree_svg(tree: dict[str, Any]) -> str:
             f'<path d="M{x1},{y1 + radius} C{x1},{(y1 + y2) // 2} {x2},{(y1 + y2) // 2} {x2},{y2 - radius}" '
             'fill="none" stroke="#334155" stroke-width="1.8" marker-end="url(#treeArrow)"/>'
         )
+        mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+        parts.append(f'<text x="{mx}" y="{my - 4}" text-anchor="middle" font-size="9" fill="#64748b">{html.escape(str(edge.get("type") or "derived_from"))}</text>')
     for node in shown:
         x, y = positions[str(node.get("id"))]
         highlight = str(node.get("highlight") or "candidate")
-        fill = "#dcfce7" if highlight == "global_champion" else "#ffffff"
-        border = "#dc2626" if highlight == "global_champion" else "#0284c7" if highlight == "round_winner" else "#0f172a"
+        branch_status = str(node.get("branch_status") or "")
+        fill = "#dcfce7" if highlight == "global_champion" else "#fef3c7" if highlight == "former_champion" else "#fee2e2" if highlight == "failed" else "#ffffff"
+        border = "#16a34a" if highlight == "global_champion" else "#d97706" if highlight == "former_champion" else "#dc2626" if highlight == "failed" else "#0f172a"
         stroke_width = 3 if highlight == "global_champion" else 2 if highlight == "round_winner" else 1.5
         score = float(node.get("score") or 0.0)
         label = f"{score:.2f}" if score else str(node.get("id") or "")[-2:]
-        parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="{fill}" stroke="{border}" stroke-width="{stroke_width}"/>')
+        dash = ' stroke-dasharray="5 3"' if branch_status == "current_exploration" else ""
+        opacity = "0.5" if branch_status == "abandoned_branch" else "1"
+        parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="{fill}" stroke="{border}" stroke-width="{stroke_width}" opacity="{opacity}"{dash}/>')
         parts.append(f'<text x="{x}" y="{y + 4}" text-anchor="middle" font-size="12" font-weight="700" fill="#0f172a">{html.escape(label)}</text>')
-        parts.append(f'<title>{html.escape(str(node.get("id") or ""))} · round {html.escape(str(node.get("outer_iteration") or "n/a"))} · score {score:.3f} · {html.escape(highlight)}</title>')
+        parts.append(f'<title>{html.escape(str(node.get("id") or ""))} · round {html.escape(str(node.get("outer_iteration") or "n/a"))} · score {score:.3f} · {html.escape(highlight)} · {html.escape(branch_status)}</title>')
     if layout["hidden_count"]:
-        parts.append(f'<text x="24" y="{height - 14}" font-size="11" fill="#64748b">+ {layout["hidden_count"]} additional nodes in champion_tree.json</text>')
+        parts.append(f'<text x="24" y="{height - 14}" font-size="11" fill="#64748b">+ {layout["hidden_count"]} additional nodes in candidate_graph.json</text>')
     parts.append("</svg>")
     return "\n".join(parts)
 
 
-def champion_tree_png(tree: dict[str, Any]) -> bytes:
+def candidate_graph_png(tree: dict[str, Any]) -> bytes:
     nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
     layout = _champion_tree_layout(tree, max_nodes=40)
     shown = layout["nodes"]
@@ -1689,9 +1699,9 @@ def champion_tree_png(tree: dict[str, Any]) -> bytes:
     height = int(layout["height"])
     radius = int(layout["radius"])
     canvas = _PngCanvas(width, height, "#ffffff")
-    canvas.text(24, 18, "Champion tree", "#0f172a", 2)
+    canvas.text(24, 18, "Candidate strategy graph", "#0f172a", 2)
     if not shown:
-        canvas.text(24, 62, "No champion tree recorded", "#94a3b8", 2)
+        canvas.text(24, 62, "No candidate graph recorded", "#94a3b8", 2)
         return canvas.png()
     for edge in edges:
         x1, y1 = positions[str(edge.get("from"))]
@@ -1700,8 +1710,8 @@ def champion_tree_png(tree: dict[str, Any]) -> bytes:
     for node in shown:
         x, y = positions[str(node.get("id"))]
         highlight = str(node.get("highlight") or "candidate")
-        fill = "#dcfce7" if highlight == "global_champion" else "#ffffff"
-        border = "#dc2626" if highlight == "global_champion" else "#0284c7" if highlight == "round_winner" else "#0f172a"
+        fill = "#dcfce7" if highlight == "global_champion" else "#fef3c7" if highlight == "former_champion" else "#fee2e2" if highlight == "failed" else "#ffffff"
+        border = "#16a34a" if highlight == "global_champion" else "#d97706" if highlight == "former_champion" else "#dc2626" if highlight == "failed" else "#0f172a"
         canvas.circle(int(x), int(y), radius, fill, border)
         canvas.text(int(x - radius + 8), int(y - 5), f"{float(node.get('score') or 0.0):.1f}", "#0f172a", 1)
     return canvas.png()

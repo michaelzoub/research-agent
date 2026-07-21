@@ -27,22 +27,16 @@ The guided CLI does not ask the user to choose an evidence backend: the model se
 
 ```mermaid
 flowchart TD
-    goal["User goal"] --> lead["Lead ResearchAgent"]
-    lead --> loop["AgentLoop\nmodel turn + bounded state"]
-    loop --> decision{"Answer or use a tool?"}
-    decision -->|answer| validate["Validate and synthesize final answer"]
-    validate --> done["Return result to user"]
-    decision -->|tool call| tools["ToolRegistry\nschema + permission checks"]
-    tools --> observe["Tool result / observation"]
-    observe --> loop
-    tools -->|delegate_task| registry["WorkerRegistry\napproved profile + prompt + budget"]
-    registry --> worker["Isolated nested AgentLoop"]
-    worker --> worker_result["Structured WorkerResult\nfindings + artifacts + accounting"]
-    worker_result --> observe
-    worker -.->|delegation disabled| blocked["No recursive workers"]
+    goal["Goal"] --> lead["Lead agent"]
+    lead --> decision{"Model action"}
+    decision -->|tool call| tool["ToolRegistry\nordinary tool"]
+    tool --> lead
+    decision -->|delegate_worker / delegate_task| worker["WorkerRegistry\nbounded worker"]
+    worker -->|WorkerResult findings| lead
+    decision -->|final answer| done["Lead synthesizes result"]
 ```
 
-Workers complete bounded assignments and return findings to the lead; they never replace the lead controller or final synthesizer. Concurrent read-only calls made by `ToolRegistry` remain ordinary tool calls and are not worker loops.
+Workers complete bounded assignments and return findings to the lead; they never replace the lead controller or final synthesizer. Ordinary tool calls remain tool calls, not workers.
 
 Grader runs separate the full audit transcript from model working context. Every iteration receives a deterministic checkpoint containing the strategy ledger, exact champion/latest code, official edge metrics, fetched literature extracts, and only the newest unresolved tool exchange. Older tool chatter remains in `agent_messages.json` and `agent_events.jsonl` but is not replayed to the model. Fetched documents are keyed by canonical URL and served from the artifact cache on repeat requests.
 
